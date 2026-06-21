@@ -1505,6 +1505,11 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
     let debt_items = crate::tech_debt::scan_debt(&output_dir);
     if !debt_items.is_empty() {
         let _ = crate::tech_debt::write_ledger(&opts.project_root, &debt_items);
+        // Feed SIGNIFICANT debt back into the lessons KB so persistent
+        // filler / unfilled-acceptance debt evolves across runs the same way
+        // an acceptance gap does (capture→sediment→retrieve), instead of only
+        // ever surfacing as a one-shot quality-check score. Fail-open.
+        crate::lessons::capture_tech_debt(&opts.project_root, &debt_items, &opts.requirement);
     }
 
     Ok(PhaseOutput {

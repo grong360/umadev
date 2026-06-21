@@ -126,6 +126,14 @@ pub struct PitfallEfficacy {
     /// absence of recurrence over later runs).
     #[serde(default)]
     pub proven_fix: bool,
+    /// Reflexion ledger: the recorded fixes that were ALREADY tried and still
+    /// let the pitfall recur. On the next injection these are surfaced verbatim
+    /// as "已试过但无效的修法" so the base is steered AWAY from re-running a known
+    /// failure toward a different approach — instead of just re-loading the same
+    /// failed fix more loudly. Capped + deduped; empty for fixes that never
+    /// recurred. `#[serde(default)]` keeps older efficacy rows readable.
+    #[serde(default)]
+    pub failed_fixes: Vec<String>,
 }
 
 /// Lifecycle of a pitfall's fix, derived from its efficacy record.
@@ -346,6 +354,105 @@ pub fn capture_validated_patterns(
     append_raw_lessons(project_root, "validated-decisions.jsonl", &[lesson]);
 }
 
+/// Minimum [`crate::tech_debt::DebtKind::severity`] a debt item must reach to
+/// be fed back into the lessons KB. `4` keeps only the findings that mean a doc
+/// can't be acted on — filler text (5) and unfilled acceptance criteria (4) —
+/// so the KB learns from *significant* debt, not every stray `TODO` note.
+const TECH_DEBT_LESSON_MIN_SEVERITY: u8 = 4;
+
+/// Feed SIGNIFICANT tech-debt findings back into the lessons KB, so persistent
+/// placeholder/filler debt participates in cross-run evolution the same way an
+/// acceptance gap or a dev-error pitfall does.
+///
+/// Until now `scan_debt` results only fed a transient quality-check score and a
+/// JSONL ledger — they never reached the capture→sediment→retrieve loop, so the
+/// worker was never *reminded* "you keep shipping docs with filler text; write
+/// real content". This closes that gap: each debt KIND that crosses
+/// [`TECH_DEBT_LESSON_MIN_SEVERITY`] becomes one [`LessonKind::Failure`] lesson
+/// (deduped by kind so a doc with 40 `Lorem ipsum` lines yields ONE lesson, not
+/// 40), keyed under the `governance` domain. Returns how many lessons were
+/// written. Fail-open: a write error never blocks the quality gate.
+pub fn capture_tech_debt(
+    project_root: &Path,
+    items: &[crate::tech_debt::DebtItem],
+    requirement: &str,
+) -> usize {
+    use crate::tech_debt::DebtKind;
+    // Group significant items by kind so each distinct debt KIND yields one
+    // lesson regardless of how many lines carry it. Keep a sample file:line and
+    // the running count for the lesson body.
+    let mut by_kind: std::collections::BTreeMap<DebtKind, (usize, String)> =
+        std::collections::BTreeMap::new();
+    for it in items {
+        if it.kind.severity() < TECH_DEBT_LESSON_MIN_SEVERITY {
+            continue;
+        }
+        let entry = by_kind
+            .entry(it.kind)
+            .or_insert_with(|| (0, format!("{}:{}", it.file, it.line)));
+        entry.0 += 1;
+    }
+    if by_kind.is_empty() {
+        return 0;
+    }
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut lessons: Vec<Lesson> = Vec::new();
+    for (kind, (count, sample)) in by_kind {
+        let kind_name = serde_json::to_string(&kind)
+            .unwrap_or_else(|_| "\"debt\"".into())
+            .trim_matches('"')
+            .to_string();
+        let (label, fix, root_cause) = match kind {
+            DebtKind::FillerText => (
+                "Filler / Lorem ipsum text in delivered docs",
+                "Replace EVERY Lorem-ipsum / filler passage with real, \
+                 requirement-specific content. Filler signals a doc that can't be \
+                 acted on downstream.",
+                "Placeholder filler was shipped instead of real content — the \
+                 artifact looks complete but carries no actionable detail.",
+            ),
+            DebtKind::UnfilledAcceptance => (
+                "Unfilled Given/When/Then acceptance criteria",
+                "Fill in every Given/When/Then with concrete pre-conditions, \
+                 actions and observable outcomes (GET returns list, POST creates \
+                 with id, …). Unfilled criteria can't gate delivery.",
+                "Acceptance criteria were left as `Given TODO` templates — there \
+                 is nothing for the quality gate or a reviewer to verify against.",
+            ),
+            _ => (
+                "Unresolved placeholder debt in delivered docs",
+                "Replace the placeholder markers with real content before \
+                 delivery; track remaining debt in the ledger.",
+                "Placeholder/TODO markers were left in the delivered artifacts.",
+            ),
+        };
+        let keywords = extract_keywords(label, &sample, requirement);
+        lessons.push(Lesson {
+            kind: LessonKind::Failure,
+            domain: "governance".to_string(),
+            title: format!("Tech debt: {label} ({count}×)"),
+            body: format!(
+                "The latest run left {count} `{kind_name}` debt item(s) in the \
+                 delivered docs (e.g. {sample}). High-severity debt like this \
+                 means the artifact reads as finished but isn't actionable.\n\n\
+                 Requirement: {requirement}"
+            ),
+            fix: fix.to_string(),
+            root_cause: root_cause.to_string(),
+            keywords,
+            source_requirement: requirement.to_string(),
+            first_seen: now.clone(),
+            signature: String::new(),
+            occurrences: 1,
+            context: Vec::new(),
+            efficacy: None,
+        });
+    }
+    let written = lessons.len();
+    append_raw_lessons(project_root, "tech-debt.jsonl", &lessons);
+    written
+}
+
 /// Capture real development errors hit during a run into the lessons KB.
 ///
 /// Each raw error string (a failed tool-call summary, a non-zero build/test
@@ -393,7 +500,15 @@ pub fn capture_dev_errors(
         if text.is_empty() || !crate::error_kb::looks_like_error(text) {
             continue;
         }
-        let insight = crate::error_kb::classify_error(text);
+        let mut insight = crate::error_kb::classify_error(text);
+        // Stabilise the dedup key: strip volatile parts (relative-path
+        // prefixes, version suffixes, line/col numbers) that leak into the
+        // discriminator segment so the SAME root cause collapses to ONE
+        // signature instead of drifting per file/version (see
+        // [`normalize_signature`]). Without this, `occurrences` would stay
+        // stuck at 1 for a recurring pitfall whose offending path or version
+        // string differs run-to-run, and the frequency signal would be lost.
+        insight.signature = normalize_signature(&insight.signature);
         if let Some(&i) = idx.get(&insight.signature) {
             // Recurrence → frequency++ and absorb any new context tokens.
             store[i].occurrences = store[i].hits().saturating_add(1);
@@ -402,6 +517,7 @@ pub fn capture_dev_errors(
             // (it was injected) and it recurred anyway, the recorded fix is
             // insufficient — flag it so recall escalates it next time.
             let occ_now = store[i].occurrences;
+            let recorded_fix = store[i].fix.clone();
             if let Some(eff) = store[i].efficacy.as_mut() {
                 // Recurred after we either warned the worker (injected) OR
                 // marked an in-run fix as proven — both mean the recorded fix
@@ -411,6 +527,10 @@ pub fn capture_dev_errors(
                 if (eff.injected >= 1 || eff.proven_fix) && occ_now > eff.occ_at_injection {
                     eff.recurred_after_warning = true;
                     eff.proven_fix = false;
+                    // Reflexion: remember that THIS fix was already tried and
+                    // failed, so the next injection steers the base away from it
+                    // toward a different approach instead of re-loading it.
+                    remember_failed_fix(eff, &recorded_fix);
                 }
             }
             changed = true;
@@ -462,23 +582,36 @@ pub fn capture_dev_errors(
 const MAX_DEV_PITFALLS: usize = 300;
 
 /// Evict the least-valuable pitfalls when the store exceeds [`MAX_DEV_PITFALLS`].
-/// Keep priority: still-failing (`Recurring`) > unproven (`Active`) > solved
-/// (`Validated`), then most-frequently-hit, then most-recent. Solved pitfalls
-/// are dropped first — their fix is proven, so losing the record costs little.
+///
+/// Keep priority is tiered by fix lifecycle first — still-failing (`Recurring`)
+/// outranks unproven (`Active`), which outranks solved (`Validated`) — so a
+/// pitfall whose fix is still failing is NEVER evicted before a handled one.
+/// WITHIN a tier, eviction is by the Generative-Agents-style decay score
+/// (`recency · importance`) rather than a hard LRU: an old, low-importance lesson
+/// is dropped before a recent or frequently-hit one even if their raw timestamps
+/// would order them the other way. (Relevance has no query at prune time, so it
+/// is the constant floor and drops out of the WITHIN-tier comparison.)
 fn prune_pitfalls(store: &mut Vec<Lesson>) {
     if store.len() <= MAX_DEV_PITFALLS {
         return;
     }
+    let now = Utc::now();
+    let empty_query = std::collections::HashSet::new();
     let rank = |l: &Lesson| match l.pitfall_status() {
         PitfallStatus::Recurring => 0u8,
         PitfallStatus::Active => 1,
         PitfallStatus::Validated => 2,
     };
     store.sort_by(|a, b| {
-        rank(a)
-            .cmp(&rank(b))
-            .then_with(|| b.hits().cmp(&a.hits()))
-            .then_with(|| b.first_seen.cmp(&a.first_seen))
+        rank(a).cmp(&rank(b)).then_with(|| {
+            // Higher decay score = keep → sort it earlier (descending).
+            let sa = lesson_decay_score(a, &empty_query, now);
+            let sb = lesson_decay_score(b, &empty_query, now);
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                // Final deterministic tiebreak so equal scores prune stably.
+                .then_with(|| b.first_seen.cmp(&a.first_seen))
+        })
     });
     store.truncate(MAX_DEV_PITFALLS);
 }
@@ -551,6 +684,24 @@ fn merge_one_token(tokens: &mut Vec<String>, name: &str) {
     }
 }
 
+/// Max distinct failed-fix entries kept in a pitfall's Reflexion ledger.
+/// Small — we only need to tell the base what NOT to re-try, not keep a history.
+const MAX_FAILED_FIXES: usize = 3;
+
+/// Record a fix that was tried and let the pitfall recur, into the Reflexion
+/// ledger. Deduped (a fix already known-failed isn't re-added) and capped at
+/// [`MAX_FAILED_FIXES`] (oldest dropped). Empty/whitespace fixes are ignored.
+fn remember_failed_fix(eff: &mut PitfallEfficacy, fix: &str) {
+    let fix = fix.trim();
+    if fix.is_empty() || eff.failed_fixes.iter().any(|f| f == fix) {
+        return;
+    }
+    eff.failed_fixes.push(fix.to_string());
+    if eff.failed_fixes.len() > MAX_FAILED_FIXES {
+        eff.failed_fixes.remove(0);
+    }
+}
+
 /// Merge `incoming` tokens into `dst` (deduped), capping at `max`.
 fn merge_tokens(dst: &mut Vec<String>, incoming: &[String], max: usize) {
     for t in incoming {
@@ -618,6 +769,7 @@ pub fn read_all_raw_lessons(project_root: &Path) -> Vec<Lesson> {
         "quality-failures.jsonl",
         "gate-revisions.jsonl",
         "validated-decisions.jsonl",
+        "tech-debt.jsonl",
         DEV_ERRORS_FILE,
     ] {
         all.extend(read_raw_lessons(project_root, f));
@@ -741,6 +893,93 @@ fn fix_suggestion_for_check(name: &str) -> String {
     }
 }
 
+/// Tokens that are clearly part of a *path* (a relative/source-dir prefix), not
+/// the module/export symbol itself. When the offending quoted token in an error
+/// was a path like `./components/Foo` rather than a bare package name, slugify
+/// folds the whole path into the discriminator — so the SAME missing symbol
+/// drifts per importing file. These leading tokens are stripped to recover the
+/// stable trailing symbol. Kept deliberately small + conservative.
+const PATH_PREFIX_TOKENS: &[&str] = &[
+    "src",
+    "app",
+    "lib",
+    "components",
+    "component",
+    "pages",
+    "page",
+    "utils",
+    "util",
+    "hooks",
+    "hook",
+    "services",
+    "service",
+    "modules",
+    "module",
+    "node",
+    "dist",
+    "build",
+    "public",
+    "assets",
+    "styles",
+    "test",
+    "tests",
+    "spec",
+];
+
+/// Normalise an error signature into a STABLE dedup key by stripping the
+/// volatile parts that leak into the discriminator (last) segment, so the same
+/// root cause collapses to one signature instead of drifting per run.
+///
+/// Only the discriminator segment (everything after `category/family/`) is
+/// touched — the family always stays intact so unrelated families never
+/// collide, and a clean package name (`react-router-dom`) is preserved whole.
+/// What gets stripped is exactly what changes run-to-run for the *same* pitfall:
+/// - **bare line/column numbers** — pure-digit tokens (`42`, `10`) are dropped.
+/// - **version suffixes** — a trailing `v4` / `18` / `1` token is dropped so
+///   `lodash-v4` → `lodash` and `react-18` → `react` (a version bump is not a
+///   new pitfall).
+/// - **relative/source path prefixes** — leading `src` / `components` / `..`
+///   style tokens are dropped so `components-foo` and `pages-foo` both reduce to
+///   `foo` (the same missing symbol imported from two files must not fork).
+///
+/// A signature with fewer than three `/`-segments (e.g. the family-only
+/// `type/type-mismatch`) is returned unchanged — there is no discriminator. If
+/// stripping empties the discriminator entirely, the family alone is returned so
+/// it still dedups instead of staying unique forever. Idempotent — the
+/// recall/resolve paths rely on normalising twice being a no-op.
+#[must_use]
+pub fn normalize_signature(signature: &str) -> String {
+    let parts: Vec<&str> = signature.splitn(3, '/').collect();
+    if parts.len() < 3 {
+        return signature.to_string();
+    }
+    let (category, family, disc) = (parts[0], parts[1], parts[2]);
+    let mut tokens: Vec<&str> = disc
+        .split('-')
+        // Drop empty + pure-digit (line/col) tokens up front.
+        .filter(|t| !t.is_empty() && !t.chars().all(|c| c.is_ascii_digit()))
+        .collect();
+    // Drop a trailing version token like `v4` (a `v` followed by digits only).
+    while let Some(last) = tokens.last() {
+        let rest = last.trim_start_matches('v');
+        if rest.len() < last.len() && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            tokens.pop();
+        } else {
+            break;
+        }
+    }
+    // Drop leading path-prefix tokens, but never strip the final token (that
+    // IS the symbol). `..` / `.` slugify to empty and are already gone.
+    while tokens.len() > 1 && PATH_PREFIX_TOKENS.contains(&tokens[0]) {
+        tokens.remove(0);
+    }
+    if tokens.is_empty() {
+        format!("{category}/{family}")
+    } else {
+        format!("{category}/{family}/{}", tokens.join("-"))
+    }
+}
+
 /// Truncate a string to `max` chars with an ellipsis.
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -854,6 +1093,16 @@ pub fn sediment_lessons(project_root: &Path) -> usize {
 
     // Promote frequently-occurring lessons to the global dir.
     let _ = promote_to_global(project_root, &lessons);
+
+    // Close the timing race: we just wrote new `.umadev/learned/*.md`, but the
+    // BM25 index is content-hash cached, so a retrieval later in THIS SAME run
+    // would otherwise still load the pre-sediment cache and miss what we just
+    // learned. Invalidating the cache forces the next retrieval to re-scan the
+    // now-larger corpus, making this run's lessons retrievable this run.
+    // Fail-open (a no-op when nothing was written / no cache exists).
+    if written > 0 {
+        umadev_knowledge::invalidate_cache(project_root);
+    }
 
     written
 }
@@ -1049,6 +1298,88 @@ fn lesson_trigger_score(l: &Lesson, query: &std::collections::HashSet<String>) -
     score
 }
 
+/// Half-life (in days) of a lesson's recency weight. After this many days the
+/// recency factor halves. 30 days ≈ "a lesson learned last month is worth half
+/// a lesson learned today" — tuned so old, never-recurring lessons gracefully
+/// fade rather than clinging to the top forever.
+const RECENCY_HALFLIFE_DAYS: f64 = 30.0;
+
+/// Recency weight in `(0, 1]` — `2^(-age_days / halflife)`. A lesson seen today
+/// scores ~1.0; one seen a half-life ago scores ~0.5; an ancient one tends to 0.
+/// An unparseable / future `first_seen` is treated as "now" (weight 1.0) so a
+/// corrupted timestamp never silently buries a lesson (fail-open).
+fn recency_weight(first_seen: &str, now: chrono::DateTime<Utc>) -> f64 {
+    let age_days = parse_iso_utc(first_seen)
+        .map(|t| (now - t).num_seconds() as f64 / 86_400.0)
+        .unwrap_or(0.0)
+        .max(0.0);
+    2.0_f64.powf(-age_days / RECENCY_HALFLIFE_DAYS)
+}
+
+/// Parse an ISO-8601 `%Y-%m-%dT%H:%M:%SZ` UTC timestamp (the format every
+/// capture site writes). Returns `None` for legacy/hand-edited rows that don't
+/// match — callers treat that as "now" so the lesson isn't penalised.
+fn parse_iso_utc(s: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%SZ")
+        .ok()
+        .map(|naive| naive.and_utc())
+}
+
+/// Intrinsic importance in `[0, 1]` — how much this lesson *matters* regardless
+/// of the current query or its age (the Generative-Agents "poignancy" axis).
+///
+/// Pitfalls whose recorded fix is still FAILING (`Recurring`) are the most
+/// important to keep surfacing; recognised (classified) pitfalls outrank generic
+/// ones; repeatedly-hit lessons matter more than one-offs; a proven/validated
+/// fix is damped because it's effectively handled. Non-pitfall kinds get a flat
+/// mid importance so they participate but don't dominate the pitfall channel.
+fn lesson_importance(l: &Lesson) -> f64 {
+    if l.kind != LessonKind::DevError {
+        // Failures / revisions / validated patterns: steady, modest weight.
+        return 0.4;
+    }
+    let mut imp: f64 = 0.4;
+    if l.is_recognized() {
+        imp += 0.2;
+    }
+    // Frequency: saturating contribution so a 50-hit pitfall isn't 50× a 1-hit.
+    imp += (f64::from(l.hits().min(8)) / 8.0) * 0.3;
+    match l.pitfall_status() {
+        PitfallStatus::Recurring => imp += 0.4, // fix is failing — keep it loud
+        PitfallStatus::Validated => imp -= 0.3, // handled — let it fade
+        PitfallStatus::Active => {}
+    }
+    imp.clamp(0.05, 1.0)
+}
+
+/// Generative-Agents-style composite retrieval score: `recency · importance ·
+/// relevance`, the product of the three normalised axes.
+///
+/// - **relevance** comes from [`lesson_trigger_score`] (query + tech-stack
+///   overlap), squashed to `(0, 1]` so a strong stack match dominates but never
+///   alone pins an irrelevant-but-recent lesson to the top.
+/// - **importance** is [`lesson_importance`] (intrinsic poignancy).
+/// - **recency** is [`recency_weight`] (exponential age decay).
+///
+/// A zero-relevance lesson keeps a small floor so the universal-fallback tier
+/// (recent pitfalls regardless of overlap) can still be ordered by recency ×
+/// importance — that's what makes pruning/eviction graceful rather than a hard
+/// LRU. Higher = keep / surface first.
+fn lesson_decay_score(
+    l: &Lesson,
+    query: &std::collections::HashSet<String>,
+    now: chrono::DateTime<Utc>,
+) -> f64 {
+    // Map the unbounded i64 relevance into (0,1]: a small floor (0.1) keeps
+    // unmatched lessons orderable by recency×importance, while matches climb
+    // toward 1.0. `.max(0)` so the validated-pitfall penalty (-4) can't make the
+    // product negative. Cap at a small ceiling before the f64 cast — relevance
+    // scores never exceed ~20, so this only guards against pathological input.
+    let raw_rel = f64::from(lesson_trigger_score(l, query).clamp(0, 1_000) as i32);
+    let rel = 0.1 + (raw_rel / (raw_rel + 6.0)) * 0.9;
+    rel * lesson_importance(l) * recency_weight(&l.first_seen, now)
+}
+
 /// Retrieve prior lessons whose error signature matches `failure_detail` — the
 /// HIGHEST-precision retrieval trigger in the whole loop: it fires on a CONCRETE
 /// failure (FLARE / Self-RAG "retrieve when failing / uncertain"), so the match
@@ -1072,7 +1403,10 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
     if !insight.recognized {
         return String::new();
     }
-    let sig = insight.signature;
+    // Normalise to the SAME stable key the store dedups under, so a recurring
+    // failure whose offending path/version differs run-to-run still matches the
+    // recorded lesson (otherwise the lookup would miss the very pitfall it hit).
+    let sig = normalize_signature(&insight.signature);
     // Match the full signature, or the same family (first two path segments,
     // e.g. `dependency/module-not-found`).
     let family: String = sig.splitn(3, '/').take(2).collect::<Vec<_>>().join("/");
@@ -1114,11 +1448,33 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
         out.push_str(
             "  [!] 上次已警示但仍复发——之前的修法不够彻底。这次必须换一个根本性的不同方案，并在修完后自检确认。\n",
         );
+        // Reflexion: name the specific fixes that were ALREADY tried and failed,
+        // so the base is steered AWAY from re-running them, not just told "try
+        // harder". This is the structured "失败修法 + 换思路" guidance.
+        out.push_str(&render_failed_fixes(top));
     }
     // Snapshot the hit count NOW so that, if this exact pitfall recurs after the
     // fix attempt, `capture_dev_errors` can flag `recurred_after_warning` — the
     // efficacy half of the closed loop.
     record_pitfall_injections(project_root, std::slice::from_ref(&top_sig));
+    out
+}
+
+/// Render a pitfall's Reflexion ledger — the fixes already tried that still let
+/// it recur — as a "do NOT re-run these, change approach" prompt block. Empty
+/// string when the ledger is empty (older pitfalls, or one that never recurred),
+/// so the prompt is unchanged in the common case.
+fn render_failed_fixes(l: &Lesson) -> String {
+    let Some(eff) = &l.efficacy else {
+        return String::new();
+    };
+    if eff.failed_fixes.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("  已试过但无效的修法（不要再重复，请换思路）：\n");
+    for f in &eff.failed_fixes {
+        out.push_str(&format!("    - {}\n", truncate(f, 200)));
+    }
     out
 }
 
@@ -1128,7 +1484,9 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
 ///
 /// Triggering matches the pitfall against the project's real tech-stack
 /// fingerprint (see [`lesson_trigger_score`]), not just the requirement prose,
-/// then ranks by frequency + recency. We don't call BM25 here to avoid a
+/// then ranks by the Generative-Agents composite [`lesson_decay_score`]
+/// (`recency · importance · relevance`) so a fresh, important, on-stack lesson
+/// outranks an old high-frequency one. We don't call BM25 here to avoid a
 /// circular dependency between the agent and knowledge crates at prompt-assembly
 /// time — the BM25 index already picks up learned/ files during
 /// `phase_knowledge_digest`.
@@ -1154,23 +1512,40 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
         query.insert(tok);
     }
 
-    // Score each lesson by how strongly its situation intersects "right now".
-    let mut scored: Vec<(i64, &Lesson)> = lessons
+    // Score each lesson on TWO axes:
+    // - `rel` (raw relevance i64) gates the Tier-1 (`> 0`) vs Tier-2 (`== 0`)
+    //   split below — a lesson only counts as "matched right now" when its
+    //   situation actually intersects the query/stack.
+    // - `decay` is the Generative-Agents composite (`recency · importance ·
+    //   relevance`) that ORDERS lessons within each tier, so a newer + more
+    //   important + more relevant lesson sorts first instead of a pure
+    //   occurrences/mtime ordering. An old validated pitfall no longer crowds
+    //   out a fresh, still-failing one just because it was hit more times.
+    let now = Utc::now();
+    let mut scored: Vec<(i64, f64, &Lesson)> = lessons
         .iter()
-        .map(|l| (lesson_trigger_score(l, &query), l))
+        .map(|l| {
+            (
+                lesson_trigger_score(l, &query),
+                lesson_decay_score(l, &query, now),
+                l,
+            )
+        })
         .collect();
-    // Highest relevance first, then most-frequently-hit, then most-recent.
+    // Highest composite decay score first; deterministic mtime tiebreak.
     scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| b.1.hits().cmp(&a.1.hits()))
-            .then_with(|| b.1.first_seen.cmp(&a.1.first_seen))
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.first_seen.cmp(&a.2.first_seen))
     });
 
     // Tier 1: positively-matched (the current situation hit a recorded one).
+    // `s` is the raw relevance; `> 0` means the query/stack actually intersected
+    // this lesson. They're already ordered by the composite decay score above.
     let mut top_idx: Vec<usize> = scored
         .iter()
         .enumerate()
-        .filter(|(_, (s, _))| *s > 0)
+        .filter(|(_, (s, _, _))| *s > 0)
         .take(2)
         .map(|(i, _)| i)
         .collect();
@@ -1181,7 +1556,7 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
         if top_idx.len() >= 3 {
             break;
         }
-        for (i, (s, l)) in scored.iter().enumerate() {
+        for (i, (s, _, l)) in scored.iter().enumerate() {
             if top_idx.len() >= 3 {
                 break;
             }
@@ -1206,7 +1581,7 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
 ",
     );
     for &i in &top_idx {
-        let lesson = scored[i].1;
+        let lesson = scored[i].2;
         let icon = match lesson.kind {
             LessonKind::Failure => "[warn]",
             LessonKind::Revision => "[write]",
@@ -1224,10 +1599,16 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
             };
             // Escalate a pitfall whose previous fix failed — tell the worker
             // the obvious fix didn't hold and to take a different, deeper tack.
+            // Reflexion: also list the SPECIFIC failed fixes so it changes
+            // approach instead of re-running a known-failure (see
+            // [`render_failed_fixes`]).
             let escalate = if lesson.pitfall_status() == PitfallStatus::Recurring {
-                "\n   ⚠ 上次已警示但仍复发 —— 之前的修法不够,这次必须换更彻底的方案并验证。"
+                format!(
+                    "\n   ⚠ 上次已警示但仍复发 —— 之前的修法不够,这次必须换更彻底的方案并验证。\n{}",
+                    render_failed_fixes(lesson)
+                )
             } else {
-                ""
+                String::new()
             };
             out.push_str(&format!(
                 "{icon} **{}**{freq}
@@ -1253,7 +1634,7 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
     // prevented recurrence. Fail-open — purely advisory state.
     let surfaced: Vec<String> = top_idx
         .iter()
-        .map(|&i| scored[i].1)
+        .map(|&i| scored[i].2)
         .filter(|l| l.kind == LessonKind::DevError && !l.signature.is_empty())
         .map(|l| l.signature.clone())
         .collect();
@@ -1284,6 +1665,7 @@ fn record_pitfall_injections(project_root: &Path, signatures: &[String]) {
                 occ_at_injection: occ,
                 recurred_after_warning: false,
                 proven_fix: false,
+                failed_fixes: Vec::new(),
             });
             eff.injected = eff.injected.saturating_add(1);
             eff.occ_at_injection = occ;
@@ -1305,7 +1687,7 @@ pub fn mark_pitfalls_resolved(project_root: &Path, raw_errors: &[String]) -> usi
     let want: std::collections::HashSet<String> = raw_errors
         .iter()
         .filter(|e| crate::error_kb::looks_like_error(e))
-        .map(|e| crate::error_kb::classify_error(e).signature)
+        .map(|e| normalize_signature(&crate::error_kb::classify_error(e).signature))
         .collect();
     if want.is_empty() {
         return 0;
@@ -1323,6 +1705,7 @@ pub fn mark_pitfalls_resolved(project_root: &Path, raw_errors: &[String]) -> usi
                 occ_at_injection: occ,
                 recurred_after_warning: false,
                 proven_fix: false,
+                failed_fixes: Vec::new(),
             });
             eff.proven_fix = true;
             eff.recurred_after_warning = false;
@@ -1445,6 +1828,56 @@ mod tests {
     }
 
     #[test]
+    fn normalize_signature_collapses_drift_but_keeps_distinct() {
+        // Clean package names are preserved whole (no false merging).
+        assert_eq!(
+            normalize_signature("dependency/module-not-found/react-router-dom"),
+            "dependency/module-not-found/react-router-dom"
+        );
+        // Path-prefixed module keys collapse to the trailing symbol, so the SAME
+        // missing symbol imported from two different files dedups.
+        assert_eq!(
+            normalize_signature("dependency/module-not-found/components-foo"),
+            "dependency/module-not-found/foo"
+        );
+        assert_eq!(
+            normalize_signature("dependency/module-not-found/src-utils-foo"),
+            normalize_signature("dependency/module-not-found/pages-foo")
+        );
+        // Version suffixes are volatile — a bump is not a new pitfall.
+        assert_eq!(
+            normalize_signature("dependency/module-not-found/lodash-v4"),
+            "dependency/module-not-found/lodash"
+        );
+        assert_eq!(
+            normalize_signature("dependency/module-not-found/react-18"),
+            "dependency/module-not-found/react"
+        );
+        // Family-only signatures (no discriminator) are untouched.
+        assert_eq!(
+            normalize_signature("type/type-mismatch"),
+            "type/type-mismatch"
+        );
+        // Idempotent — recall/resolve normalise the same key twice.
+        let once = normalize_signature("dependency/module-not-found/components-foo");
+        assert_eq!(normalize_signature(&once), once);
+        // An all-volatile discriminator collapses to the family, never unique.
+        assert_eq!(normalize_signature("general/error/42"), "general/error");
+    }
+
+    #[test]
+    fn drifting_path_signatures_accumulate_occurrences() {
+        // Regression for the signature-drift bug: the same root cause whose
+        // offending path differs per file must bump `occurrences`, not fork into
+        // separate single-hit rows. We can't easily make `classify_error` emit a
+        // path discriminator, so assert the normalization the capture path uses
+        // directly merges them.
+        let a = normalize_signature("dependency/module-not-found/components-widget");
+        let b = normalize_signature("dependency/module-not-found/pages-widget");
+        assert_eq!(a, b, "same symbol, different importing dir → one signature");
+    }
+
+    #[test]
     fn lessons_for_error_matches_signature_and_abstains() {
         let tmp = TempDir::new().unwrap();
         let err = "Error: Cannot find module 'react-router-dom'".to_string();
@@ -1556,6 +1989,51 @@ mod tests {
     }
 
     #[test]
+    fn reflexion_records_failed_fix_and_steers_away_next_time() {
+        let tmp = TempDir::new().unwrap();
+        let sig = "dependency/module-not-found/lodash";
+        let err = vec!["Error: Cannot find module 'lodash'".to_string()];
+        let failed_fix = |t: &std::path::Path| {
+            read_raw_lessons(t, DEV_ERRORS_FILE)
+                .into_iter()
+                .find(|l| l.signature == sig)
+                .and_then(|l| l.efficacy)
+                .map(|e| e.failed_fixes)
+                .unwrap_or_default()
+        };
+
+        // 1. First sighting + warn the worker.
+        capture_dev_errors(tmp.path(), &err, "demo", "需求");
+        let _ = relevant_lessons_for_prompt(tmp.path(), "无关一");
+        assert!(
+            failed_fix(tmp.path()).is_empty(),
+            "no failed fix recorded yet"
+        );
+
+        // 2. It recurs DESPITE the warning → the recorded fix is logged as a
+        //    tried-and-failed approach in the Reflexion ledger.
+        capture_dev_errors(tmp.path(), &err, "demo", "需求");
+        let ff = failed_fix(tmp.path());
+        assert_eq!(ff.len(), 1, "the failed fix must be remembered: {ff:?}");
+        assert!(
+            ff[0].contains("install") || !ff[0].is_empty(),
+            "recorded fix text captured"
+        );
+
+        // 3. The at-failure recall now explicitly steers AWAY from the failed
+        //    fix instead of merely re-injecting it.
+        let recall = lessons_for_error(tmp.path(), &err[0]);
+        assert!(
+            recall.contains("已试过但无效的修法"),
+            "recurring recall must list the failed approach: {recall}"
+        );
+
+        // 4. The same failed fix is NOT recorded twice (deduped).
+        capture_dev_errors(tmp.path(), &err, "demo", "需求");
+        assert_eq!(failed_fix(tmp.path()).len(), 1, "failed fix deduped");
+    }
+
+    #[test]
     fn in_run_fix_proves_pitfall_immediately() {
         let tmp = TempDir::new().unwrap();
         let err = vec!["Error: Cannot find module 'lodash'".to_string()];
@@ -1649,6 +2127,170 @@ mod tests {
     }
 
     #[test]
+    fn recency_weight_decays_with_age() {
+        let now = Utc::now();
+        let today = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let month_ago = (now - chrono::Duration::days(30))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let year_ago = (now - chrono::Duration::days(365))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let w_today = recency_weight(&today, now);
+        let w_month = recency_weight(&month_ago, now);
+        let w_year = recency_weight(&year_ago, now);
+        assert!(
+            w_today > w_month && w_month > w_year,
+            "older → smaller weight"
+        );
+        // 30-day half-life → ~0.5 at one month.
+        assert!((w_month - 0.5).abs() < 0.05, "half-life ≈ 30d: {w_month}");
+        // Unparseable timestamp is treated as "now" (fail-open, weight 1.0).
+        assert!((recency_weight("not-a-date", now) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn decay_score_prefers_recent_over_stale_same_relevance() {
+        let now = Utc::now();
+        let recent = (now - chrono::Duration::days(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let stale = (now - chrono::Duration::days(200))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let base = Lesson {
+            kind: LessonKind::DevError,
+            domain: "dependency".into(),
+            title: "踩坑".into(),
+            body: String::new(),
+            fix: String::new(),
+            root_cause: String::new(),
+            keywords: vec!["dependency".into()],
+            source_requirement: String::new(),
+            first_seen: recent.clone(),
+            signature: "dependency/module-not-found/lodash".into(),
+            occurrences: 1,
+            context: vec!["react".into()],
+            efficacy: None,
+        };
+        let stale_lesson = Lesson {
+            first_seen: stale,
+            ..base.clone()
+        };
+        // Same query/relevance, only age differs → recent must score higher.
+        let q: std::collections::HashSet<String> = ["react".to_string(), "lodash".to_string()]
+            .into_iter()
+            .collect();
+        let s_recent = lesson_decay_score(&base, &q, now);
+        let s_stale = lesson_decay_score(&stale_lesson, &q, now);
+        assert!(
+            s_recent > s_stale,
+            "recent lesson must outrank stale (same relevance): {s_recent} vs {s_stale}"
+        );
+    }
+
+    #[test]
+    fn importance_rewards_recurring_and_damps_validated() {
+        let mk = |eff: Option<PitfallEfficacy>| Lesson {
+            kind: LessonKind::DevError,
+            domain: "dependency".into(),
+            title: "踩坑".into(),
+            body: String::new(),
+            fix: String::new(),
+            root_cause: String::new(),
+            keywords: vec![],
+            source_requirement: String::new(),
+            first_seen: "2026-06-21T00:00:00Z".into(),
+            signature: "dependency/module-not-found/lodash".into(),
+            occurrences: 3,
+            context: vec![],
+            efficacy: eff,
+        };
+        let recurring = mk(Some(PitfallEfficacy {
+            injected: 1,
+            occ_at_injection: 1,
+            recurred_after_warning: true,
+            proven_fix: false,
+            failed_fixes: Vec::new(),
+        }));
+        let validated = mk(Some(PitfallEfficacy {
+            injected: 2,
+            occ_at_injection: 3,
+            recurred_after_warning: false,
+            proven_fix: true,
+            failed_fixes: Vec::new(),
+        }));
+        assert!(
+            lesson_importance(&recurring) > lesson_importance(&validated),
+            "a failing (recurring) fix must outweigh a handled (validated) one"
+        );
+    }
+
+    #[test]
+    fn prune_evicts_stale_validated_before_recent_failing() {
+        let now = Utc::now();
+        let recent = (now - chrono::Duration::days(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let ancient = (now - chrono::Duration::days(400))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let mut store: Vec<Lesson> = Vec::new();
+        // One recent, still-failing pitfall we MUST keep.
+        store.push(Lesson {
+            kind: LessonKind::DevError,
+            domain: "dependency".into(),
+            title: "KEEP-recurring".into(),
+            body: String::new(),
+            fix: String::new(),
+            root_cause: String::new(),
+            keywords: vec![],
+            source_requirement: "r".into(),
+            first_seen: recent,
+            signature: "dependency/module-not-found/keep".into(),
+            occurrences: 5,
+            context: vec![],
+            efficacy: Some(PitfallEfficacy {
+                injected: 1,
+                occ_at_injection: 1,
+                recurred_after_warning: true,
+                proven_fix: false,
+                failed_fixes: Vec::new(),
+            }),
+        });
+        // Fill past the cap with ancient, validated (handled) pitfalls.
+        for n in 0..MAX_DEV_PITFALLS + 10 {
+            store.push(Lesson {
+                kind: LessonKind::DevError,
+                domain: "dependency".into(),
+                title: format!("drop-{n}"),
+                body: String::new(),
+                fix: String::new(),
+                root_cause: String::new(),
+                keywords: vec![],
+                source_requirement: "r".into(),
+                first_seen: ancient.clone(),
+                signature: format!("dependency/module-not-found/old-{n}"),
+                occurrences: 1,
+                context: vec![],
+                efficacy: Some(PitfallEfficacy {
+                    injected: 2,
+                    occ_at_injection: 1,
+                    recurred_after_warning: false,
+                    proven_fix: true,
+                    failed_fixes: Vec::new(),
+                }),
+            });
+        }
+        prune_pitfalls(&mut store);
+        assert!(store.len() <= MAX_DEV_PITFALLS);
+        assert!(
+            store.iter().any(|l| l.title == "KEEP-recurring"),
+            "a recent still-failing pitfall must survive eviction of stale validated ones"
+        );
+    }
+
+    #[test]
     fn recognized_dev_error_is_global_worthy_on_first_sight() {
         // A classified pitfall seen in ONE project is still cross-project
         // knowledge → promotes from a single requirement.
@@ -1731,6 +2373,69 @@ mod tests {
         assert_eq!(lessons.len(), 1);
         assert_eq!(lessons[0].kind, LessonKind::Revision);
         assert!(lessons[0].body.contains("数据库设计"));
+    }
+
+    #[test]
+    fn capture_tech_debt_feeds_significant_debt_into_kb() {
+        use crate::tech_debt::{DebtItem, DebtKind, DebtStatus};
+        let tmp = TempDir::new().unwrap();
+        let mk = |kind: DebtKind, line: u32| DebtItem {
+            file: "output/demo-prd.md".into(),
+            line,
+            kind,
+            snippet: "x".into(),
+            first_seen: "2026-06-21T00:00:00Z".into(),
+            status: DebtStatus::Open,
+            resolved_at: String::new(),
+        };
+        let items = vec![
+            mk(DebtKind::FillerText, 3),          // sev 5 → captured
+            mk(DebtKind::FillerText, 7),          // same kind → folded into one lesson
+            mk(DebtKind::UnfilledAcceptance, 12), // sev 4 → captured
+            mk(DebtKind::Todo, 20),               // sev 2 → BELOW threshold, skipped
+        ];
+        let n = capture_tech_debt(tmp.path(), &items, "博客系统");
+        assert_eq!(
+            n, 2,
+            "two significant kinds captured, low-severity TODO skipped"
+        );
+        let raw = read_raw_lessons(tmp.path(), "tech-debt.jsonl");
+        assert_eq!(raw.len(), 2);
+        assert!(raw.iter().all(|l| l.kind == LessonKind::Failure));
+        assert!(raw.iter().all(|l| l.domain == "governance"));
+        // The filler lesson folds the 2 occurrences into one row with a count.
+        let filler = raw
+            .iter()
+            .find(|l| l.title.contains("Filler"))
+            .expect("filler lesson present");
+        assert!(
+            filler.title.contains("2×"),
+            "occurrences folded: {}",
+            filler.title
+        );
+
+        // It joins the sediment loop: read_all + sediment must surface it.
+        let all = read_all_raw_lessons(tmp.path());
+        assert!(all.iter().any(|l| l.title.contains("Tech debt")));
+        let written = sediment_lessons(tmp.path());
+        assert!(written >= 2, "tech-debt lessons sediment to markdown");
+    }
+
+    #[test]
+    fn capture_tech_debt_skips_when_no_significant_debt() {
+        use crate::tech_debt::{DebtItem, DebtKind, DebtStatus};
+        let tmp = TempDir::new().unwrap();
+        let items = vec![DebtItem {
+            file: "output/x.md".into(),
+            line: 1,
+            kind: DebtKind::Todo, // sev 2, below threshold
+            snippet: "TODO".into(),
+            first_seen: "t".into(),
+            status: DebtStatus::Open,
+            resolved_at: String::new(),
+        }];
+        assert_eq!(capture_tech_debt(tmp.path(), &items, "r"), 0);
+        assert!(read_raw_lessons(tmp.path(), "tech-debt.jsonl").is_empty());
     }
 
     #[test]
@@ -1872,6 +2577,33 @@ mod tests {
         // Keywords in body (for BM25).
         assert!(content.contains("Keywords:"));
         assert!(content.contains("openapi"));
+    }
+
+    #[test]
+    fn sediment_invalidates_kb_index_cache() {
+        let tmp = TempDir::new().unwrap();
+        // Pre-seed a stale kb-index signature file (as if an index was already
+        // built+cached BEFORE this run learned anything new).
+        let kb_dir = tmp.path().join(".umadev/kb-index");
+        fs::create_dir_all(&kb_dir).unwrap();
+        let sig = kb_dir.join("bm25.sig");
+        fs::write(&sig, "stale-signature").unwrap();
+        assert!(sig.is_file());
+
+        // Sediment new lessons → the stale cache signature must be removed so the
+        // next retrieval rebuilds and can see what we just learned this run.
+        capture_quality_failures(
+            tmp.path(),
+            &[check("OpenAPI contract", "failed", 0)],
+            "demo",
+            "api contract openapi",
+        );
+        let written = sediment_lessons(tmp.path());
+        assert!(written > 0, "sediment should write at least one lesson");
+        assert!(
+            !sig.exists(),
+            "sediment must invalidate the stale kb-index cache signature"
+        );
     }
 
     #[test]

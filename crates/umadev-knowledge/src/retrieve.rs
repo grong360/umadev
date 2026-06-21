@@ -252,29 +252,84 @@ pub fn retrieve_with_vector(
     let bm25_hits = filter_by_phase(&index, &bm25_raw, phase, config.top_k);
 
     // Vector fusion only when: hybrid engine, vector layer enabled, a query
-    // vector was provided, AND the store actually has vectors.
+    // vector was provided, AND the store actually has vectors. Whichever ranked
+    // list we end up with, it flows through ONE unified post-rank ([`normalise`]
+    // + [`dedup_learned_chunks`]) so duplicate sedimented lessons can't be
+    // injected twice (see the dedup rationale below).
     let use_vector =
         config.engine == RetrievalEngine::Hybrid && vector::is_enabled() && query_vec.is_some();
-    if !use_vector {
-        return normalise(&index, bm25_hits);
-    }
-    let query_vec = query_vec.unwrap_or(&[]);
+    let ranked = if use_vector {
+        let query_vec = query_vec.unwrap_or(&[]);
+        let store = vector::VectorStore::load(project_root);
+        let vec_hits = if store.is_empty() {
+            Vec::new()
+        } else {
+            store.search(query_vec, config.top_k * 3)
+        };
+        if vec_hits.is_empty() {
+            bm25_hits
+        } else {
+            // Real RRF fusion: merge the two ranked lists. Fall back to BM25 if
+            // fusion somehow empties (defensive).
+            let fused = rrf_fuse(&index, &bm25_hits, &vec_hits, RRF_K, config.top_k);
+            if fused.is_empty() {
+                bm25_hits
+            } else {
+                fused
+            }
+        }
+    } else {
+        bm25_hits
+    };
+    dedup_learned_chunks(normalise(&index, ranked))
+}
 
-    let store = vector::VectorStore::load(project_root);
-    if store.is_empty() {
-        return normalise(&index, bm25_hits);
+/// Collapse duplicate sedimented-lesson chunks so the SAME learned lesson is
+/// never injected twice into one prompt.
+///
+/// The capture→sediment loop writes a lesson to BOTH the project dir
+/// (`.umadev/learned/<domain>/lesson-*.md`) AND, once it's "global-worthy", the
+/// user-home dir (`~/.umadev/learned/<domain>/<slug>.md`) with near-identical
+/// content. Both dirs are indexed, so a plain BM25/RRF ranking can return the
+/// project copy AND the global copy of one lesson — the worker then sees the
+/// same guidance twice (noisy, and risks looking contradictory when an older
+/// global copy lags a fresher project one).
+///
+/// This is the conservative half of the "unified reranker": rather than fuse the
+/// agent crate's fingerprint channel in here (which would couple the two crates
+/// and threaten the closed loop), we de-duplicate WITHIN this BM25/RRF channel
+/// by CONTENT IDENTITY — `(section, title, first non-empty body line)`. Two
+/// chunks sharing all three are the same material (the project + global copies
+/// of one lesson have different filenames but identical content), so only the
+/// first — i.e. higher-scored, since the list is already score-sorted — is kept.
+///
+/// Keying on content rather than a fragile `is_lesson` path heuristic means a
+/// promoted-global lesson (whose filename is a slug, not `lesson-*`) still
+/// collapses against its project copy. It is also safe for curated `knowledge/`:
+/// distinct curated chunks never share an identical (section, title, first line)
+/// triple, so they pass through untouched. Fail-open: order is otherwise
+/// preserved and a unique chunk is never dropped.
+fn dedup_learned_chunks(hits: Vec<ScoredChunk>) -> Vec<ScoredChunk> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<ScoredChunk> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let first_line = hit
+            .chunk
+            .body
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("");
+        let key = format!(
+            "{}\0{}\0{}",
+            hit.chunk.meta.title, hit.chunk.meta.section, first_line
+        );
+        if seen.insert(key) {
+            out.push(hit); // first (highest-scored) copy of this content
+        }
+        // else: an identical-content, lower-scored copy → drop it.
     }
-    let vec_hits = store.search(query_vec, config.top_k * 3);
-    if vec_hits.is_empty() {
-        return normalise(&index, bm25_hits);
-    }
-
-    // Real RRF fusion: merge the two ranked lists.
-    let fused = rrf_fuse(&index, &bm25_hits, &vec_hits, RRF_K, config.top_k);
-    if fused.is_empty() {
-        return normalise(&index, bm25_hits);
-    }
-    normalise(&index, fused)
+    out
 }
 
 /// Standard RRF constant. `k=60` is the value used by Elasticsearch and the
@@ -679,6 +734,56 @@ mod tests {
         assert_eq!(back.engine, RetrievalEngine::Hybrid);
         assert_eq!(back.top_k, 12);
         assert!(!back.enabled);
+    }
+
+    #[test]
+    fn dedup_learned_chunks_collapses_duplicate_lessons() {
+        // Two copies of ONE sedimented lesson (project + global) with different
+        // paths but identical title + body → must collapse to a single hit.
+        let proj = crate::chunker::chunk_text(
+            "frontend/lesson-frontend-1.md",
+            "# Lesson\n\n## Symptom\n\nthe avoid-color pitfall body here",
+        );
+        let glob = crate::chunker::chunk_text(
+            "frontend/api-Validated-color.md",
+            "# Lesson\n\n## Symptom\n\nthe avoid-color pitfall body here",
+        );
+        // A distinct curated knowledge chunk that must NOT be touched.
+        let curated = crate::chunker::chunk_text(
+            "design/tokens.md",
+            "# Tokens\n\n## Color\n\nuse design tokens not hex",
+        );
+        let mk = |c: &Chunk, s: f32| ScoredChunk {
+            chunk: c.clone(),
+            score: s,
+        };
+        let hits = vec![
+            mk(&proj[0], 1.0),    // higher-scored copy → kept
+            mk(&glob[0], 0.8),    // duplicate lesson → dropped
+            mk(&curated[0], 0.7), // distinct knowledge → kept
+        ];
+        let out = dedup_learned_chunks(hits);
+        assert_eq!(out.len(), 2, "duplicate lesson collapsed, curated kept");
+        // The kept lesson copy is the higher-scored project one.
+        assert!(out[0].chunk.meta.path.contains("lesson-frontend-1"));
+        assert!(out
+            .iter()
+            .any(|h| h.chunk.meta.path.contains("design/tokens")));
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_lessons() {
+        // Two genuinely different lessons (different titles) must both survive.
+        let a =
+            crate::chunker::chunk_text("frontend/lesson-frontend-1.md", "# A\n\n## S\n\nbody a");
+        let b =
+            crate::chunker::chunk_text("frontend/lesson-frontend-2.md", "# B\n\n## S\n\nbody b");
+        let mk = |c: &Chunk, s: f32| ScoredChunk {
+            chunk: c.clone(),
+            score: s,
+        };
+        let out = dedup_learned_chunks(vec![mk(&a[0], 1.0), mk(&b[0], 0.9)]);
+        assert_eq!(out.len(), 2, "distinct lessons must not be merged");
     }
 
     #[test]

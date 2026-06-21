@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 pub const DEBT_LEDGER: &str = ".umadev/tech-debt.jsonl";
 
 /// The kind of placeholder marker found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DebtKind {
     /// A literal `TODO` token.

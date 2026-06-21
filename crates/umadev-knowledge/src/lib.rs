@@ -70,8 +70,8 @@ pub mod vector;
 
 pub use chunker::{chunk_file, chunk_text, Chunk, ChunkMeta};
 pub use index::{
-    bm25_search, build_index, build_vector_store_if_enabled, load_or_build_index, Bm25Index,
-    Posting,
+    bm25_search, build_index, build_vector_store_if_enabled, invalidate_cache, load_or_build_index,
+    Bm25Index, Posting,
 };
 pub use retrieve::{
     retrieve, retrieve_for_phase, retrieve_for_phase_with_vector, retrieve_with_vector,

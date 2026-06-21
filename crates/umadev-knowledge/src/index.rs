@@ -186,6 +186,23 @@ fn index_path(project_root: &Path) -> PathBuf {
     project_root.join(super::KB_INDEX_DIR).join("bm25.bin")
 }
 
+/// Force the next [`load_or_build_index_multi`] to REBUILD from source instead
+/// of loading the cache, by removing the on-disk signature file.
+///
+/// The cache is keyed on a content-hash signature of the corpus. That makes a
+/// rebuild happen whenever a source `.md` changes — but a caller that has just
+/// written NEW lesson files and wants them retrievable *within the same run*
+/// can't wait for an organic content change to be noticed: it must invalidate
+/// the cache explicitly so the very next retrieval re-scans the (now larger)
+/// corpus. This is the write-side half of closing the sediment→index→retrieve
+/// loop inside one run (see `lessons::sediment_lessons`). Fail-open: a missing
+/// or unremovable signature file is ignored (a stale `.sig` only costs one
+/// extra organic rebuild later, never correctness).
+pub fn invalidate_cache(project_root: &Path) {
+    let sig_path = index_path(project_root).with_extension("sig");
+    let _ = std::fs::remove_file(&sig_path);
+}
+
 /// Build (or rebuild) the index from all `.md` files under `knowledge_dir`,
 /// serialise it to disk, and return it. Always overwrites the on-disk copy.
 ///
@@ -706,6 +723,44 @@ mod tests {
         .unwrap();
         let idx3 = load_or_build_index(root, &kd);
         assert!(!idx3.chunks.is_empty());
+    }
+
+    #[test]
+    fn invalidate_cache_forces_rebuild_picking_up_new_files() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let kd = root.join("knowledge");
+        fs::create_dir_all(&kd).unwrap();
+        fs::write(kd.join("a.md"), "# A\n\n## S\n\nalpha content").unwrap();
+
+        // Build + cache the index over the initial corpus.
+        let idx1 = load_or_build_index(root, &kd);
+        let chunks1 = idx1.chunks.len();
+        assert!(root.join(".umadev/kb-index/bm25.sig").is_file());
+
+        // Add a NEW file. Without invalidation, simulate the in-run race: the
+        // signature file still describes the old corpus. Invalidate it, then the
+        // next load MUST rebuild and include the new file's content.
+        fs::write(kd.join("b.md"), "# B\n\n## S\n\nbeta brandnewterm").unwrap();
+        invalidate_cache(root);
+
+        let idx2 = load_or_build_index(root, &kd);
+        assert!(
+            idx2.chunks.len() > chunks1,
+            "rebuild must include the newly-written file"
+        );
+        assert!(
+            !idx2.search("brandnewterm", 5).is_empty(),
+            "the freshly-added content must be retrievable after invalidation"
+        );
+    }
+
+    #[test]
+    fn invalidate_cache_missing_sig_is_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No index built yet → no .sig file. Must not panic / error (fail-open).
+        invalidate_cache(tmp.path());
     }
 
     #[test]
