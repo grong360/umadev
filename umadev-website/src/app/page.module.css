@@ -513,11 +513,12 @@
   color: #04181d;
   font-size: 15px;
   font-weight: 800;
-  background: linear-gradient(180deg, var(--cyan), var(--cyan-2));
+  background: var(--duo);
   border-radius: 11px;
   box-shadow:
-    0 8px 28px -8px rgba(1, 203, 241, 0.5),
-    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    0 10px 30px -10px rgba(255, 50, 198, 0.45),
+    0 10px 30px -12px rgba(1, 203, 241, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24);
   transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease;
 }
 
@@ -1599,6 +1600,18 @@
   border-radius: 22px;
 }
 
+/* Docs: section anchors clear the sticky header on smooth-scroll; subtle
+   separators between sections in the single long-scroll page. */
+.docSection {
+  scroll-margin-top: 100px;
+}
+
+.docSection:not(:first-child) {
+  margin-top: 46px;
+  padding-top: 42px;
+  border-top: 1px solid rgba(1, 203, 241, 0.12);
+}
+
 .docArticle h2,
 .releaseList h2 {
   margin: 0 0 24px;
@@ -2099,10 +2112,23 @@
 }
 
 .heroBackdrop img {
-  object-fit: cover;
-  object-position: 68% center;
-  filter: saturate(0.92) brightness(0.72) contrast(1.08);
-  transform: scale(1.04);
+  object-fit: contain;
+  object-position: right center;
+  filter: saturate(1.05) brightness(0.98) contrast(1.04);
+  transform: scale(1.02);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, #000 32%, #000 100%);
+  mask-image: linear-gradient(90deg, transparent 0%, #000 32%, #000 100%);
+}
+
+.heroBackdrop::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(58% 48% at 16% 38%, rgba(1, 203, 241, 0.2), transparent 70%),
+    radial-gradient(54% 46% at 84% 90%, rgba(255, 50, 198, 0.18), transparent 70%);
+  mix-blend-mode: screen;
 }
 
 .heroMark {
@@ -3118,4 +3144,170 @@
   .hero h1 {
     font-size: 36px;
   }
+}
+
+/* Keep hero copy clean: background imagery must not show text behind the H1. */
+.hero::before {
+  background:
+    linear-gradient(90deg, rgba(1, 2, 6, 0.99) 0%, rgba(1, 2, 6, 0.96) 38%, rgba(1, 2, 6, 0.72) 61%, rgba(1, 2, 6, 0.9) 100%),
+    radial-gradient(circle at 78% 38%, rgba(1, 203, 241, 0.18), transparent 30%),
+    linear-gradient(180deg, rgba(1, 2, 6, 0.72) 0%, rgba(1, 2, 6, 0.25) 44%, rgba(1, 2, 6, 0.98) 100%);
+}
+
+.heroBackdrop img {
+  object-position: 78% center;
+  filter: saturate(0.72) brightness(0.34) contrast(1.08);
+}
+
+/* Use the wide agent artwork as atmosphere only; hide its built-in copy behind the headline. */
+.hero::before {
+  background:
+    linear-gradient(90deg, rgba(1, 2, 6, 1) 0%, rgba(1, 2, 6, 0.99) 36%, rgba(1, 2, 6, 0.76) 58%, rgba(1, 2, 6, 0.58) 100%),
+    radial-gradient(circle at 79% 44%, rgba(1, 203, 241, 0.16), transparent 30%),
+    linear-gradient(180deg, rgba(1, 2, 6, 0.86) 0%, rgba(1, 2, 6, 0.2) 48%, rgba(1, 2, 6, 0.98) 100%);
+}
+
+.heroBackdrop img {
+  object-position: 82% center;
+  filter: saturate(0.84) brightness(0.38) contrast(1.08);
+  transform: scale(1.08);
+}
+
+/* --- IP mascot gallery (相册) --- */
+.galleryGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(176px, 1fr));
+  gap: 16px;
+  padding-bottom: 90px;
+}
+
+.galleryItem {
+  position: relative;
+  aspect-ratio: 1;
+  overflow: hidden;
+  background: rgba(9, 14, 19, 0.6);
+  border: 1px solid rgba(1, 203, 241, 0.16);
+  border-radius: 16px;
+  cursor: zoom-in;
+  transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.galleryItem:hover {
+  transform: translateY(-3px);
+  border-color: rgba(1, 203, 241, 0.5);
+  box-shadow: 0 14px 32px -14px rgba(1, 203, 241, 0.45);
+}
+
+.galleryImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* Final interaction polish: global cyan cursor glow and theme-only buttons. */
+.pointerGlow {
+  z-index: 6;
+  background:
+    radial-gradient(190px circle at var(--mx) var(--my), rgba(1, 203, 241, 0.07), rgba(1, 203, 241, 0.022) 34%, transparent 72%),
+    radial-gradient(54px circle at var(--mx) var(--my), rgba(210, 250, 255, 0.035), transparent 76%);
+  opacity: 0.58;
+  mix-blend-mode: screen;
+  transition: background-position 80ms linear;
+}
+
+.shell::before {
+  z-index: 5;
+  background:
+    radial-gradient(300px circle at var(--mx) var(--my), rgba(1, 203, 241, 0.045), transparent 72%),
+    radial-gradient(86px circle at var(--mx) var(--my), rgba(255, 255, 255, 0.018), transparent 76%);
+  mix-blend-mode: screen;
+}
+
+.heroActions a,
+.cta a {
+  color: #02171c;
+  background: linear-gradient(180deg, #44e4ff 0%, #01cbf1 54%, #029dbb 100%);
+  border: 1px solid rgba(184, 249, 255, 0.44);
+  box-shadow:
+    0 14px 34px -20px rgba(1, 203, 241, 0.72),
+    inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+
+.heroActions a:hover,
+.cta a:hover {
+  filter: brightness(1.04) saturate(1.08);
+  box-shadow:
+    0 18px 42px -22px rgba(1, 203, 241, 0.86),
+    inset 0 1px 0 rgba(255, 255, 255, 0.32);
+}
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5vh 6vw;
+  background: rgba(3, 6, 9, 0.93);
+  backdrop-filter: blur(8px);
+}
+
+.lightboxImg {
+  width: auto;
+  height: auto;
+  max-width: min(86vw, 720px);
+  max-height: 86vh;
+  object-fit: contain;
+  border-radius: 18px;
+  box-shadow: 0 30px 90px -24px rgba(1, 203, 241, 0.55);
+}
+
+.lightboxClose,
+.lightboxNav {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  color: #cde9f0;
+  line-height: 1;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(1, 203, 241, 0.22);
+  border-radius: 50%;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.lightboxClose:hover,
+.lightboxNav:hover {
+  background: rgba(1, 203, 241, 0.18);
+  border-color: rgba(1, 203, 241, 0.55);
+}
+
+.lightboxClose {
+  top: 22px;
+  right: 26px;
+  width: 44px;
+  height: 44px;
+  font-size: 26px;
+}
+
+.lightboxNav {
+  top: 50%;
+  width: 52px;
+  height: 52px;
+  font-size: 32px;
+  transform: translateY(-50%);
+}
+
+.lightboxNav[data-side="prev"] { left: 3vw; }
+.lightboxNav[data-side="next"] { right: 3vw; }
+
+.lightboxCount {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  color: #7a8b9a;
+  font-family: var(--font-mono), monospace;
+  font-size: 13px;
+  transform: translateX(-50%);
 }

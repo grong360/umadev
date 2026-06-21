@@ -2,8 +2,8 @@
 
 import Image from "next/image";
 import type { PointerEvent as ReactPointerEvent } from "react";
-import { useRef, useState } from "react";
-import { docs, i18n, releases, type DocBlock, type Lang, type View } from "./content";
+import { useEffect, useRef, useState } from "react";
+import { docs, gallery, i18n, releases, type DocBlock, type Lang, type View } from "./content";
 import styles from "./page.module.css";
 
 const githubUrl = "https://github.com/umacloud/umadev";
@@ -16,6 +16,7 @@ export default function Home() {
   const [stageIndex, setStageIndex] = useState(0);
   const [mode, setMode] = useState("claude-code");
   const [docId, setDocId] = useState("quickstart");
+  const [lightbox, setLightbox] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stageButtonRefs = useRef<(HTMLButtonElement | null)[]>([]);
@@ -27,6 +28,45 @@ export default function Home() {
   const activeDoc =
     docCats.flatMap((cat) => cat.items).find((item) => item.id === docId) ??
     docCats[0].items[0];
+
+  // Docs: scroll-spy — highlight the sidebar entry for the section near the top
+  // of the viewport as the reader scrolls (the big-docs pattern).
+  useEffect(() => {
+    if (view !== "docs") return;
+    const sections = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-doc-section]"),
+    );
+    if (sections.length === 0) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible[0]) setDocId(visible[0].target.id);
+      },
+      { rootMargin: "-15% 0px -75% 0px" },
+    );
+    sections.forEach((sec) => observer.observe(sec));
+    return () => observer.disconnect();
+  }, [view, lang]);
+
+  // Lightbox: Esc closes, arrows navigate, lock background scroll while open.
+  useEffect(() => {
+    if (lightbox === null) return;
+    document.body.style.overflow = "hidden";
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setLightbox(null);
+      else if (e.key === "ArrowLeft")
+        setLightbox((p) => (p === null ? null : (p - 1 + gallery.length) % gallery.length));
+      else if (e.key === "ArrowRight")
+        setLightbox((p) => (p === null ? null : (p + 1) % gallery.length));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = "";
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [lightbox]);
 
   const heroTitle = `${t.hero.title1} ${t.hero.titleHi}${t.hero.title2}`;
   const titleLines =
@@ -65,9 +105,8 @@ export default function Home() {
   }
 
   function trackPointer(event: ReactPointerEvent<HTMLDivElement>) {
-    const rect = event.currentTarget.getBoundingClientRect();
-    event.currentTarget.style.setProperty("--mx", `${event.clientX - rect.left}px`);
-    event.currentTarget.style.setProperty("--my", `${event.clientY - rect.top}px`);
+    event.currentTarget.style.setProperty("--mx", `${event.clientX}px`);
+    event.currentTarget.style.setProperty("--my", `${event.clientY}px`);
   }
 
   return (
@@ -97,6 +136,9 @@ export default function Home() {
           </button>
           <button className={navClass(view === "docs")} type="button" onClick={() => go("docs")}>
             {t.nav.docs}
+          </button>
+          <button className={navClass(view === "gallery")} type="button" onClick={() => go("gallery")}>
+            {t.nav.gallery}
           </button>
           <button
             className={navClass(view === "changelog")}
@@ -137,7 +179,7 @@ export default function Home() {
             <section className={styles.hero}>
               <div className={styles.heroBackdrop} aria-hidden="true">
                 <Image
-                  src="/assets/umadev/hero-city-agent.png"
+                  src="/assets/umadev/hero-agent-backdrop.png"
                   alt=""
                   fill
                   priority
@@ -407,7 +449,9 @@ export default function Home() {
                         type="button"
                         onClick={() => {
                           setDocId(item.id);
-                          window.scrollTo({ top: 0, behavior: "smooth" });
+                          document
+                            .getElementById(item.id)
+                            ?.scrollIntoView({ behavior: "smooth", block: "start" });
                         }}
                       >
                         {item.title}
@@ -417,10 +461,21 @@ export default function Home() {
                 ))}
               </aside>
               <article className={styles.docArticle}>
-                <h2>{activeDoc.title}</h2>
-                {activeDoc.blocks.map((block, index) => (
-                  <DocBlockView block={block} key={index} />
-                ))}
+                {docCats
+                  .flatMap((cat) => cat.items)
+                  .map((item) => (
+                    <section
+                      className={styles.docSection}
+                      data-doc-section
+                      id={item.id}
+                      key={item.id}
+                    >
+                      <h2>{item.title}</h2>
+                      {item.blocks.map((block, index) => (
+                        <DocBlockView block={block} key={index} />
+                      ))}
+                    </section>
+                  ))}
               </article>
             </div>
           </section>
@@ -453,7 +508,64 @@ export default function Home() {
             </div>
           </section>
         )}
+
+        {view === "gallery" && (
+          <section className={styles.docsPage}>
+            <PageHero title={t.galleryPage.title} sub={t.galleryPage.sub} />
+            <div className={styles.galleryGrid}>
+              {gallery.map((src, i) => (
+                <button className={styles.galleryItem} key={src} onClick={() => setLightbox(i)} type="button">
+                  <Image alt={`UmaDev IP ${i + 1}`} className={styles.galleryImg} height={420} src={src} unoptimized width={420} />
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
       </main>
+
+      {lightbox !== null && (
+        <div aria-modal="true" className={styles.lightbox} onClick={() => setLightbox(null)} role="dialog">
+          <button aria-label="Close" className={styles.lightboxClose} onClick={() => setLightbox(null)} type="button">
+            ×
+          </button>
+          <button
+            aria-label="Previous"
+            className={styles.lightboxNav}
+            data-side="prev"
+            onClick={(e) => {
+              e.stopPropagation();
+              setLightbox((p) => (p === null ? null : (p - 1 + gallery.length) % gallery.length));
+            }}
+            type="button"
+          >
+            ‹
+          </button>
+          <Image
+            alt={`UmaDev IP ${lightbox + 1}`}
+            className={styles.lightboxImg}
+            height={1100}
+            onClick={(e) => e.stopPropagation()}
+            src={gallery[lightbox]}
+            unoptimized
+            width={1100}
+          />
+          <button
+            aria-label="Next"
+            className={styles.lightboxNav}
+            data-side="next"
+            onClick={(e) => {
+              e.stopPropagation();
+              setLightbox((p) => (p === null ? null : (p + 1) % gallery.length));
+            }}
+            type="button"
+          >
+            ›
+          </button>
+          <span className={styles.lightboxCount}>
+            {lightbox + 1} / {gallery.length}
+          </span>
+        </div>
+      )}
 
       <footer className={styles.footer}>
         <div>

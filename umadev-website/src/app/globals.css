@@ -8,6 +8,10 @@
   --muted-2: #718596;
   --cyan: #01cbf1;
   --cyan-2: #01a9cf;
+  --magenta: #ff32c6;
+  --magenta-2: #c91f9e;
+  --duo: linear-gradient(118deg, #01cbf1 0%, #4dd0f0 42%, #ff32c6 100%);
+  --line-magenta: rgba(255, 50, 198, 0.4);
   --green: #48d6a8;
   --gold: #e5a84b;
   --line: rgba(1, 203, 241, 0.24);

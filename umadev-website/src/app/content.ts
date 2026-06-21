@@ -1,5 +1,5 @@
 export type Lang = "zh" | "en";
-export type View = "home" | "docs" | "changelog";
+export type View = "home" | "docs" | "gallery" | "changelog";
 
 export type DocBlock =
   | { h: string }
@@ -10,7 +10,7 @@ export type DocBlock =
 
 export const i18n = {
   zh: {
-    nav: { product: "产品首页", docs: "文档中心", changelog: "更新日志" },
+    nav: { product: "产品首页", docs: "文档中心", gallery: "形象相册", changelog: "更新日志" },
     hero: {
       badge: "v1.0.0 · MIT 开源 · Rust 单二进制",
       title1: "把 AI 编码工具，变成",
@@ -123,6 +123,7 @@ export const i18n = {
       note: "npm install -g umadev",
     },
     docsPage: { title: "文档中心", sub: "从安装到交付，UmaDev 的完整使用文档。", onThis: "本页内容" },
+    galleryPage: { title: "形象相册", sub: "UmaDev 的 IP 形象集 —— 点击任意一张放大查看。" },
     logPage: { title: "更新日志", sub: "UmaDev 各版本的新增、改进与安全更新。", current: "当前版本" },
     footer: {
       blurb: "把「AI 写代码」变成一个完整、可上线、可审计的交付过程。",
@@ -150,7 +151,7 @@ export const i18n = {
     ],
   },
   en: {
-    nav: { product: "Home", docs: "Docs", changelog: "Changelog" },
+    nav: { product: "Home", docs: "Docs", gallery: "Gallery", changelog: "Changelog" },
     hero: {
       badge: "v1.0.0 · MIT licensed · Single Rust binary",
       title1: "Turn your AI coding tool into a",
@@ -263,6 +264,7 @@ export const i18n = {
       note: "npm install -g umadev",
     },
     docsPage: { title: "Documentation", sub: "From install to delivery — the complete UmaDev guide.", onThis: "On this page" },
+    galleryPage: { title: "Mascot gallery", sub: "The UmaDev IP mascot set — click any image to enlarge." },
     logPage: { title: "Changelog", sub: "Every UmaDev release — what was added, improved and secured.", current: "Latest" },
     footer: {
       blurb: "Turn “AI writes code” into a complete, shippable, auditable delivery process.",
@@ -455,3 +457,8 @@ export const releases = {
     { ver: "1.0.0", date: "2026-06-21", current: true, title: "First public release — AI coding project-director agent", changes: [["Added", "Full 9-phase commercial-delivery pipeline: research → docs → spec → frontend → backend → quality → delivery, with docs-confirm and preview-confirm human-in-the-loop gates"], ["Added", "Three local CLI backends — Claude Code, Codex CLI, OpenCode — driving your already-logged-in CLI and sharing its own model and reasoning effort; UmaDev holds no API key of its own"], ["Added", "Parallel fan-out: the docs phase drafts architecture and UI/UX concurrently to cut delivery wall-clock"], ["Added", "UIUX conformance gate + anti-AI-slop design law: named bans (default indigo / purple gradients / emoji icons / template skeletons) and design-token discipline; UI that drifts from the declared design system is auto-rejected and redone"], ["Added", "Fail-open governance kernel: pre-write hook + CI + quality-gate sweep; blocks emoji icons, hardcoded colors and AI-slop; compliance mapping for SOC 2 · ISO 27001 · EU AI Act"], ["Added", "Knowledge base: 416 engineering-standard docs, BM25 + optional vector hybrid retrieval (RRF fusion), pluggable team knowledge"], ["Added", "Frontend/backend contract validation: parse the architecture API table, render OpenAPI, and check that frontend fetch calls align"], ["Added", "Self-learning pitfall KB: auto-detects errors and proactively avoids the same class of problem next time by tech-stack fingerprint"], ["Added", "Quality gate + proof pack: scorecard.html, proof-pack.zip delivery proof and an audit evidence chain"], ["Added", "Trilingual TUI (Simplified / Traditional Chinese / English), MCP server + manager; pure-Rust single binary, ten crates, zero external process dependencies"]] },
   ],
 } as const;
+
+export const gallery = Array.from({ length: 45 }, (_, index) => {
+  const n = String(index + 1).padStart(2, "0");
+  return `/assets/umadev/ip/uma-ip-${n}.png`;
+});
