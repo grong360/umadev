@@ -918,6 +918,10 @@ impl App {
         ("rewind", "list/rewind file checkpoints (/rewind [id])"),
         ("config", "show all current configuration"),
         ("init", "write umadev.yaml manifest"),
+        (
+            "adopt",
+            "adopt an EXISTING project (detect stack, index source, derive contract)",
+        ),
         ("continue", "approve the active gate"),
         ("revise", "stay at gate, request changes"),
         ("manual", "review each checkpoint before continuing"),
@@ -2398,6 +2402,19 @@ impl App {
             "skill" => {
                 let output = self.run_subprocess_cli("skill list");
                 self.push(ChatRole::System, format!("[skill] Skills:\n\n{output}"));
+                Action::None
+            }
+            "adopt" => {
+                // Brownfield onboarding of the CURRENT workspace. Delegates to
+                // the `umadev adopt` subprocess (fail-open there) so the TUI
+                // shares one implementation with the CLI verb, then surfaces
+                // its summary in the transcript.
+                self.push(
+                    ChatRole::UmaDev,
+                    umadev_i18n::t(self.lang, "adopt.tui_running"),
+                );
+                let output = self.run_subprocess_cli("adopt");
+                self.push(ChatRole::System, output);
                 Action::None
             }
             "cancel" | "abort" => {

@@ -105,6 +105,37 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Adopt an EXISTING repository (brownfield): detect the stack, index the
+    /// source, reverse-derive the API contract, and write a lean boundary doc.
+    #[command(
+        long_about = "Adopt an EXISTING project so UmaDev can work on it INCREMENTALLY\n\
+                      (brownfield), instead of scaffolding a brand-new app.\n\
+                      \n\
+                      `adopt` runs five fail-open steps on the workspace:\n  \
+                      1. detect the stack + recover real test/build/lint commands\n  \
+                      2. index your source tree into .umadev/project-source-index/\n  \
+                      3. reverse-derive an API contract from existing frontend calls\n     \
+                         into .umadev/contracts/ (the adopted baseline)\n  \
+                      4. write a lean UMADEV.md boundary brief (commands + rules)\n  \
+                      5. drop a .umadev/adopt.json baseline marker so later runs\n     \
+                         bias toward incremental change, not a rewrite\n\
+                      \n\
+                      Nothing in your source is modified — adopt only writes the\n\
+                      UmaDev artifacts above. Re-running is safe (idempotent).",
+        after_help = "EXAMPLES:\n  \
+                      umadev adopt                       # adopt the current directory\n  \
+                      umadev adopt ./legacy-app          # adopt a specific path\n  \
+                      umadev adopt --project-root ./app  # equivalent, explicit flag"
+    )]
+    Adopt {
+        /// Path to the existing repository to adopt. Defaults to the current
+        /// directory. (A positional alias for `--project-root`.)
+        path: Option<PathBuf>,
+        /// Workspace root; defaults to current directory. Overrides `path`
+        /// when both are given.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
     /// Drive the pipeline from `research` to the first gate (`docs_confirm`).
     #[command(
         hide = true,
@@ -618,6 +649,7 @@ async fn main() -> Result<()> {
             project_root,
             force,
         } => cmd_init(slug, project_root, force),
+        Command::Adopt { path, project_root } => cmd_adopt(path, project_root),
         Command::Run {
             requirement,
             backend,
@@ -1340,6 +1372,90 @@ opencode.json
     println!("Inside the TUI:");
     println!("  /claude, /codex, /opencode   switch base CLI (each uses its OWN login + model)");
     println!("  /status                      show the active base and its driving model");
+    Ok(())
+}
+
+/// `umadev adopt [path]` — onboard an EXISTING repository (brownfield). Detects
+/// the stack, indexes the source tree, reverse-derives the API contract,
+/// writes a lean boundary doc, and drops the baseline marker. Fail-open: the
+/// underlying `run_adopt` never errors, so this prints a summary even on a
+/// sparse / empty workspace.
+fn cmd_adopt(path: Option<PathBuf>, project_root: Option<PathBuf>) -> Result<()> {
+    let lang = cli_lang();
+    // `--project-root` wins over the positional `path`; else the positional;
+    // else cwd.
+    let workspace = resolve_root(project_root.or(path))?;
+    let report = umadev_agent::run_adopt(&workspace);
+
+    if report.looks_adopted() {
+        println!("{}", umadev_i18n::t(lang, "adopt.title"));
+    } else {
+        println!("{}", umadev_i18n::t(lang, "adopt.empty"));
+    }
+    println!(
+        "{}",
+        umadev_i18n::tf(lang, "adopt.workspace", &[&workspace.display().to_string()])
+    );
+    println!("{}", umadev_i18n::tf(lang, "adopt.stack", &[&report.stack]));
+    if !report.dev_server.is_empty() {
+        println!(
+            "{}",
+            umadev_i18n::tf(lang, "adopt.dev_server", &[&report.dev_server])
+        );
+    }
+
+    // Commands.
+    if report.commands.is_empty() {
+        println!("{}", umadev_i18n::t(lang, "adopt.no_commands"));
+    } else {
+        println!("{}", umadev_i18n::t(lang, "adopt.commands_header"));
+        for c in &report.commands {
+            println!(
+                "{}",
+                umadev_i18n::tf(lang, "adopt.command_line", &[&c.name, &c.command])
+            );
+        }
+    }
+
+    // Counts.
+    println!(
+        "{}",
+        umadev_i18n::tf(
+            lang,
+            "adopt.api_count",
+            &[&report.api_endpoints.to_string()]
+        )
+    );
+    println!(
+        "{}",
+        umadev_i18n::tf(
+            lang,
+            "adopt.index_count",
+            &[
+                &report.indexed_files.to_string(),
+                &report.indexed_chunks.to_string(),
+            ],
+        )
+    );
+
+    // Artifacts written.
+    if !report.artifacts.is_empty() {
+        println!("{}", umadev_i18n::t(lang, "adopt.artifacts_header"));
+        for a in &report.artifacts {
+            println!("{}", umadev_i18n::tf(lang, "adopt.artifact_line", &[a]));
+        }
+    }
+
+    // Skips / notes (fail-open visibility).
+    if !report.notes.is_empty() {
+        println!("{}", umadev_i18n::t(lang, "adopt.notes_header"));
+        for n in &report.notes {
+            println!("{}", umadev_i18n::tf(lang, "adopt.note_line", &[n]));
+        }
+    }
+
+    println!();
+    println!("{}", umadev_i18n::t(lang, "adopt.next_steps"));
     Ok(())
 }
 
