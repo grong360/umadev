@@ -249,14 +249,19 @@ fn cream_band_hex(lower: &str) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'#' && i + 7 <= bytes.len() {
-            let hex = &lower[i + 1..i + 7];
-            if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-                let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-                let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
-                let warmth = i32::from(r) - i32::from(b);
-                if r.min(g).min(b) >= 209 && r >= g && g >= b && (6..=48).contains(&warmth) {
-                    return Some(format!("#{hex}"));
+            // `.get()` (not `&lower[..]`) so a `#` followed by a multibyte
+            // char (e.g. `#abcdeé` in a CJK / emoji style file) yields None
+            // instead of panicking on a non-char-boundary byte slice — the
+            // governor is fail-open by contract and must never block the host.
+            if let Some(hex) = lower.get(i + 1..i + 7) {
+                if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+                    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+                    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+                    let warmth = i32::from(r) - i32::from(b);
+                    if r.min(g).min(b) >= 209 && r >= g && g >= b && (6..=48).contains(&warmth) {
+                        return Some(format!("#{hex}"));
+                    }
                 }
             }
             i += 7;
@@ -452,6 +457,22 @@ mod tests {
     fn flags_ai_purple() {
         let r = rules("src/Hero.tsx", "const c = '#6366f1';");
         assert!(r.contains(&"ai-purple"));
+    }
+
+    #[test]
+    fn cream_band_survives_multibyte_after_hash() {
+        // Regression (fail-open): a `#` followed by a multibyte char (a CJK /
+        // emoji style file) used to panic on a non-char-boundary byte slice.
+        // The governor must never panic / block the host.
+        assert_eq!(cream_band_hex("#abcdeé"), None);
+        assert_eq!(cream_band_hex("色 #你好世界 #fffffé end"), None);
+        // The valid-hex path still detects a real cream-band color.
+        assert_eq!(cream_band_hex("#f5f0e8"), Some("#f5f0e8".to_string()));
+        // Public entry stays panic-free on CJK-laden content.
+        let _ = scan_design_quality(
+            "src/theme.css",
+            "/* 主题 */ .x{color:#你好;background:#fffaf0}",
+        );
     }
 
     #[test]

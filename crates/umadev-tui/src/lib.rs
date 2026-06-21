@@ -38,7 +38,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -125,6 +127,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         // Best-effort restoration — ignore errors, we're panicking anyway.
         let _ = disable_raw_mode();
+        let _ = std::io::stdout().execute(DisableBracketedPaste);
         let _ = std::io::stdout().execute(LeaveAlternateScreen);
         let _ = std::io::stdout().execute(crossterm::cursor::Show);
         // Print a visible marker so the user knows it was a panic, not a
@@ -869,6 +872,10 @@ fn setup_terminal() -> Result<Term> {
 
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    // Turn on bracketed paste so multi-char bursts (clipboard paste AND CJK
+    // IME commits, which most terminals deliver as a paste) arrive as one
+    // atomic `Event::Paste` instead of a scrambled stream of `Char` events.
+    stdout.execute(EnableBracketedPaste)?;
     // Show the terminal cursor so the user sees a blinking caret in the
     // input box (positioned via frame.set_cursor_position in render_prompt).
     stdout.execute(crossterm::cursor::Show)?;
@@ -878,6 +885,7 @@ fn setup_terminal() -> Result<Term> {
 
 fn restore_terminal(terminal: &mut Term) -> Result<()> {
     disable_raw_mode()?;
+    let _ = terminal.backend_mut().execute(DisableBracketedPaste);
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
@@ -972,8 +980,22 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 }
             }
             maybe_key = keys.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe_key {
-                    if key.kind == KeyEventKind::Press {
+                if let Some(Ok(Event::Paste(pasted))) = &maybe_key {
+                    // Bracketed paste (and CJK IME commits, which most terminals
+                    // deliver as a paste burst): insert the text atomically at the
+                    // cursor instead of letting it arrive as a scrambled stream of
+                    // raw `Char` events. Without this the buffer and the rendered
+                    // cursor desync — the reported "打字乱串 / 输入框乱跳".
+                    app.insert_str_at_cursor(pasted);
+                } else if let Some(Ok(Event::Key(key))) = maybe_key {
+                    // Accept Press AND Repeat. On terminals that negotiate the
+                    // kitty / enhanced-keyboard protocol (Ghostty, recent iTerm2,
+                    // WezTerm — or a base CLI like opencode that left the protocol
+                    // enabled on the shared TTY), a held / fast-repeated key arrives
+                    // as `Repeat`, not `Press`. Filtering for `Press` only silently
+                    // DROPPED those keystrokes → missing / out-of-order characters.
+                    // `Release` is still ignored so every key fires exactly once.
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         match app.apply_key_with_mods(key.code, key.modifiers) {
                             Action::Quit => break,
                             Action::None | Action::BackendChanged => {

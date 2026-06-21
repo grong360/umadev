@@ -245,6 +245,23 @@ impl Runtime for Box<dyn Runtime> {
         (**self).kind()
     }
 
+    // These three carry the brain's real powers — forwarding is NOT optional.
+    // Without it a boxed runtime (the TUI drives `AgentRunner<Box<dyn Runtime>>`)
+    // silently reports the trait DEFAULTS: fork()=None kills the parallel docs
+    // fan-out, capabilities()=all-false disables persistent /goal + realtime
+    // governance + usage/streaming. Mirrors the `Box<dyn HostDriver>` fork fix.
+    fn capabilities(&self) -> BrainCapabilities {
+        (**self).capabilities()
+    }
+
+    fn is_offline(&self) -> bool {
+        (**self).is_offline()
+    }
+
+    fn fork(&self) -> Option<Box<dyn Runtime>> {
+        (**self).fork()
+    }
+
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, RuntimeError> {
         (**self).complete(req).await
     }

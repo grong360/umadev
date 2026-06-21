@@ -1503,6 +1503,7 @@ mod tests {
     use crate::app::App;
     use crate::config::UserConfig;
     use crossterm::event::KeyCode;
+    use ratatui::backend::Backend;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use umadev_agent::{EngineEvent, Gate};
@@ -1686,6 +1687,45 @@ mod tests {
         });
         let out = render_to_string(&app);
         assert!(out.contains("pipeline running"));
+    }
+
+    #[test]
+    fn cjk_backspace_deletes_one_whole_char_no_residue() {
+        // Regression for the reported bug: type "你是" (2 chars / 6 bytes), one
+        // Backspace must leave exactly "你" — never a byte-sliced fragment and
+        // never a stale char bleeding in from a previous message. The char-cursor
+        // + byte_index splice must stay on UTF-8 boundaries.
+        let mut app = app_with(Some("offline"));
+        for c in "你是".chars() {
+            let _ = app.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(app.input, "你是");
+        assert_eq!(app.input_cursor, 2);
+        let _ = app.apply_key(KeyCode::Backspace);
+        assert_eq!(
+            app.input, "你",
+            "backspace must delete the whole last CJK char"
+        );
+        assert_eq!(app.input_cursor, 1);
+        // The rendered cursor column lands right after the single remaining
+        // wide char: gutter(2) + prefix `>_ `(3) + 2 cols for "你" = x 7.
+        let backend = TestBackend::new(60, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let cur = term.backend_mut().get_cursor_position().unwrap();
+        assert_eq!(cur.x, 7, "cursor must sit just past the wide char");
+    }
+
+    #[test]
+    fn pasted_text_inserts_atomically_and_strips_escapes() {
+        // Bracketed paste / CJK IME commit: a whole string lands at the cursor in
+        // one shot. Newlines survive (multi-line prompts); other control chars
+        // (here a stray ESC) are dropped so a pasted escape can't corrupt render.
+        let mut app = app_with(Some("offline"));
+        app.insert_str_at_cursor("你好\x1b世界\n第二行");
+        assert_eq!(app.input, "你好世界\n第二行");
+        // cursor advanced by the number of chars actually inserted (ESC skipped).
+        assert_eq!(app.input_cursor, app.input_len());
     }
 
     #[test]

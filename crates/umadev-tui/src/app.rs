@@ -702,6 +702,27 @@ impl App {
         self.palette_selected = 0;
     }
 
+    /// Insert a whole string at the cursor (bracketed paste / CJK IME commit).
+    /// Newlines are kept (multi-line prompts); other control characters are
+    /// dropped so a pasted terminal escape sequence can't corrupt the buffer or
+    /// the render. Honors [`INPUT_CAP`] and advances the char-cursor by the
+    /// number of characters actually inserted.
+    pub fn insert_str_at_cursor(&mut self, text: &str) {
+        for c in text.chars() {
+            if c != '\n' && c.is_control() {
+                continue;
+            }
+            if self.input_len() >= INPUT_CAP {
+                break;
+            }
+            let pos = self.byte_index(self.input_cursor);
+            self.input.insert(pos, c);
+            self.input_cursor += 1;
+        }
+        self.input_history_idx = None;
+        self.palette_selected = 0;
+    }
+
     /// Delete the character BEFORE the cursor (Backspace).
     pub fn backspace(&mut self) {
         if self.input_cursor == 0 {
