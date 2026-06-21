@@ -225,6 +225,13 @@ pub struct RunOptions {
     /// prompt references `knowledge/seed-templates/<name>.md` for the
     /// page structure and quality gates.
     pub seed_template: String,
+    /// Trust / autonomy tier for this run (`plan` / `guarded` / `auto`).
+    /// Default [`crate::trust::TrustMode::Guarded`] preserves the existing
+    /// human-in-the-loop behaviour. `plan` makes the run read-only (research +
+    /// docs, then stop at `docs_confirm` without executing); `auto` drives
+    /// end-to-end. The mode only governs gate auto-pass policy — phase *content*
+    /// stays deterministic.
+    pub mode: crate::trust::TrustMode,
 }
 
 impl RunOptions {
@@ -1067,6 +1074,21 @@ impl<R: Runtime> AgentRunner<R> {
         self.transition(Phase::DocsConfirm, gate.map_or("", Gate::id_str))?;
 
         self.warn_degraded_summary();
+        // Plan (read-only) mode: the pipeline stops here by design. Research +
+        // the three planning docs are produced ("here's how I'd build it"), but
+        // nothing past `docs_confirm` executes — no spec, no real code. The user
+        // reviews the plan, then re-runs in `guarded` / `auto` to execute.
+        if self.options.mode == crate::trust::TrustMode::Plan {
+            self.emit(EngineEvent::Note(
+                "[plan] 计划模式(只读):已产出研究 + PRD/架构/UIUX 计划文档,\
+                 流水线在此停止,未执行 spec/前端/后端,未写入真实代码。\
+                 审核计划后,用 guarded/auto 模式重跑以执行。  \
+                 [plan] Plan mode (read-only): produced research + PRD/arch/UIUX. \
+                 The pipeline stops here without executing spec/frontend/backend \
+                 — no real code was written. Re-run in guarded/auto to execute."
+                    .to_string(),
+            ));
+        }
         self.emit(EngineEvent::BlockCompleted {
             final_phase: Phase::DocsConfirm,
             paused_at: gate,
@@ -4716,6 +4738,7 @@ not json at all
             backend: String::new(),
             design_system: String::new(),
             seed_template: String::new(),
+            mode: crate::trust::TrustMode::Guarded,
         }
     }
 
@@ -4969,6 +4992,48 @@ error TS2304: Cannot find name 'Foo'
         assert_eq!(r.final_phase, Phase::DocsConfirm);
         assert_eq!(r.paused_at, Some(Gate::DocsConfirm));
         assert!(tmp.path().join("output/demo-prd.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn plan_mode_stops_at_docs_with_readonly_note() {
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.mode = crate::trust::TrustMode::Plan;
+        let sink = RecordingSink::new();
+        let runner = AgentRunner::new(FakeRuntime, o).with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        let r = runner.run_initial_block(false, None).await.unwrap();
+        // Plan mode produces the planning docs and pauses at docs_confirm —
+        // identical pause point, but it announces the read-only stop.
+        assert_eq!(r.paused_at, Some(Gate::DocsConfirm));
+        let emitted_plan_note = sink.events().iter().any(|e| {
+            matches!(e, EngineEvent::Note(n) if n.contains("[plan]") && n.contains("read-only"))
+        });
+        assert!(
+            emitted_plan_note,
+            "plan mode must announce the read-only stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_mode_emits_no_plan_stop_note() {
+        // The default (guarded) run must NOT emit the plan read-only note — it
+        // is identical to the pre-existing behaviour.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        runner.run_initial_block(false, None).await.unwrap();
+        let plan_note = sink
+            .events()
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("Plan mode (read-only)")));
+        assert!(!plan_note, "guarded mode must not announce a plan stop");
     }
 
     #[tokio::test]

@@ -944,6 +944,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             backend: app.backend.clone().unwrap_or_default(),
                             design_system: app.config.design_system.clone().unwrap_or_default(),
                             seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                            mode: app.effective_trust_mode(),
                         };
                         run_task = Some(spawn_block(
                             run_opts,
@@ -1052,6 +1053,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     backend: app.backend.clone().unwrap_or_default(),
                                     design_system: app.config.design_system.clone().unwrap_or_default(),
                                     seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                                    mode: app.effective_trust_mode(),
                                 };
                                 run_task = Some(spawn_block(
                                     run_opts,
@@ -1072,6 +1074,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     backend: app.backend.clone().unwrap_or_default(),
                                     design_system: app.config.design_system.clone().unwrap_or_default(),
                                     seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                                    mode: app.effective_trust_mode(),
                                 };
                                 run_task = Some(spawn_block(
                                     run_opts,
@@ -1148,6 +1151,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     backend: app.backend.clone().unwrap_or_default(),
                                     design_system: app.config.design_system.clone().unwrap_or_default(),
                                     seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                                    mode: app.effective_trust_mode(),
                                 };
                                 let block = match app.active_gate {
                                     Some(Gate::PreviewConfirm) => {
@@ -1330,6 +1334,7 @@ fn current_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
         backend: app.backend.clone().unwrap_or_default(),
         design_system: app.config.design_system.clone().unwrap_or_default(),
         seed_template: app.config.seed_template.clone().unwrap_or_default(),
+        mode: app.effective_trust_mode(),
     }
 }
 

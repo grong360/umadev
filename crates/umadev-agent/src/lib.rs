@@ -58,6 +58,7 @@ pub mod security;
 pub mod skills;
 pub mod state;
 pub mod tech_debt;
+pub mod trust;
 pub mod verify;
 
 pub use adopt::{
@@ -102,5 +103,9 @@ pub use skills::{
 pub use state::{
     list_snapshots, read_workflow_state, read_workflow_state_diagnostic, restore_snapshot,
     write_workflow_state, ReadState, WorkflowState,
+};
+pub use trust::{
+    requires_confirmation, reversibility_class, GateTrust, Reversibility, TrustLedger, TrustMode,
+    TrustSuggestion,
 };
 pub use verify::{detect_project, run_verify, ProjectKind, VerifyOutcome};

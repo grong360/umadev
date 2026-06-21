@@ -177,6 +177,12 @@ enum Command {
         /// Project slug used in artifact filenames.
         #[arg(long, default_value = "")]
         slug: String,
+        /// Trust / autonomy tier: `plan` (research + plan only, read-only),
+        /// `guarded` (default — pause at every confirmation gate), or `auto`
+        /// (fully autonomous). Irreversible actions (.git / network /
+        /// destructive shell) are always confirmed, even in `auto`.
+        #[arg(long, default_value = "guarded")]
+        mode: String,
     },
     /// Lightweight fast track for a trivial task (skip the heavy phases).
     #[command(
@@ -215,6 +221,10 @@ enum Command {
         /// Project slug used in artifact filenames.
         #[arg(long, default_value = "")]
         slug: String,
+        /// Trust / autonomy tier: `plan` / `guarded` (default) / `auto`.
+        /// See `umadev run --help`. Irreversible actions always confirm.
+        #[arg(long, default_value = "guarded")]
+        mode: String,
     },
     /// Re-run a single named phase (reuses the prior run's context).
     #[command(
@@ -671,6 +681,7 @@ async fn main() -> Result<()> {
             model,
             project_root,
             slug,
+            mode,
         } => {
             cmd_run(RunArgs {
                 requirement,
@@ -678,6 +689,7 @@ async fn main() -> Result<()> {
                 model,
                 project_root,
                 slug,
+                mode,
             })
             .await
         }
@@ -687,6 +699,7 @@ async fn main() -> Result<()> {
             model,
             project_root,
             slug,
+            mode,
         } => {
             cmd_quick(RunArgs {
                 requirement: task,
@@ -694,6 +707,7 @@ async fn main() -> Result<()> {
                 model,
                 project_root,
                 slug,
+                mode,
             })
             .await
         }
@@ -1831,6 +1845,9 @@ struct RunArgs {
     model: String,
     project_root: Option<PathBuf>,
     slug: String,
+    /// Trust / autonomy tier string (`plan` / `guarded` / `auto`); parsed into
+    /// [`umadev_agent::TrustMode`] at the boundary, fail-open to `guarded`.
+    mode: String,
 }
 
 /// Attach a live event sink to the runner and spawn a background printer.
@@ -1907,6 +1924,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
+    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
     let opts = RunOptions {
         project_root: project_root.clone(),
         requirement: args.requirement,
@@ -1918,6 +1936,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
             .map_or(String::new(), |b| b.id().to_string()),
         design_system: String::new(),
         seed_template: String::new(),
+        mode,
     };
 
     // Two modes:
@@ -2005,6 +2024,7 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
+    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
     let opts = RunOptions {
         project_root: project_root.clone(),
         requirement: args.requirement,
@@ -2016,6 +2036,7 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
             .map_or(String::new(), |b| b.id().to_string()),
         design_system: String::new(),
         seed_template: String::new(),
+        mode,
     };
 
     let (report, runtime_label) = if let Some(backend) = args.backend {
@@ -2142,6 +2163,10 @@ async fn cmd_redo(
         backend: backend_id.clone().unwrap_or_default(),
         design_system: String::new(),
         seed_template: String::new(),
+        // Resume paths honour the existing gate semantics (the user explicitly
+        // invoked `continue`); `plan` read-only gating only applies to the
+        // initial `run`, so resume defaults to guarded.
+        mode: umadev_agent::TrustMode::Guarded,
     };
 
     let _ = record_tool_call(
@@ -2421,6 +2446,8 @@ async fn drive_gate_block(
         backend: backend_id.clone().unwrap_or_default(),
         design_system: String::new(),
         seed_template: String::new(),
+        // Resume paths default to guarded — see the `continue` path above.
+        mode: umadev_agent::TrustMode::Guarded,
     };
 
     let use_runtime = backend_id.is_some();

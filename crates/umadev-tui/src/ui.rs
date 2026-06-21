@@ -1129,14 +1129,14 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "Enter submit · /help for all commands"
     };
-    let (mode_chip, mode_color) = if app.auto_approve_on() {
-        (umadev_i18n::t(app.lang, "mode.auto_chip"), theme::SUCCESS())
-    } else {
-        (
-            umadev_i18n::t(app.lang, "mode.manual_chip"),
-            theme::WARNING(),
-        )
+    // Trust-tier chip: plan (read-only) / guarded (review each gate) / auto.
+    let mode = app.effective_trust_mode();
+    let mode_color = match mode {
+        umadev_agent::TrustMode::Auto => theme::SUCCESS(),
+        umadev_agent::TrustMode::Guarded => theme::WARNING(),
+        umadev_agent::TrustMode::Plan => theme::INFO(),
     };
+    let mode_chip = umadev_i18n::t(app.lang, mode.chip_key());
     meta_row(
         frame,
         prompt_chunks[1],

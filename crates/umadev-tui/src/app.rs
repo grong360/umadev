@@ -337,7 +337,22 @@ pub struct App {
     /// (`Some(false)`) or `/auto` (`Some(true)`). `None` → use the project's
     /// `.umadevrc` value. Lets the user flip review mode mid-session without
     /// hand-editing config or losing it on restart-of-flow.
+    ///
+    /// Kept as the compatibility surface for the binary `/auto` `/manual`
+    /// toggle; [`trust_mode_override`] is the richer three-tier control that
+    /// supersedes it. The two stay consistent — flipping one updates the other.
     pub auto_approve_override: Option<bool>,
+
+    /// Session-level trust / autonomy tier override (`/mode plan|guarded|auto`).
+    /// `None` → derive from `.umadevrc` (`auto_approve_gates`). When `Some`, it
+    /// takes precedence and also drives the legacy [`auto_approve_override`].
+    /// The default tier is `guarded` (the existing human-in-the-loop behaviour).
+    pub trust_mode_override: Option<umadev_agent::TrustMode>,
+
+    /// Per-project collaborative trust ledger (`.umadev/trust.json`). Records
+    /// how many times in a row each gate passed; after a threshold it *suggests*
+    /// (never auto-applies) letting that gate auto-advance. Fail-open.
+    pub trust_ledger: umadev_agent::TrustLedger,
 
     /// Detected host backends (asynchronously populated).
     pub backends: Vec<BackendInfo>,
@@ -462,6 +477,8 @@ impl App {
             thinking: false,
             thinking_started: None,
             auto_approve_override: None,
+            trust_mode_override: None,
+            trust_ledger: umadev_agent::TrustLedger::load(&project_root),
             backends: Vec::new(),
             show_help: false,
             help_scroll: 0,
@@ -926,6 +943,7 @@ impl App {
         ("revise", "stay at gate, request changes"),
         ("manual", "review each checkpoint before continuing"),
         ("auto", "auto-approve checkpoints (autonomous)"),
+        ("mode", "trust tier: /mode plan|guarded|auto"),
         ("status", "show detailed pipeline status"),
         ("export", "export the latest proof-pack"),
         ("knowledge", "list knowledge + design files"),
@@ -1133,26 +1151,25 @@ impl App {
                     return;
                 }
 
-                // **Auto-approve** — when `auto_approve_gates` is on (the
-                // DEFAULT), the pipeline runs fully autonomously through EVERY
-                // checkpoint, INCLUDING the Clarify gate. Most users are not
-                // engineers: they type one requirement and expect the Agent to
-                // drive end-to-end without being asked technical questions or
-                // needing to know any slash command. So in auto mode the Agent
-                // self-resolves ambiguities (stating its assumptions in the
-                // docs, which the user can still review/revise) instead of
-                // blocking. Manual mode (`/manual`) restores the pause at every
-                // gate, Clarify included, for users who want to drive each step.
-                let config_auto = umadev_agent::config::load_project_config(&self.project_root)
-                    .pipeline
-                    .auto_approve_gates;
-                let auto_approve =
-                    self.run_started && self.auto_approve_override.unwrap_or(config_auto);
-                if auto_approve {
+                // **Trust-tiered gate policy.** The active tier (resolved from a
+                // `/mode` / `/auto` / `/manual` session override, else the
+                // `.umadevrc` default) decides what happens here:
+                //   - `auto`    → auto-approve EVERY checkpoint (incl. Clarify),
+                //     running end-to-end. Most users aren't engineers — they type
+                //     one requirement and expect the agent to self-resolve and
+                //     drive. We also record a trust pass (and may *suggest*, never
+                //     auto-apply, that a long-trusted gate auto-advance).
+                //   - `guarded` → pause and show the gate card (the default,
+                //     human-in-the-loop). The user types `c` to approve.
+                //   - `plan`    → read-only: stop at the gate, never auto-continue
+                //     (the runner already produced research + plan docs only).
+                let mode = self.effective_trust_mode();
+                if self.run_started && mode.gates_auto_approve() {
                     self.push(
                         ChatRole::UmaDev,
                         umadev_i18n::tf(self.lang, "gate.auto_approved", &[gate.id_str()]),
                     );
+                    self.record_trust_pass(gate.id_str());
                     self.pending_auto_continue = Some(gate);
                     return;
                 }
@@ -1161,6 +1178,14 @@ impl App {
                     ChatRole::Gate,
                     gate_card(gate, &self.slug, &self.project_root, self.lang),
                 );
+                // Plan (read-only) tier: tell the user the run stops here by
+                // design and how to execute the plan once they're happy with it.
+                if mode == umadev_agent::TrustMode::Plan {
+                    self.push(
+                        ChatRole::UmaDev,
+                        umadev_i18n::t(self.lang, "mode.plan.gate").to_string(),
+                    );
+                }
                 // When the preview gate opens, surface the frontend's
                 // recorded Preview URL so the user knows where to look.
                 if gate == umadev_agent::gates::Gate::PreviewConfirm {
@@ -1817,8 +1842,12 @@ impl App {
                     Gate::ClarifyGate => umadev_i18n::t(self.lang, "gate.confirmed_generic"),
                 };
                 self.push(ChatRole::UmaDev, format!("[ok] {what}"));
+                // A manual approval also builds trust for this gate.
+                self.record_trust_pass(gate.id_str());
                 return Action::Continue(gate);
             }
+            // A revision request resets this gate's trust streak.
+            self.record_trust_revision(gate.id_str());
             self.push(
                 ChatRole::UmaDev,
                 umadev_i18n::tf(self.lang, "gate.revision_received", &[&text]),
@@ -2300,6 +2329,7 @@ impl App {
                         ChatRole::UmaDev,
                         format!("[ok] approved gate `{}` — continuing…", gate.id_str()),
                     );
+                    self.record_trust_pass(gate.id_str());
                     Action::Continue(gate)
                 } else {
                     let hint = if self.run_started && !self.finished {
@@ -2317,7 +2347,8 @@ impl App {
                 if rest.is_empty() {
                     self.push(ChatRole::System, umadev_i18n::t(self.lang, "revise.usage"));
                     Action::None
-                } else if self.active_gate.is_some() {
+                } else if let Some(gate) = self.active_gate {
+                    self.record_trust_revision(gate.id_str());
                     self.push(
                         ChatRole::UmaDev,
                         umadev_i18n::tf(self.lang, "gate.revision_received", &[rest]),
@@ -2357,6 +2388,7 @@ impl App {
             }
             "manual" => self.slash_set_review_mode(false),
             "auto" => self.slash_set_review_mode(true),
+            "mode" => self.slash_mode(rest),
             "model" => self.slash_model(rest),
             "lang" | "language" | "语言" | "語言" => self.slash_lang(rest),
             "setup" | "reconfigure" | "guide" | "配置" | "設定" => self.slash_setup(),
@@ -4149,18 +4181,52 @@ impl App {
     /// Shift+Tab cycles the gate-approval mode (auto <-> manual), Claude-Code
     /// style. The current mode shows in the prompt meta row.
     pub fn cycle_approval_mode(&mut self) {
-        let cur = self.auto_approve_override.unwrap_or(true);
-        self.slash_set_review_mode(!cur);
+        let auto = matches!(self.effective_trust_mode(), umadev_agent::TrustMode::Auto);
+        self.slash_set_review_mode(!auto);
+    }
+
+    /// Resolve the active trust tier: an explicit `/mode` (or `/auto` /
+    /// `/manual`) session override wins; otherwise derive from `.umadevrc`'s
+    /// `auto_approve_gates` (`true` → `auto`, `false` → `guarded`). The default
+    /// is `guarded` — the existing human-in-the-loop behaviour.
+    #[must_use]
+    pub fn effective_trust_mode(&self) -> umadev_agent::TrustMode {
+        if let Some(m) = self.trust_mode_override {
+            return m;
+        }
+        // Legacy binary override (set via `/auto` / `/manual` before any
+        // `/mode`) still maps onto a tier for back-compat.
+        if let Some(auto) = self.auto_approve_override {
+            return if auto {
+                umadev_agent::TrustMode::Auto
+            } else {
+                umadev_agent::TrustMode::Guarded
+            };
+        }
+        let config_auto = umadev_agent::config::load_project_config(&self.project_root)
+            .pipeline
+            .auto_approve_gates;
+        if config_auto {
+            umadev_agent::TrustMode::Auto
+        } else {
+            umadev_agent::TrustMode::Guarded
+        }
     }
 
     /// Whether gates currently auto-approve (true) or pause for review (false).
+    /// Kept for the prompt meta-row chip + back-compat; `auto` tier → true.
     #[must_use]
     pub fn auto_approve_on(&self) -> bool {
-        self.auto_approve_override.unwrap_or(true)
+        matches!(self.effective_trust_mode(), umadev_agent::TrustMode::Auto)
     }
 
     fn slash_set_review_mode(&mut self, auto: bool) -> Action {
-        self.auto_approve_override = Some(auto);
+        let mode = if auto {
+            umadev_agent::TrustMode::Auto
+        } else {
+            umadev_agent::TrustMode::Guarded
+        };
+        self.set_trust_mode(mode);
         let msg = if auto {
             umadev_i18n::t(self.lang, "review.auto_on")
         } else {
@@ -4168,6 +4234,75 @@ impl App {
         };
         self.push(ChatRole::UmaDev, msg.to_string());
         Action::None
+    }
+
+    /// `/mode plan|guarded|auto` — set the trust / autonomy tier for this
+    /// session. `plan` is read-only (research + plan, no execution); `guarded`
+    /// (default) pauses at every gate; `auto` runs end-to-end. With no/unknown
+    /// argument, print the current tier and the options.
+    fn slash_mode(&mut self, rest: &str) -> Action {
+        let arg = rest.trim();
+        if arg.is_empty() {
+            let cur = self.effective_trust_mode();
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::tf(
+                    self.lang,
+                    "mode.current",
+                    &[umadev_i18n::t(self.lang, cur.chip_key())],
+                ),
+            );
+            return Action::None;
+        }
+        match umadev_agent::TrustMode::parse(arg) {
+            Some(mode) => {
+                self.set_trust_mode(mode);
+                self.push(
+                    ChatRole::UmaDev,
+                    umadev_i18n::t(self.lang, mode.desc_key()).to_string(),
+                );
+            }
+            None => {
+                self.push(
+                    ChatRole::UmaDev,
+                    umadev_i18n::tf(self.lang, "mode.unknown", &[arg]),
+                );
+            }
+        }
+        Action::None
+    }
+
+    /// Apply a trust tier as the session override, keeping the legacy binary
+    /// `auto_approve_override` consistent so the prompt chip + any old code path
+    /// reads the same state.
+    fn set_trust_mode(&mut self, mode: umadev_agent::TrustMode) {
+        self.trust_mode_override = Some(mode);
+        self.auto_approve_override = Some(mode.gates_auto_approve());
+    }
+
+    /// Record that a gate passed (auto or manual) into the per-project trust
+    /// ledger, persist it, and — if this gate has now passed enough times in a
+    /// row — SUGGEST (never auto-apply) letting it auto-advance next time. The
+    /// whole path is fail-open: a ledger IO error never blocks the pipeline.
+    fn record_trust_pass(&mut self, gate_id: &str) {
+        if let Some(suggestion) = self.trust_ledger.record_pass(gate_id) {
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::tf(
+                    self.lang,
+                    "trust.suggest_auto",
+                    &[&suggestion.consecutive.to_string(), &suggestion.gate_id],
+                ),
+            );
+        }
+        self.trust_ledger.save(&self.project_root);
+    }
+
+    /// Record that a gate was revised — resets its consecutive-pass streak so a
+    /// revision walks back the accumulated trust. Persisted, fail-open.
+    fn record_trust_revision(&mut self, gate_id: &str) {
+        self.trust_ledger.record_revision(gate_id);
+        self.trust_ledger.save(&self.project_root);
     }
 
     fn slash_toggle_animations(&mut self) -> Action {
@@ -6837,5 +6972,109 @@ mod tests {
         });
         let last = a.history.back().unwrap();
         assert!(last.body.contains("rate limited"));
+    }
+
+    #[test]
+    fn default_trust_mode_is_guarded() {
+        // fresh_app writes `.umadevrc` with auto_approve_gates = false, so the
+        // default tier is the existing human-in-the-loop behaviour.
+        let a = fresh_app(Some("offline"));
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+        assert!(!a.auto_approve_on());
+    }
+
+    #[test]
+    fn slash_mode_switches_tier_and_keeps_legacy_toggle_consistent() {
+        let mut a = fresh_app(Some("offline"));
+        a.slash_mode("auto");
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Auto);
+        assert!(a.auto_approve_on(), "legacy toggle tracks the tier");
+
+        a.slash_mode("plan");
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Plan);
+        // plan is read-only → gates do NOT auto-approve.
+        assert!(!a.auto_approve_on());
+
+        a.slash_mode("guarded");
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+
+        // Unknown arg is rejected without changing the tier.
+        a.slash_mode("nonsense");
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+        assert!(a
+            .history
+            .iter()
+            .any(|m| m.body.contains("nonsense") || m.body.contains("未知")));
+    }
+
+    #[test]
+    fn plan_mode_does_not_auto_continue_at_gate() {
+        let mut a = fresh_app(Some("offline"));
+        a.run_started = true;
+        a.slash_mode("plan");
+        a.apply_engine(EngineEvent::GateOpened {
+            gate: Gate::DocsConfirm,
+        });
+        // Plan is read-only: the gate pauses, never auto-continues.
+        assert!(
+            a.pending_auto_continue.is_none(),
+            "plan mode must not auto-advance the gate"
+        );
+        assert_eq!(a.active_gate, Some(Gate::DocsConfirm));
+    }
+
+    /// Reset any persisted trust state so a leftover `.umadev/trust.json` from a
+    /// previous run of the (reused) test workspace can't skew the counters.
+    fn reset_trust(a: &mut App) {
+        let _ = std::fs::remove_file(a.project_root.join(".umadev").join("trust.json"));
+        a.trust_ledger = umadev_agent::TrustLedger::default();
+    }
+
+    #[test]
+    fn auto_mode_auto_continues_and_records_trust() {
+        let mut a = fresh_app(Some("offline"));
+        reset_trust(&mut a);
+        a.run_started = true;
+        a.slash_mode("auto");
+        a.apply_engine(EngineEvent::GateOpened {
+            gate: Gate::DocsConfirm,
+        });
+        // Auto tier auto-advances AND books a trust pass for the gate.
+        assert_eq!(a.pending_auto_continue, Some(Gate::DocsConfirm));
+        assert_eq!(a.trust_ledger.consecutive("docs_confirm"), 1);
+    }
+
+    #[test]
+    fn manual_approval_builds_trust_and_suggests_at_threshold() {
+        let mut a = fresh_app(Some("offline"));
+        reset_trust(&mut a);
+        // Guarded default: manually approve the docs gate enough times in a row
+        // that the ledger surfaces a one-time auto-advance suggestion.
+        for _ in 0..umadev_agent::trust::SUGGEST_THRESHOLD {
+            a.active_gate = Some(Gate::DocsConfirm);
+            let action = a.submit_text("c".to_string());
+            assert_eq!(action, Action::Continue(Gate::DocsConfirm));
+        }
+        assert_eq!(
+            a.trust_ledger.consecutive("docs_confirm"),
+            umadev_agent::trust::SUGGEST_THRESHOLD
+        );
+        assert!(
+            a.history.iter().any(|m| m.body.contains("[trust]")),
+            "a trust suggestion should have fired once at the threshold"
+        );
+    }
+
+    #[test]
+    fn revision_resets_trust_streak() {
+        let mut a = fresh_app(Some("offline"));
+        reset_trust(&mut a);
+        a.active_gate = Some(Gate::PreviewConfirm);
+        let _ = a.submit_text("c".to_string());
+        assert_eq!(a.trust_ledger.consecutive("preview_confirm"), 1);
+        // A revision at the gate walks back the accumulated trust.
+        a.active_gate = Some(Gate::PreviewConfirm);
+        let _ = a.submit_text("把图标换成 lucide".to_string());
+        assert_eq!(a.trust_ledger.consecutive("preview_confirm"), 0);
     }
 }
