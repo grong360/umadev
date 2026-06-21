@@ -11,9 +11,14 @@
 //! first-class host base, just like Claude Code and Codex: we pass the prompt
 //! to the already-configured CLI and capture the answer.
 //!
-//! Official CLI docs: `opencode run [message..]` is the documented
-//! non-interactive form; `--model provider/model` is accepted when the model
-//! id is already in `OpenCode`'s provider/model shape.
+//! Official CLI docs (and the live `opencode run --help` on the dev machine):
+//! `opencode run [message..]` is the documented non-interactive form;
+//! `--model provider/model` is accepted when the model id is already in
+//! `OpenCode`'s provider/model shape; `-c/--continue` resumes the *most recent*
+//! session in this directory; and `-s/--session <id>` resumes a *specific*
+//! session id deterministically. When UmaDev has pinned a session id it uses
+//! `-s <id>` (never colliding with the user's other `opencode` conversations in
+//! the same dir); with no pinned id it falls back to `--continue`.
 
 use std::time::Duration;
 
@@ -32,9 +37,16 @@ use crate::{
 pub struct OpenCodeDriver {
     program: String,
     timeout: Duration,
-    /// When `true`, the next `complete` resumes the last `opencode` session
-    /// (`opencode run --continue`) so the base keeps its own memory.
+    /// When `true`, the next `complete` resumes a prior `opencode` session so
+    /// the base keeps its own memory — deterministically via `-s <id>` when a
+    /// [`Self::session_id`] is pinned, otherwise `--continue` (most recent).
     continue_session: bool,
+    /// An explicit `opencode` session id to resume. When set AND
+    /// [`Self::continue_session`] is true, the call uses `-s <id>` so UmaDev
+    /// resumes *its own* session deterministically instead of grabbing
+    /// "the most recent in this dir" (which could be the user's other
+    /// conversation). When `None`, falls back to `--continue`.
+    session_id: Option<String>,
     /// The cwd the `opencode` subprocess runs in (the pipeline project root).
     workspace: Option<std::path::PathBuf>,
 }
@@ -46,6 +58,7 @@ impl Default for OpenCodeDriver {
                 .unwrap_or_else(|_| "opencode".to_string()),
             timeout: crate::worker_timeout_from_env(),
             continue_session: false,
+            session_id: None,
             workspace: None,
         }
     }
@@ -75,6 +88,13 @@ impl OpenCodeDriver {
         self
     }
 
+    /// Builder form of [`HostDriver::set_session_id`] (mainly for tests).
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
     /// The argument vector preceding the prompt. Exposed for tests.
     #[must_use]
     pub fn base_args(&self, model: &str) -> Vec<String> {
@@ -96,17 +116,44 @@ impl OpenCodeDriver {
         args
     }
 
-    /// The full argument vector for a `complete` call, including the
-    /// `--continue` resume flag when [`Self::continue_session`] is set. Exposed
-    /// for tests. The prompt is appended by the subprocess layer as the last
-    /// positional argument.
+    /// The full argument vector for a `complete` call, resolving the resume
+    /// strategy. Exposed for tests. The prompt is appended by the subprocess
+    /// layer as the last positional argument.
+    ///
+    /// - pinned id + resume → `-s <id>`     (resume OUR session deterministically)
+    /// - no id + resume     → `--continue`  (most recent session in this dir)
+    /// - fresh              → (nothing)     (brand-new session)
+    ///
+    /// Both `-s/--session <id>` and `-c/--continue` are confirmed against the
+    /// live `opencode run --help`. A pinned id is preferred because `--continue`
+    /// could otherwise grab the user's other conversation in the same directory.
+    ///
+    // TODO(opencode): we cannot yet *capture* the session id opencode assigns on
+    // a fresh turn (opencode has no "create with this id" flag like claude's
+    // `--session-id`; the id only appears in `--format json` output, whose exact
+    // event schema is not yet confirmed on this machine). Until that schema is
+    // verified, turn 1 stays a fresh `run` and only an externally-pinned id
+    // drives deterministic `-s <id>` resume. Do NOT add `--format json` to the
+    // run path before the usage/session-id event shape is confirmed — it would
+    // turn the plain-text stdout this driver parses into raw JSON and break
+    // `complete`'s answer extraction.
     #[must_use]
     pub fn call_args(&self, model: &str) -> Vec<String> {
         let mut args = self.base_args(model);
         if self.continue_session {
-            // `--continue` resumes the last session so `opencode` answers with
-            // its own prior context instead of starting cold.
-            args.push("--continue".to_string());
+            match &self.session_id {
+                Some(id) => {
+                    // Resume OUR specific session — never "the most recent in
+                    // this dir", so we can't continue the user's other chat.
+                    args.push("--session".to_string());
+                    args.push(id.clone());
+                }
+                None => {
+                    // `--continue` resumes the last session so `opencode` answers
+                    // with its own prior context instead of starting cold.
+                    args.push("--continue".to_string());
+                }
+            }
         }
         args
     }
@@ -114,9 +161,14 @@ impl OpenCodeDriver {
 
 #[async_trait]
 impl Runtime for OpenCodeDriver {
-    /// Concurrent-safe fork: clone with a FRESH session (no `--continue`).
+    /// Concurrent-safe fork: clone with a FRESH session (no resume, no pinned
+    /// id) so parallel pipeline steps don't collide on one opencode session.
     fn fork(&self) -> Option<Box<dyn Runtime>> {
-        Some(Box::new(self.clone().with_continue_session(false)))
+        Some(Box::new(
+            self.clone()
+                .with_continue_session(false)
+                .with_session_id(None),
+        ))
     }
 
     fn kind(&self) -> RuntimeKind {
@@ -167,6 +219,10 @@ impl HostDriver for OpenCodeDriver {
 
     fn set_continue_session(&mut self, continue_session: bool) {
         self.continue_session = continue_session;
+    }
+
+    fn set_session_id(&mut self, session_id: Option<String>) {
+        self.session_id = session_id;
     }
 
     fn set_workspace(&mut self, workspace: std::path::PathBuf) {
@@ -246,8 +302,42 @@ mod tests {
         resumed.set_continue_session(true);
         assert!(
             resumed.call_args("m").contains(&"--continue".to_string()),
-            "a continued session must pass --continue so opencode uses its own memory"
+            "a continued session with no pinned id must pass --continue so opencode uses its own memory"
         );
+    }
+
+    #[test]
+    fn pinned_session_id_uses_deterministic_resume() {
+        let id = "ses_01abcDEF".to_string();
+
+        // Pinned id + continue → `--session <id>` (deterministic), NOT --continue.
+        let mut resume = OpenCodeDriver::default().with_session_id(Some(id.clone()));
+        resume.set_continue_session(true);
+        let args = resume.call_args("m");
+        assert!(
+            args.windows(2).any(|w| w == ["--session", id.as_str()]),
+            "pinned id must resume via --session <id>: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--continue".to_string()),
+            "a pinned id must NOT fall back to --continue"
+        );
+
+        // The setter mirrors the builder.
+        let mut via_setter = OpenCodeDriver::default();
+        via_setter.set_session_id(Some(id.clone()));
+        via_setter.set_continue_session(true);
+        assert!(via_setter
+            .call_args("m")
+            .windows(2)
+            .any(|w| w == ["--session", id.as_str()]));
+
+        // A pinned id WITHOUT continue is still a fresh run (no resume flag) —
+        // opencode has no "create with this id" flag.
+        let fresh_pinned = OpenCodeDriver::default().with_session_id(Some(id.clone()));
+        let args = fresh_pinned.call_args("m");
+        assert!(!args.contains(&"--session".to_string()));
+        assert!(!args.contains(&"--continue".to_string()));
     }
 
     #[tokio::test]

@@ -99,7 +99,16 @@ impl ClaudeCodeDriver {
     /// - no id + fresh         → (nothing)            (brand-new conversation)
     #[must_use]
     pub fn call_args(&self) -> Vec<String> {
-        let mut args = self.base_args();
+        self.call_args_with_format("text")
+    }
+
+    /// [`Self::call_args`] but with the `--output-format` value spelled out so
+    /// the non-streaming `complete` can request `"json"` (single `result`
+    /// envelope) and read real token `usage`. Session handling is identical to
+    /// [`Self::call_args`]; only the output format differs.
+    #[must_use]
+    pub fn call_args_with_format(&self, output_format: &str) -> Vec<String> {
+        let mut args = self.base_args_with_format(output_format);
         match (&self.session_id, self.continue_session) {
             (Some(id), true) => {
                 args.push("--resume".to_string());
@@ -115,7 +124,13 @@ impl ClaudeCodeDriver {
         args
     }
 
-    /// The argument vector preceding the prompt. Exposed for tests.
+    /// The argument vector preceding the prompt, with the output format made
+    /// explicit. Exposed for tests.
+    ///
+    /// `output_format` is `"text"` for the non-streaming path's plain-markdown
+    /// answer, or `"json"` when the caller wants the single `result` envelope
+    /// (so it can read real token `usage`). Both share the same permission and
+    /// session handling; only the `--output-format` value differs.
     ///
     /// Flag rationale:
     /// - `--print` (or `-p`): non-interactive single-shot mode.
@@ -140,10 +155,19 @@ impl ClaudeCodeDriver {
     /// `UMADEV_NO_SKIP_PERMS=1` (e.g. if a corporate policy blocks it).
     #[must_use]
     pub fn base_args(&self) -> Vec<String> {
+        self.base_args_with_format("text")
+    }
+
+    /// [`Self::base_args`] but with the `--output-format` value spelled out so
+    /// the non-streaming `complete` can request `"json"` and read real `usage`
+    /// off the single `result` envelope. See [`Self::base_args`] for the flag
+    /// rationale.
+    #[must_use]
+    pub fn base_args_with_format(&self, output_format: &str) -> Vec<String> {
         let mut args = vec![
             self.print_flag.clone(),
             "--output-format".to_string(),
-            "text".to_string(),
+            output_format.to_string(),
         ];
         // Auto-skip permission prompts so the pipeline is fully autonomous.
         // UmaDev's governance layer replaces the host's permission system.
@@ -184,7 +208,12 @@ impl Runtime for ClaudeCodeDriver {
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, RuntimeError> {
         let prompt = merge_prompt(&req);
-        let mut args = self.call_args();
+        // Request `--output-format json` (not `text`) so claude emits a single
+        // `result` envelope carrying real token `usage` — without it the
+        // non-streaming path had NO usage data and `/usage` always read zero for
+        // it. The envelope is the same shape the streaming `result` line uses, so
+        // the existing `extract_*` helpers parse it unchanged.
+        let mut args = self.call_args_with_format("json");
         args.extend(model_args(&req.model));
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
         let out = run_subprocess(SubprocessCall {
@@ -199,11 +228,23 @@ impl Runtime for ClaudeCodeDriver {
         .await
         .map_err(crate::map_subprocess_error)?;
 
+        // Parse the `result` envelope for the answer + usage. Fall back to raw
+        // stdout if extraction yields nothing (an error envelope or an
+        // unexpected format must never silently empty the run — fail-open).
+        let usage = extract_usage(&out.stdout);
+        let text = extract_result_text(&out.stdout).unwrap_or_else(|| {
+            let assistant = extract_all_assistant_text(&out.stdout);
+            if assistant.trim().is_empty() {
+                out.stdout.clone()
+            } else {
+                assistant
+            }
+        });
         Ok(CompletionResponse {
-            text: out.stdout,
+            text,
             id: "claude-code-cli".to_string(),
             model: req.model,
-            usage: Usage::default(),
+            usage,
         })
     }
 
@@ -847,6 +888,78 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--resume", uuid.as_str()]));
         assert!(!args.contains(&"--continue".to_string()));
         assert!(!args.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn call_args_json_format_requests_usage_envelope() {
+        // The non-streaming complete() asks for `--output-format json` so it can
+        // read real token usage off the single result envelope; the default
+        // text path is unchanged.
+        let d = ClaudeCodeDriver::default();
+        let json_args = d.call_args_with_format("json");
+        assert!(
+            json_args
+                .windows(2)
+                .any(|w| w == ["--output-format", "json"]),
+            "json format must pass --output-format json: {json_args:?}"
+        );
+        let text_args = d.call_args();
+        assert!(
+            text_args
+                .windows(2)
+                .any(|w| w == ["--output-format", "text"]),
+            "default call_args stays text: {text_args:?}"
+        );
+        // Session handling is identical across formats — a pinned resume id
+        // still appears regardless of output format.
+        let id = "11111111-2222-4333-8444-555555555555".to_string();
+        let resume = ClaudeCodeDriver::default()
+            .with_session_id(Some(id.clone()))
+            .with_continue_session(true);
+        assert!(resume
+            .call_args_with_format("json")
+            .windows(2)
+            .any(|w| w == ["--resume", id.as_str()]));
+    }
+
+    // The fake claude is a `#!/bin/sh` script, which Windows cannot exec; the
+    // JSON-envelope parsing it exercises is also covered by `extract_usage` /
+    // `extract_result_text` unit tests above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn complete_parses_usage_from_json_result_envelope() {
+        // Drive a fake `claude` that emits the real `--output-format json`
+        // single-object envelope (captured from live claude). complete() must
+        // extract BOTH the answer text and the real token usage, instead of the
+        // old hard-coded zeros.
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"the real answer\",\"usage\":{\"input_tokens\":1200,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":50,\"output_tokens\":42}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let d = ClaudeCodeDriver::with_program(script.to_str().unwrap());
+        let req = CompletionRequest {
+            model: "claude-opus-4-8".into(),
+            system: None,
+            messages: vec![umadev_runtime::Message {
+                role: "user".into(),
+                content: "x".into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+        };
+        let resp = d.complete(req).await.unwrap();
+        assert_eq!(resp.text, "the real answer");
+        // input = 1200 + 300 cache read + 50 cache creation.
+        assert_eq!(resp.usage.input_tokens, 1550);
+        assert_eq!(resp.usage.output_tokens, 42);
     }
 
     #[tokio::test]

@@ -90,7 +90,16 @@ pub fn validate_frontend_vs_contract(
             violations.push(ContractViolation::undeclared_call(call));
             continue;
         }
-        // Path is known — does the method match?
+        // The path matches a declared template. Only raise MethodMismatch when
+        // the frontend method was actually determined from the call shape. A
+        // call whose method is a best-effort default (e.g. a bare
+        // `request('/x')` wrapper, where the verb is unknown) must NOT be
+        // reported as a method mismatch — that would be a guess presented as a
+        // defect, exactly the kind of false alarm that erodes trust.
+        if !call.method_known {
+            continue;
+        }
+        // Path is known and the method is known — does the method match?
         if !spec.has_endpoint(call.method, &call.path) {
             // Find the declared path template for a clearer message.
             let declared = spec
@@ -219,6 +228,18 @@ mod tests {
             file: "src/api.ts".into(),
             method,
             path: path.into(),
+            method_known: true,
+        }
+    }
+
+    /// A call whose method is a best-effort default (verb not determinable
+    /// from the call shape), e.g. a bare `request('/x')` wrapper.
+    fn call_unknown_method(method: HttpVerb, path: &str) -> FrontendCall {
+        FrontendCall {
+            file: "src/api.ts".into(),
+            method,
+            path: path.into(),
+            method_known: false,
         }
     }
 
@@ -252,6 +273,34 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].kind, ViolationKind::MethodMismatch);
         assert!(v[0].detail.contains("DELETE"));
+    }
+
+    #[test]
+    fn unknown_method_suppresses_method_mismatch() {
+        // Fix 3: a call whose method is a best-effort default (method_known =
+        // false, e.g. a bare `request('/x')` wrapper) must NOT raise a
+        // MethodMismatch even when the guessed verb differs from the contract.
+        let spec = spec();
+        // Contract has GET+POST /api/users (no DELETE without :id). A
+        // DELETE-tagged but unknown-method call to /api/users would mismatch if
+        // we trusted the guess — we must not.
+        let calls = vec![call_unknown_method(HttpVerb::Delete, "/api/users")];
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert!(
+            v.is_empty(),
+            "unknown-method call must not raise MethodMismatch, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_method_still_flags_undeclared_path() {
+        // The method_known leniency only suppresses MethodMismatch — an
+        // entirely unknown PATH is still a real UndeclaredCall.
+        let spec = spec();
+        let calls = vec![call_unknown_method(HttpVerb::Get, "/api/nonexistent")];
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].kind, ViolationKind::UndeclaredCall);
     }
 
     #[test]
@@ -374,5 +423,75 @@ mod tests {
         let spec = ApiSpec::default();
         assert!(validate_frontend_vs_contract(&[], &spec).is_empty());
         assert!(validate_prd_vs_contract(&[], &spec).is_empty());
+    }
+
+    // ---- Fix 4: lock the (currently zero-call) PRD validators' logic ----
+
+    #[test]
+    fn prd_route_matched_when_resource_is_present() {
+        // A PRD route whose leaf resource is served by SOME endpoint is clean.
+        let spec = spec();
+        let routes = vec!["/users".to_string(), "/users/edit".to_string()];
+        // "/users" → users (present); "/users/edit" → edit (NOT present).
+        let v = validate_prd_vs_contract(&routes, &spec);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].detail.contains("/users/edit"));
+    }
+
+    #[test]
+    fn prd_route_base_skips_param_and_api_and_version() {
+        // The resource segment is the last NON-param, NON-"api", NON-version
+        // segment. `/api/v3/users/:id` → "users", which the contract serves.
+        let spec = spec();
+        let v = validate_prd_vs_contract(&["/api/v3/users/:id".to_string()], &spec);
+        assert!(
+            v.is_empty(),
+            "version + param + api prefixes must be skipped, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn prd_route_all_param_segments_is_skipped_not_flagged() {
+        // A route that is purely `/:id` (no resource segment) is too generic to
+        // validate → silently skipped, never a false UnmatchedRoute.
+        let spec = spec();
+        assert!(validate_prd_vs_contract(&["/:id".to_string()], &spec).is_empty());
+        assert!(validate_prd_vs_contract(&["/api".to_string()], &spec).is_empty());
+    }
+
+    #[test]
+    fn extract_prd_routes_takes_path_before_label() {
+        // A tree line `├── /dashboard  Main dashboard` keeps only `/dashboard`.
+        let prd = "├── /dashboard  Main dashboard\n└── /orders  Order list";
+        let routes = extract_prd_routes(prd);
+        assert_eq!(
+            routes,
+            vec!["/dashboard".to_string(), "/orders".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_prd_routes_ignores_non_path_and_too_short() {
+        // Prose lines and the bare root `/` are not routes.
+        let prd = "This app has pages.\n/\n/x\n├── /reports";
+        let routes = extract_prd_routes(prd);
+        // `/` and `/x` (len < 3) dropped; only `/reports` survives.
+        assert_eq!(routes, vec!["/reports".to_string()]);
+    }
+
+    #[test]
+    fn extract_then_validate_prd_round_trip() {
+        // End-to-end for the (soon-to-be-wired) pair: extract from markdown,
+        // then validate against the contract.
+        let spec = spec();
+        let prd = "## IA\n```\n/ (Home)\n├── /users\n└── /billing\n```";
+        let routes = extract_prd_routes(prd);
+        assert!(routes.contains(&"/users".to_string()));
+        assert!(routes.contains(&"/billing".to_string()));
+        let v = validate_prd_vs_contract(&routes, &spec);
+        // /users is served; /billing is not.
+        assert_eq!(v.len(), 1);
+        assert!(v[0].detail.contains("/billing"));
+        assert_eq!(v[0].kind, ViolationKind::UnmatchedRoute);
     }
 }

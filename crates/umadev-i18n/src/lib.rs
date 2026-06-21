@@ -268,6 +268,70 @@ mod tests {
     }
 
     #[test]
+    fn migrated_tui_keys_present_in_all_langs() {
+        // Guard the keys migrated out of hard-coded TUI strings (overlay / help
+        // hints, /model tiers, checkpoint+rewind labels, /deploy, and the
+        // background worker / preview / deploy spawn errors). A developer who
+        // adds one of these surfaces by writing literal English (or Chinese)
+        // again — instead of a catalog key — would let the parity gate pass
+        // while still shipping a wrong-language string; this test fails loudly
+        // and tells them to add the key in all three catalogs.
+        const MIGRATED: &[&str] = &[
+            "run.classified_build_memo",
+            "checkpoint.phase_label",
+            "checkpoint.manual_label",
+            "checkpoint.created",
+            "checkpoint.git_required",
+            "rewind.empty",
+            "rewind.list_header",
+            "rewind.restored",
+            "rewind.failed",
+            "model.tiers_current",
+            "model.tiers_hint",
+            "model.tiers_busy",
+            "model.tiers_default",
+            "model.tiers_default_paren",
+            "model.tiers_updated",
+            "deploy.confirm_preflight",
+            "worker.init_failed",
+            "pipeline.start_failed",
+            "worker.timeout",
+            "worker.not_on_path",
+            "worker.exited",
+            "pipeline.generic_error",
+            "pipeline.error_note",
+            "base.init_failed",
+            "route.resume_retry",
+            "base.empty_reply",
+            "route.failed",
+            "preview.dev_starting",
+            "preview.dev_ready",
+            "preview.dev_not_ready",
+            "preview.dev_spawn_failed",
+            "preview.port_busy",
+            "deploy.running",
+            "deploy.login_hint",
+            "deploy.done",
+            "deploy.done_no_url",
+            "deploy.failed",
+            "deploy.exec_failed",
+            "deploy.timeout",
+        ];
+        let cats = catalogs();
+        for lang in Lang::ALL {
+            for key in MIGRATED {
+                assert!(
+                    cats[lang as usize].contains_key(*key),
+                    "catalog {} is missing migrated key `{}` — add it (in all three \
+                     catalogs) instead of hard-coding the string in the TUI",
+                    lang.code(),
+                    key
+                );
+            }
+        }
+    }
+
+    #[test]
     fn lookup_and_format() {
         // Seeded key exists in all langs.
         assert!(!t(Lang::ZhCn, "picker.title").is_empty());

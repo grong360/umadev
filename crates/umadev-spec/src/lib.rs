@@ -514,6 +514,89 @@ mod tests {
         assert_eq!(ids.len(), 3);
     }
 
+    /// The normative prose, embedded at compile time. The relative path is
+    /// from this file (`crates/umadev-spec/src/lib.rs`) up to the workspace
+    /// root, then into `spec/`. If the prose is ever moved, this `include_str!`
+    /// fails the build — which is exactly the lockstep guarantee we want.
+    const SPEC_PROSE: &str = include_str!("../../../spec/UMADEV_HOST_SPEC_V1.md");
+
+    /// The boundary marker after which clause IDs are non-normative V2
+    /// candidates (§10 "Future work"). IDs that appear only beyond this point
+    /// are intentionally *not* in [`CLAUSES`].
+    const FUTURE_WORK_MARKER: &str = "## 10. Future work";
+
+    /// Forward lockstep: every clause carried as data MUST appear, verbatim,
+    /// in the normative prose. This is the half that actually caught the HOST
+    /// drift — data and `.md` can no longer diverge silently. Enforces the
+    /// CLAUDE.md "Spec sync contract".
+    #[test]
+    fn every_clause_id_appears_in_the_prose() {
+        for c in CLAUSES {
+            assert!(
+                SPEC_PROSE.contains(c.id),
+                "clause {} is in CLAUSES but not in spec/UMADEV_HOST_SPEC_V1.md \
+                 — the data and the normative prose have drifted",
+                c.id
+            );
+        }
+    }
+
+    /// Forward lockstep, part two: every clause's declared `section` number
+    /// MUST head a real `### <section>` heading in the prose, so a clause
+    /// can't point at a section that doesn't exist (or was renumbered).
+    #[test]
+    fn every_clause_section_heading_exists_in_the_prose() {
+        for c in CLAUSES {
+            let heading = format!("### {} ", c.section);
+            assert!(
+                SPEC_PROSE.contains(&heading),
+                "clause {} claims section {} but no `### {} …` heading exists \
+                 in spec/UMADEV_HOST_SPEC_V1.md",
+                c.id,
+                c.section,
+                c.section
+            );
+        }
+    }
+
+    /// Reverse lockstep: every `UD-XXX-NNN` identifier mentioned in the
+    /// normative body of the prose (everything *before* §10 "Future work")
+    /// MUST be backed by a clause in [`CLAUSES`]. IDs that live only in §10
+    /// are documented V2 candidates and are deliberately excluded. This is
+    /// the half that locks out a `UD-HOST-*` (or any other) layer being
+    /// described in prose without a data entry.
+    #[test]
+    fn every_normative_prose_id_is_a_known_clause() {
+        let normative = SPEC_PROSE
+            .split_once(FUTURE_WORK_MARKER)
+            .map_or(SPEC_PROSE, |(before, _)| before);
+
+        let known: HashSet<&str> = CLAUSES.iter().map(|c| c.id).collect();
+
+        // Scan for `UD-<UPPER>-<3 digits>` tokens without pulling in a regex
+        // dep (this crate is deliberately dependency-light).
+        for raw in normative.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-')) {
+            let token = raw.trim_matches('-');
+            let mut parts = token.split('-');
+            let is_clause_id = parts.next() == Some("UD")
+                && parts.next().is_some_and(|layer| {
+                    !layer.is_empty() && layer.chars().all(|c| c.is_ascii_uppercase())
+                })
+                && parts
+                    .next()
+                    .is_some_and(|num| num.len() == 3 && num.chars().all(|c| c.is_ascii_digit()))
+                && parts.next().is_none();
+            if is_clause_id {
+                assert!(
+                    known.contains(token),
+                    "{token} appears in the normative prose (before §10) but is \
+                     not in CLAUSES — either add the clause data or move the \
+                     mention into §10 Future work"
+                );
+            }
+        }
+    }
+
     #[test]
     fn gate_from_id_roundtrips_and_is_case_insensitive() {
         for g in [Gate::DocsConfirm, Gate::PreviewConfirm] {

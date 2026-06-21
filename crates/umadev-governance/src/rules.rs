@@ -128,6 +128,9 @@ pub fn scan_content_with_policy(
         check_malicious_urls,
         check_typosquat_packages,
         check_eval_injection,
+        check_weak_crypto,
+        check_template_injection,
+        check_command_injection,
         check_unsafe_deserialization,
         check_unreliable_sources,
         check_hardcoded_config,
@@ -2027,11 +2030,27 @@ fn extract_leading_number(s: &str) -> Option<u64> {
     digits.parse().ok()
 }
 
-/// Well-known numbers that don't count as "magic" (HTTP status codes, common
-/// timeouts). Conservative — these are universally recognized.
+/// Well-known numbers that don't count as "magic" — universally recognized
+/// domain constants whose meaning is obvious at the comparison site, so
+/// flagging them is a false positive. Covers:
+/// - HTTP status codes (`200`/`404`/`500` …),
+/// - common ages / thresholds (`13`/`16`/`18`/`21`/`65`),
+/// - percentages and round bases (`50`/`100`/`1000`),
+/// - powers of two used for sizes (`16`/`32`/`64`/`128`/`255`/`256`/`512`/`1024`/`2048`/`4096`),
+/// - common time/port constants (`12`/`24`/`60`/`3600`/`8080`/`3000`).
+///
+/// Conservative by design: only numbers with a single obvious real-world
+/// meaning. Anything outside this set still counts toward the magic-number
+/// budget.
 const WELL_KNOWN_NUMBERS: &[u64] = &[
-    100, 101, 200, 201, 202, 204, 301, 302, 304, 400, 401, 403, 404, 405, 409, 422, 429, 500, 502,
-    503, 504,
+    // HTTP status codes
+    100, 101, 200, 201, 202, 204, 301, 302, 304, 400, 401, 403, 404, 405, 409, 410, 422, 429, 500,
+    502, 503, 504, // common ages / legal thresholds
+    13, 16, 18, 21, 65, // percentages / round decimal bases
+    50, 1000, 10000, // powers of two (sizes, masks, buffer lengths)
+    16, 32, 64, 128, 255, 256, 512, 1024, 2048, 4096, 8192,
+    // common time units & well-known ports
+    12, 24, 60, 90, 360, 365, 3600, 86400, 3000, 5000, 8000, 8080,
 ];
 
 /// **UD-ARCH-014** (Python): ban bare `except:` clauses.
@@ -6848,6 +6867,284 @@ const DESTRUCTIVE_BASH_PATTERNS: &[BashPattern] = &[
     },
 ];
 
+/// Regex matching a broken/weak hash or cipher primitive being *constructed*
+/// or *named* in code. Reused across `check_weak_crypto`; cached in a
+/// `OnceLock` so it compiles once. Matches:
+/// - `createHash('md5'|'sha1')` / `createHash("sha-1")` (Node crypto),
+/// - `hashlib.md5(` / `hashlib.sha1(` (Python),
+/// - `MessageDigest.getInstance("MD5"|"SHA-1")` (Java),
+/// - `md5(` / `sha1(` standalone calls (PHP / Ruby / generic),
+/// - `DES` / `RC4` / `Cipher.getInstance("DES")` weak ciphers,
+/// - `MD5CryptoServiceProvider` / `SHA1Managed` (.NET).
+///
+/// The match is intentionally name-anchored (word boundaries / quotes) so a
+/// substring like `sha1sum` in a comment URL or `address1` won't trip it.
+fn weak_crypto_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"(?i)(",
+            // Node crypto: createHash('md5') / createHash("sha-1")
+            r#"createhash\s*\(\s*['"]\s*(md5|sha-?1)\s*['"]"#,
+            r"|",
+            // Python hashlib: hashlib.md5( / hashlib.sha1(
+            r"hashlib\s*\.\s*(md5|sha1)\s*\(",
+            r"|",
+            // Java MessageDigest.getInstance("MD5") / Cipher.getInstance("DES")
+            r#"getinstance\s*\(\s*['"]\s*(md5|sha-?1|des|rc4|des/|tripledes)['"/]"#,
+            r"|",
+            // .NET providers
+            r"\b(md5cryptoserviceprovider|sha1managed|sha1cryptoserviceprovider|descryptoserviceprovider|rc2cryptoserviceprovider)\b",
+            r"|",
+            // standalone weak-hash calls: md5( / sha1( (PHP/Ruby/Go/generic)
+            r"\b(md5|sha1)\s*\(",
+            r"|",
+            // weak symmetric ciphers named directly: DESede, DES, RC4, Blowfish
+            r"\b(des-cbc|des-ecb|rc4|3des|desede)\b",
+            r")",
+        ))
+        .expect("weak-crypto regex is well-formed at compile time")
+    })
+}
+
+/// **UD-SEC-018** (extends the cryptographic-storage family): ban broken hash
+/// and cipher primitives — MD5, SHA-1, DES, RC4.
+///
+/// MD5 and SHA-1 are collision-broken and must never be used for integrity,
+/// signatures, password hashing, or any security purpose; DES/3DES/RC4 are
+/// broken symmetric ciphers. Matches `createHash('md5'|'sha1')`,
+/// `hashlib.md5()`/`hashlib.sha1()`, `MessageDigest.getInstance("MD5"|"SHA-1")`,
+/// `Cipher.getInstance("DES")`, bare `md5(`/`sha1(` calls, and the broken .NET
+/// providers. Runs on common backend/source extensions. Fail-open: any
+/// internal slip returns pass.
+#[must_use]
+pub fn check_weak_crypto(file_path: &str, content: &str) -> Decision {
+    let ext = extension_of(file_path);
+    if !matches!(
+        ext.as_str(),
+        "ts" | "js" | "jsx" | "tsx" | "py" | "rb" | "go" | "java" | "kt" | "cs" | "php" | "rs"
+    ) {
+        return Decision::pass();
+    }
+    let re = weak_crypto_regex();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        // Skip comment lines — naming a banned primitive while explaining it
+        // (e.g. "// don't use md5") shouldn't fire.
+        if trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('*')
+            || trimmed.starts_with("/*")
+        {
+            continue;
+        }
+        if re.is_match(line) {
+            return Decision::block(
+                "UD-SEC-018",
+                format!(
+                    "UmaDev: broken crypto primitive (UD-SEC-018). \
+                     `{file_path}` uses a collision-broken hash (MD5/SHA-1) or a \
+                     broken cipher (DES/3DES/RC4). These offer no real security. \
+                     Use SHA-256/SHA-3 for integrity, AES-GCM for encryption, and \
+                     bcrypt/scrypt/Argon2 for password hashing — never a raw hash \
+                     for passwords.",
+                ),
+            );
+        }
+    }
+    Decision::pass()
+}
+
+/// Regex matching server-side template rendering fed *directly* from a
+/// concatenation/interpolation that includes a user-input-looking token —
+/// i.e. Server-Side Template Injection (SSTI). Cached in a `OnceLock`.
+/// Matches things like:
+/// - `render_template_string("..." + user)` / `render_template_string(f"...{req...}")` (Flask/Jinja),
+/// - `Template(user_input).render(` / `Template(... + x).render(` (Jinja/Mako/Tornado),
+/// - `new Function(...)`-style template engines are covered by UD-SEC-007 instead.
+///
+/// The key signal is *dynamic construction* of the template SOURCE from
+/// request/user data, which is the SSTI hole — passing user data as render
+/// *context* (the safe pattern) does not match.
+fn ssti_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"(?i)(",
+            // Flask: render_template_string( ... <dynamic> )
+            r"render_template_string\s*\(",
+            r"|",
+            // Jinja2/Mako/Tornado/Django Template(...).render where the
+            // Template SOURCE is built dynamically.
+            r"\btemplate\s*\(",
+            r"|",
+            // express/handlebars/ejs compile from a dynamic string
+            r"\b(handlebars|hbs|ejs|pug|nunjucks)\s*\.\s*compile\s*\(",
+            r")",
+        ))
+        .expect("ssti regex is well-formed at compile time")
+    })
+}
+
+/// **UD-SEC-007** (extends the injection family): ban Server-Side Template
+/// Injection — feeding user input into the *template source*, not the context.
+///
+/// `render_template_string(base + user_input)`, `Template(user_input).render()`,
+/// or `handlebars.compile(userString)` let an attacker inject template syntax
+/// that the engine executes (RCE in Jinja2/Twig/Freemarker). The rule fires
+/// only when a dynamic template-rendering call is combined with a
+/// user-input-looking token (`user`, `req`, `request`, `params`, `body`,
+/// `query`, `input`, a template literal `${...}`, an f-string, or string
+/// concatenation) on the same line. Runs on JS/TS/Python. Fail-open.
+#[must_use]
+pub fn check_template_injection(file_path: &str, content: &str) -> Decision {
+    let ext = extension_of(file_path);
+    if !matches!(ext.as_str(), "ts" | "js" | "jsx" | "tsx" | "py") {
+        return Decision::pass();
+    }
+    let re = ssti_regex();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+            continue;
+        }
+        if !re.is_match(line) {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        // The template SOURCE must be built from dynamic / user-ish data.
+        let dynamic_user_source = (lower.contains("user")
+            || lower.contains("req.")
+            || lower.contains("request")
+            || lower.contains("params")
+            || lower.contains("req.body")
+            || lower.contains("body")
+            || lower.contains("query")
+            || lower.contains("input")
+            || lower.contains("${"))
+            && (lower.contains(" + ")
+                || lower.contains("+ ")
+                || lower.contains("${")
+                || lower.contains("f\"")
+                || lower.contains("f'")
+                || lower.contains(".format(")
+                || lower.contains("%s")
+                || lower.contains("user")
+                || lower.contains("input"));
+        if dynamic_user_source {
+            return Decision::block(
+                "UD-SEC-007",
+                format!(
+                    "UmaDev: server-side template injection (UD-SEC-007). \
+                     `{file_path}` builds a template's SOURCE from user input \
+                     (e.g. `render_template_string(... + user)` / \
+                     `Template(user_input).render()`). The engine executes \
+                     injected template syntax — a classic RCE. Render a STATIC \
+                     template and pass user data only as the render CONTEXT: \
+                     `render_template('page.html', name=user_name)`.",
+                ),
+            );
+        }
+    }
+    Decision::pass()
+}
+
+/// Regex matching a shell-spawning call. Cached in a `OnceLock`. Matches the
+/// shell-exec sinks across languages: `exec(` / `execSync(` / `spawn(` (Node),
+/// `os.system(` / `subprocess.` / `Popen(` (Python), `Runtime.exec(` (Java),
+/// `Process(`/backticks left to the per-line concat check. The *injection*
+/// decision is made by `check_command_injection`, which additionally requires
+/// dynamic string construction (or `shell=True`) on the same line.
+fn shell_exec_sink_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"(?i)(",
+            r"\bexec(sync)?\s*\(", // Node child_process exec/execSync
+            r"|",
+            r"\bspawn(sync)?\s*\(", // Node spawn/spawnSync
+            r"|",
+            r"\bos\s*\.\s*system\s*\(", // Python os.system
+            r"|",
+            r"\bos\s*\.\s*popen\s*\(", // Python os.popen
+            r"|",
+            r"\bsubprocess\s*\.\s*(call|run|popen|check_output|check_call)\s*\(", // Python subprocess
+            r"|",
+            r"\bpopen\s*\(", // generic popen
+            r"|",
+            r"\bruntime\s*\.\s*getruntime\s*\(\s*\)\s*\.\s*exec\s*\(", // Java
+            r")",
+        ))
+        .expect("shell-exec sink regex is well-formed at compile time")
+    })
+}
+
+/// **UD-ARCH-023** (extends the shell-exec family): ban OS command injection —
+/// user input concatenated into a shell-spawning call.
+///
+/// `exec(\`... ${user}\`)`, `os.system("cmd " + user)`, or any
+/// `subprocess.*(..., shell=True)` with a built-up string lets an attacker
+/// inject `; rm -rf /`. The rule fires when a shell-exec sink (see
+/// [`shell_exec_sink_regex`]) appears on a line that ALSO shows dynamic
+/// construction (template literal `${...}`, f-string, `.format(`, `%`-format,
+/// or string concatenation) OR uses `shell=True`. A static literal command
+/// passes. Runs on JS/TS/Python/Java. Fail-open.
+#[must_use]
+pub fn check_command_injection(file_path: &str, content: &str) -> Decision {
+    let ext = extension_of(file_path);
+    if !matches!(
+        ext.as_str(),
+        "ts" | "js" | "jsx" | "tsx" | "py" | "java" | "kt"
+    ) {
+        return Decision::pass();
+    }
+    let re = shell_exec_sink_regex();
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        // `shell=True` is dangerous on its own when paired with dynamic input.
+        let shell_true = lower.contains("shell=true");
+        let is_sink = re.is_match(line) || (shell_true && lower.contains("subprocess"));
+        if !is_sink {
+            continue;
+        }
+        // Dynamic construction signals — string interpolation / concatenation.
+        let dynamic = lower.contains("${")
+            || lower.contains("` +")
+            || lower.contains("+ `")
+            || lower.contains("\" +")
+            || lower.contains("+ \"")
+            || lower.contains("' +")
+            || lower.contains("+ '")
+            || lower.contains("f\"")
+            || lower.contains("f'")
+            || lower.contains(".format(")
+            || lower.contains("% (")
+            || lower.contains("%s")
+            || lower.contains("\" + ")
+            || lower.contains("str(");
+        // `shell=True` plus ANY non-list argument is the canonical injection.
+        if dynamic || shell_true {
+            return Decision::block(
+                "UD-ARCH-023",
+                format!(
+                    "UmaDev: OS command injection (UD-ARCH-023). \
+                     `{file_path}` builds a shell command from interpolated / \
+                     concatenated input (or uses `shell=True`). An attacker can \
+                     inject `; rm -rf /`. Pass an argument ARRAY to a non-shell \
+                     exec — `execFile('git', ['clone', url])` (Node), \
+                     `subprocess.run(['git','clone',url])` with `shell=False` \
+                     (Python) — and never string-build the command line.",
+                ),
+            );
+        }
+    }
+    Decision::pass()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10719,5 +11016,288 @@ const x = 1;",
     fn code_for_in_ignores_non_js() {
         let d = check_for_in_array("server/app.py", "for x in items:");
         assert!(!d.block);
+    }
+
+    // --- UD-SEC-018: weak crypto -----------------------------------------
+
+    #[test]
+    fn crypto_blocks_node_createhash_md5() {
+        let d = check_weak_crypto(
+            "src/hash.ts",
+            "const h = crypto.createHash('md5').update(x);",
+        );
+        assert!(d.block);
+        assert_eq!(d.clause, "UD-SEC-018");
+    }
+
+    #[test]
+    fn crypto_blocks_node_createhash_sha1_double_quotes() {
+        let d = check_weak_crypto("src/hash.js", "crypto.createHash(\"sha1\").digest('hex')");
+        assert!(d.block);
+    }
+
+    #[test]
+    fn crypto_blocks_python_hashlib_md5() {
+        let d = check_weak_crypto("server/auth.py", "digest = hashlib.md5(data).hexdigest()");
+        assert!(d.block);
+    }
+
+    #[test]
+    fn crypto_blocks_python_hashlib_sha1() {
+        let d = check_weak_crypto("server/auth.py", "h = hashlib.sha1(token.encode())");
+        assert!(d.block);
+    }
+
+    #[test]
+    fn crypto_blocks_java_messagedigest_md5() {
+        let d = check_weak_crypto(
+            "src/Hash.java",
+            "MessageDigest md = MessageDigest.getInstance(\"MD5\");",
+        );
+        assert!(d.block);
+    }
+
+    #[test]
+    fn crypto_blocks_des_cipher() {
+        let d = check_weak_crypto(
+            "src/Crypt.java",
+            "Cipher c = Cipher.getInstance(\"DES/ECB/PKCS5Padding\");",
+        );
+        assert!(d.block);
+    }
+
+    #[test]
+    fn crypto_blocks_php_md5_call() {
+        let d = check_weak_crypto("app/User.php", "$hash = md5($password);");
+        assert!(d.block);
+    }
+
+    #[test]
+    fn crypto_blocks_dotnet_provider() {
+        let d = check_weak_crypto("src/Hash.cs", "var p = new SHA1Managed();");
+        assert!(d.block);
+    }
+
+    #[test]
+    fn crypto_passes_sha256() {
+        let d = check_weak_crypto("src/hash.ts", "const h = crypto.createHash('sha256');");
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn crypto_passes_bcrypt() {
+        let d = check_weak_crypto(
+            "server/auth.py",
+            "hashed = bcrypt.hashpw(pw, bcrypt.gensalt())",
+        );
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn crypto_passes_comment_mention() {
+        let d = check_weak_crypto("src/hash.ts", "// never use md5() for passwords");
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn crypto_passes_substring_not_a_call() {
+        // `address1` / `sha1sum` mentioned without being the primitive call.
+        let d = check_weak_crypto("src/form.ts", "const address1 = user.address1;");
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn crypto_ignores_non_source_files() {
+        let d = check_weak_crypto("README.md", "We dropped md5() in favor of sha256.");
+        assert!(!d.block);
+    }
+
+    // --- UD-SEC-007: server-side template injection ----------------------
+
+    #[test]
+    fn ssti_blocks_flask_render_template_string_concat() {
+        let d = check_template_injection(
+            "server/views.py",
+            "return render_template_string('<h1>' + user_name + '</h1>')",
+        );
+        assert!(d.block);
+        assert_eq!(d.clause, "UD-SEC-007");
+    }
+
+    #[test]
+    fn ssti_blocks_flask_render_template_string_fstring() {
+        let d = check_template_injection(
+            "server/views.py",
+            "return render_template_string(f'Hello {request.args.get(\"name\")}')",
+        );
+        assert!(d.block);
+    }
+
+    #[test]
+    fn ssti_blocks_template_render_user_input() {
+        let d = check_template_injection(
+            "server/render.py",
+            "html = Template(user_input + base).render(ctx)",
+        );
+        assert!(d.block);
+    }
+
+    #[test]
+    fn ssti_blocks_handlebars_compile_dynamic() {
+        let d = check_template_injection(
+            "src/email.ts",
+            "const tpl = handlebars.compile(`${req.body.template}`);",
+        );
+        assert!(d.block);
+    }
+
+    #[test]
+    fn ssti_passes_static_render_template() {
+        // Safe pattern: static template file, user data as context.
+        let d = check_template_injection(
+            "server/views.py",
+            "return render_template('page.html', name=user_name)",
+        );
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn ssti_passes_static_compile_literal() {
+        let d = check_template_injection(
+            "src/email.ts",
+            "const tpl = handlebars.compile('Hello world');",
+        );
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn ssti_ignores_non_target_ext() {
+        let d = check_template_injection(
+            "app/User.php",
+            "render_template_string('<h1>' + user + '</h1>')",
+        );
+        assert!(!d.block);
+    }
+
+    // --- UD-ARCH-023: OS command injection -------------------------------
+
+    #[test]
+    fn cmdinj_blocks_node_exec_template_literal() {
+        let d = check_command_injection(
+            "src/git.ts",
+            "exec(`git clone ${userRepo}`, (e, out) => {});",
+        );
+        assert!(d.block);
+        assert_eq!(d.clause, "UD-ARCH-023");
+    }
+
+    #[test]
+    fn cmdinj_blocks_python_os_system_concat() {
+        let d = check_command_injection("server/ops.py", "os.system('ping ' + user_host)");
+        assert!(d.block);
+    }
+
+    #[test]
+    fn cmdinj_blocks_python_subprocess_shell_true() {
+        let d =
+            check_command_injection("server/ops.py", "subprocess.run('ls ' + path, shell=True)");
+        assert!(d.block);
+    }
+
+    #[test]
+    fn cmdinj_blocks_python_fstring_subprocess() {
+        let d = check_command_injection(
+            "server/ops.py",
+            "subprocess.call(f'rm {target}', shell=True)",
+        );
+        assert!(d.block);
+    }
+
+    #[test]
+    fn cmdinj_blocks_java_runtime_exec_concat() {
+        let d = check_command_injection(
+            "src/Ops.java",
+            "Runtime.getRuntime().exec(\"ping \" + host);",
+        );
+        assert!(d.block);
+    }
+
+    #[test]
+    fn cmdinj_passes_static_exec_command() {
+        let d = check_command_injection("src/git.ts", "execSync('git status');");
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn cmdinj_passes_argument_array_no_shell() {
+        // Safe: array args, shell=False (default).
+        let d = check_command_injection(
+            "server/ops.py",
+            "subprocess.run(['git', 'clone', repo_url])",
+        );
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn cmdinj_passes_node_execfile_array() {
+        let d = check_command_injection("src/git.ts", "execFile('git', ['clone', url]);");
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn cmdinj_ignores_comment_line() {
+        let d = check_command_injection("src/git.ts", "// exec(`git ${x}`) -- old, removed");
+        assert!(!d.block);
+    }
+
+    // --- UD-CODE-004: magic-number false-positive fix --------------------
+
+    #[test]
+    fn magic_allows_age_threshold() {
+        // Age comparisons read clearly and are not "magic" — one per line so
+        // each is independently counted against the budget.
+        let src = "if (age === 18) ok();\n\
+                   if (age === 21) drink();\n\
+                   if (age === 65) retire();\n\
+                   if (age === 13) teen();\n\
+                   if (age === 16) drive();";
+        let d = check_magic_numbers("src/age.ts", src);
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn magic_allows_percentages_and_sizes() {
+        let src = "if (pct === 50) a();\n\
+                   if (pct === 100) b();\n\
+                   if (len === 256) c();\n\
+                   if (len === 1024) d();\n\
+                   if (len === 4096) e();";
+        let d = check_magic_numbers("src/size.ts", src);
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn magic_allows_http_status_codes() {
+        let src = "if (s === 200) a();\n\
+                   if (s === 404) b();\n\
+                   if (s === 500) c();\n\
+                   if (s === 403) d();\n\
+                   if (s === 429) e();";
+        let d = check_magic_numbers("src/http.ts", src);
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn magic_still_blocks_genuine_magic_numbers() {
+        // Numbers with no obvious meaning still trip the budget (> 3),
+        // one comparison per line so each is counted.
+        let src = "if (x === 37) a();\n\
+                   if (y === 419) b();\n\
+                   if (z === 733) c();\n\
+                   if (w === 911) d();\n\
+                   if (v === 542) e();";
+        let d = check_magic_numbers("src/calc.ts", src);
+        assert!(d.block);
+        assert_eq!(d.clause, "UD-CODE-004");
     }
 }

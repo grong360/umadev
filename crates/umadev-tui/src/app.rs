@@ -912,7 +912,7 @@ impl App {
         ("status", "show detailed pipeline status"),
         ("export", "export the latest proof-pack"),
         ("knowledge", "list knowledge + design files"),
-        ("pitfalls", "show the self-learning 踩坑 knowledge base"),
+        ("pitfalls", "show the self-learning pitfalls knowledge base"),
         ("mcp", "manage MCP servers (/mcp list)"),
         ("skill", "manage skill packages (/skill list)"),
         ("spec", "show the UMADEV_HOST_SPEC_V1 spec"),
@@ -1062,7 +1062,7 @@ impl App {
                 // blocking task so a slow `git add -A` on a big repo never
                 // freezes the UI event loop; best-effort (no git -> no snapshot).
                 let root = self.project_root.clone();
-                let label = format!("阶段开始: {}", phase.id());
+                let label = umadev_i18n::tf(self.lang, "checkpoint.phase_label", &[phase.id()]);
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn_blocking(move || {
                         let _ = umadev_agent::checkpoint::create_checkpoint(&root, &label);
@@ -2085,7 +2085,7 @@ impl App {
         );
         self.conversation.push(umadev_runtime::Message {
             role: "assistant".to_string(),
-            content: format!("(进入 9 阶段流水线,需求:{requirement})"),
+            content: umadev_i18n::tf(self.lang, "run.classified_build_memo", &[requirement]),
         });
         self.trim_conversation();
     }
@@ -2499,18 +2499,19 @@ impl App {
             let plan = self.config.model_plan.as_deref();
             let build = self.config.model_build.as_deref();
             if plan.is_some() || build.is_some() {
+                let default = umadev_i18n::t(self.lang, "model.tiers_default");
                 self.push(
                     ChatRole::System,
-                    format!(
-                        "分阶段模型 —— 规划/文档: {} · 写码: {}(/model plan|build <模型> 调整,off 还原)",
-                        plan.unwrap_or("默认单模型"),
-                        build.unwrap_or("默认单模型")
+                    umadev_i18n::tf(
+                        self.lang,
+                        "model.tiers_current",
+                        &[plan.unwrap_or(default), build.unwrap_or(default)],
                     ),
                 );
             } else {
                 self.push(
                     ChatRole::System,
-                    "提示:可用 /model plan <便宜模型> 与 /model build <强模型> 给规划/写码分别配模型,省时省钱。".to_string(),
+                    umadev_i18n::t(self.lang, "model.tiers_hint").to_string(),
                 );
             }
             return Action::None;
@@ -2527,7 +2528,7 @@ impl App {
             if self.is_pipeline_active() {
                 self.push(
                     ChatRole::System,
-                    "运行进行中,不能修改模型分级 —— 等当前运行结束再设置。".to_string(),
+                    umadev_i18n::t(self.lang, "model.tiers_busy").to_string(),
                 );
                 return Action::None;
             }
@@ -2545,13 +2546,12 @@ impl App {
             };
             self.config.apply_model_tiers();
             let _ = crate::config::save_to(&self.config, &self.config_path);
-            let plan = self.config.model_plan.as_deref().unwrap_or("(默认单模型)");
-            let build = self.config.model_build.as_deref().unwrap_or("(默认单模型)");
+            let default = umadev_i18n::t(self.lang, "model.tiers_default_paren");
+            let plan = self.config.model_plan.as_deref().unwrap_or(default);
+            let build = self.config.model_build.as_deref().unwrap_or(default);
             self.push(
                 ChatRole::System,
-                format!(
-                    "已更新模型分级 —— 规划/文档阶段: {plan} · 写码阶段: {build}\n规划用便宜/快的、写码用强的,省时也省钱(对自带 key/第三方更明显)。"
-                ),
+                umadev_i18n::tf(self.lang, "model.tiers_updated", &[plan, build]),
             );
             return Action::None;
         }
@@ -3064,18 +3064,18 @@ impl App {
     /// work can be rewound later (shadow git, never touches the user's `.git`).
     fn slash_checkpoint(&mut self, label: &str) -> Action {
         let label = if label.trim().is_empty() {
-            "手动检查点".to_string()
+            umadev_i18n::t(self.lang, "checkpoint.manual_label").to_string()
         } else {
             label.trim().to_string()
         };
         match umadev_agent::checkpoint::create_checkpoint(&self.project_root, &label) {
             Some(id) => self.push(
                 ChatRole::System,
-                format!("已创建文件检查点 `{id}`:{label}\n用 /rewind 查看,/rewind {id} 回滚。"),
+                umadev_i18n::tf(self.lang, "checkpoint.created", &[&id, &label, &id]),
             ),
             None => self.push(
                 ChatRole::System,
-                "无法创建检查点——检查点用影子 git 快照工作区文件,需要本机安装 git。".to_string(),
+                umadev_i18n::t(self.lang, "checkpoint.git_required").to_string(),
             ),
         }
         Action::None
@@ -3091,12 +3091,11 @@ impl App {
             if list.is_empty() {
                 self.push(
                     ChatRole::System,
-                    "还没有文件检查点。/checkpoint [说明] 手动建一个;每个阶段开始也会自动建。"
-                        .to_string(),
+                    umadev_i18n::t(self.lang, "rewind.empty").to_string(),
                 );
                 return Action::None;
             }
-            let mut out = String::from("文件检查点(新→旧)——用 /rewind <id> 回滚工作区文件:\n");
+            let mut out = umadev_i18n::t(self.lang, "rewind.list_header").to_string();
             for c in list.iter().take(20) {
                 let when = c.when.split('T').next().unwrap_or(&c.when);
                 out.push_str(&format!("  {}  {}  {}\n", c.id, when, c.label));
@@ -3107,9 +3106,12 @@ impl App {
         match umadev_agent::checkpoint::restore_checkpoint(&self.project_root, arg) {
             Ok(()) => self.push(
                 ChatRole::System,
-                format!("已把工作区文件回滚到 `{arg}`(回滚前的现场已自动存档,可再 /rewind 回去)。"),
+                umadev_i18n::tf(self.lang, "rewind.restored", &[arg]),
             ),
-            Err(e) => self.push(ChatRole::System, format!("回滚失败:{e}")),
+            Err(e) => self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "rewind.failed", &[&e]),
+            ),
         }
         Action::None
     }
@@ -4040,9 +4042,7 @@ impl App {
         if !confirmed {
             self.push(
                 ChatRole::UmaDev,
-                format!(
-                    "准备部署(尚未执行)。将运行:\n  {cmd}\n\n部署前自检:1) 构建/测试已过  2) 环境变量与密钥已在目标平台配好  3) 目标环境(prod/preview)正确  4) 数据库迁移/回滚预案就绪。\n确认无误后输入 /deploy confirm 才真正部署。"
-                ),
+                umadev_i18n::tf(self.lang, "deploy.confirm_preflight", &[&cmd]),
             );
             return Action::None;
         }
@@ -4206,13 +4206,14 @@ impl App {
             .unwrap_or_else(|| "offline".to_string());
         let report = format!(
             "# UmaDev bug report\n\n\
-             version: 4.6.0\n\
+             version: {}\n\
              backend: {backend}\n\
              slug: {slug}\n\
              project_root: {}\n\n\
              ## workflow state\n\n{}\n\n\
              ## usage\n\n{usage}\n\n\
              ## last 10 chat messages\n\n{}",
+            env!("CARGO_PKG_VERSION"),
             self.project_root.display(),
             ws_state,
             self.history

@@ -241,3 +241,54 @@
 "setup.nav_hint" = "↑↓ select · Enter next · Esc back/quit"
 "setup.more_above" = "↑ {} more above"
 "setup.more_below" = "↓ {} more below"
+
+# Routing memo (conversation context fed to the base, not shown directly)
+"run.classified_build_memo" = "(entering the 9-phase pipeline, requirement: {})"
+
+# File checkpoints / phase labels
+"checkpoint.phase_label" = "phase start: {}"
+"checkpoint.manual_label" = "manual checkpoint"
+"checkpoint.created" = "Created file checkpoint `{}`: {}\nUse /rewind to view, /rewind {} to roll back."
+"checkpoint.git_required" = "Cannot create a checkpoint — checkpoints snapshot workspace files with a shadow git, which requires git installed locally."
+"rewind.empty" = "No file checkpoints yet. /checkpoint [note] makes one manually; one is also created at the start of every phase."
+"rewind.list_header" = "File checkpoints (new → old) — use /rewind <id> to roll workspace files back:\n"
+"rewind.restored" = "Rolled workspace files back to `{}` (the pre-rewind state was auto-archived, so you can /rewind forward again)."
+"rewind.failed" = "Rewind failed: {}"
+
+# /model per-phase tiers (plan / build)
+"model.tiers_current" = "Per-phase models — plan/docs: {} · code: {} (/model plan|build <model> to adjust, off to reset)"
+"model.tiers_hint" = "Tip: use /model plan <cheaper model> and /model build <stronger model> to assign models per phase — saves time and money."
+"model.tiers_busy" = "A run is in progress — model tiers can't be changed now; set them after the current run finishes."
+"model.tiers_default" = "default single model"
+"model.tiers_default_paren" = "(default single model)"
+"model.tiers_updated" = "Model tiers updated — plan/docs phase: {} · code phase: {}\nUse a cheap/fast model for planning and a strong one for code — saves time and money (more so with your own key / a third party)."
+
+# /deploy pre-confirm preflight
+"deploy.confirm_preflight" = "Ready to deploy (not run yet). Will run:\n  {}\n\nPre-deploy checklist: 1) build/tests passed  2) env vars and secrets configured on the target platform  3) target environment (prod/preview) correct  4) DB migration / rollback plan ready.\nWhen everything checks out, type /deploy confirm to actually deploy."
+
+# Worker / base spawn error hints (emitted from background tasks, use the process-wide language)
+"worker.init_failed" = "[warn] Could not initialize worker `{}`: {}\n  Check: is the custom provider's kind/base_url/key correct? Or use /backend to pick a logged-in CLI; /offline to switch to offline templates."
+"pipeline.start_failed" = "[warn] Pipeline failed to start: {}\n  Check: is the working directory writable? Is there enough disk space?"
+"worker.timeout" = "Worker `{}` call timed out (5 minutes). Troubleshoot in order:\n  1) run that CLI once in your terminal to confirm it responds;\n  2) if the requirement is large, split it up and retry;\n  3) use /doctor to check worker health, or /offline to temporarily fall back to offline templates."
+"worker.not_on_path" = "Worker CLI `{}` is not on PATH.\n  Use /doctor to see which workers are available, or install that CLI and retry;\n  you can also /offline to fall back to offline templates."
+"worker.exited" = "The worker process exited abnormally. Check the worker output above to locate the cause;\n  commonly it's not logged in or out of quota — run that CLI once on its own in your terminal to verify."
+"pipeline.generic_error" = "The pipeline hit an error. It fell back to offline templates to continue (where applicable). Use /status to see the current state."
+"pipeline.error_note" = "[warn] Pipeline error: {}\n  {}"
+"base.init_failed" = "[warn] Could not initialize base `{}`: {}\n  Check the current base configuration, or use /backend /offline to switch."
+"route.resume_retry" = "[info] Resuming the previous session failed — retried with a fresh session…"
+"base.empty_reply" = "[warn] Base `{}` returned no content."
+"route.failed" = "[warn] Routing failed (base `{}`): {}\n  You can retry, or use /run <requirement> to start the pipeline explicitly."
+
+# Preview dev server / deploy (background tasks, use the process-wide language)
+"preview.dev_starting" = "[wait] dev server starting, waiting for the port to be ready…"
+"preview.dev_ready" = "[ok] dev server ready, browser opened: {}\n  /stop-preview to stop"
+"preview.dev_not_ready" = "[warn] dev server not ready within 15s ({}).\n  It may still be compiling, or the port is taken. Open the address manually, or check the host output."
+"preview.dev_spawn_failed" = "[warn] Could not start the dev server ({}): {}\n  Run the command manually, then refresh {}"
+"preview.port_busy" = "ℹ The port is already in use ({}), probably your existing dev server.\n  Opened the address for you. To restart, first /stop-preview or stop the service holding that port."
+"deploy.running" = "[deploy] Deploying, running: `{}` …"
+"deploy.login_hint" = "If this is your first deploy, most CLIs need you to log in first: run `vercel login` (or `netlify login`) in a **separate terminal**, then come back and /deploy."
+"deploy.done" = "[ok] Deploy complete. {}"
+"deploy.done_no_url" = "check the output above for the address"
+"deploy.failed" = "[warn] Deploy failed (exit code {}): {}\n  {}"
+"deploy.exec_failed" = "[warn] Could not run the deploy command ({}): {}"
+"deploy.timeout" = "[warn] Deploy timed out (>5 minutes, aborted). {}\n  Or run it manually in your terminal: `{}`"

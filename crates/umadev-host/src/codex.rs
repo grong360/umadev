@@ -192,12 +192,13 @@ impl Runtime for CodexDriver {
     }
 
     fn capabilities(&self) -> umadev_runtime::BrainCapabilities {
-        // Codex streams (`--json`) but has no `/goal` mode, no usage on stdout,
-        // and no PreToolUse hook.
+        // Codex streams (`--json`) AND reports real token usage on the terminal
+        // `turn.completed` line (parsed by `extract_codex_usage`), so `/usage`
+        // is truthful. It still has no `/goal` mode and no PreToolUse hook.
         umadev_runtime::BrainCapabilities {
             persistent_goal: false,
             streaming: true,
-            reports_usage: false,
+            reports_usage: true,
             realtime_governance: false,
         }
     }
@@ -223,6 +224,9 @@ impl Runtime for CodexDriver {
         // base_args carries `--json`, so stdout is a JSONL event stream — extract
         // the `agent_message` text(s). Fall back to raw stdout only if extraction
         // yields nothing (so an unexpected format never silently empties the run).
+        // Capture real token usage from the terminal `turn.completed` line
+        // BEFORE `out.stdout` may be moved into `text` below.
+        let usage = extract_codex_usage(&out.stdout);
         let mut text = extract_codex_messages(&out.stdout);
         if text.trim().is_empty() && !out.stdout.trim().is_empty() {
             text = out.stdout;
@@ -231,7 +235,7 @@ impl Runtime for CodexDriver {
             text,
             id: "codex-cli".to_string(),
             model: req.model,
-            usage: Usage::default(),
+            usage,
         })
     }
 
@@ -287,6 +291,9 @@ impl Runtime for CodexDriver {
 
         match result {
             Ok(out) => {
+                // Real token usage from the terminal `turn.completed` line
+                // (captured before `out.stdout` may be moved into `final_text`).
+                let usage = extract_codex_usage(&out.stdout);
                 // Extract all agent_message texts from the JSONL stream.
                 let mut final_text = extract_codex_messages(&out.stdout);
                 if final_text.trim().is_empty() && !out.stdout.trim().is_empty() {
@@ -296,7 +303,7 @@ impl Runtime for CodexDriver {
                     text: final_text,
                     id: "codex-cli".to_string(),
                     model,
-                    usage: Usage::default(),
+                    usage,
                 })
             }
             Err(e) => {
@@ -413,6 +420,42 @@ fn codex_model_args(model: &str) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// Parse token usage from the codex `--json` JSONL stream.
+///
+/// The terminal `{"type":"turn.completed","usage":{"input_tokens":…,
+/// "cached_input_tokens":…,"output_tokens":…,"reasoning_output_tokens":…}}`
+/// line carries real usage (verified against live `codex exec --json` output).
+/// We fold `cached_input_tokens` into input (cached reads ARE consumed input,
+/// mirroring the claude driver) and `reasoning_output_tokens` into output
+/// (reasoning tokens are billed output), so `/usage` reflects true spend
+/// instead of the previous hard-coded zeros. If several `turn.completed` lines
+/// appear (a resumed multi-turn run), the LAST one wins — codex reports
+/// cumulative usage. Returns [`Usage::default`] (zeros) when no usable line is
+/// present (fail-open).
+fn extract_codex_usage(stdout: &str) -> Usage {
+    let mut usage = Usage::default();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("turn.completed") {
+                if let Some(u) = v.get("usage") {
+                    let field = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let input = field("input_tokens") + field("cached_input_tokens");
+                    let output = field("output_tokens") + field("reasoning_output_tokens");
+                    usage = Usage {
+                        input_tokens: u32::try_from(input).unwrap_or(u32::MAX),
+                        output_tokens: u32::try_from(output).unwrap_or(u32::MAX),
+                    };
+                }
+            }
+        }
+    }
+    usage
 }
 
 /// Extract all `agent_message` texts from a codex `--json` JSONL stream.
@@ -585,6 +628,53 @@ mod tests {
         assert!(result.contains("4.6.0"));
         // command_execution is NOT an agent_message — should not appear.
         assert!(!result.contains("cat Cargo.toml"));
+    }
+
+    #[test]
+    fn extract_codex_usage_reads_tokens_from_turn_completed() {
+        // Verified against live `codex exec --json` output: the terminal
+        // `turn.completed` line carries usage with input/cached/output/reasoning
+        // token counts.
+        let stdout = concat!(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"PONG"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":17162,"cached_input_tokens":5504,"output_tokens":6,"reasoning_output_tokens":4}}"#,
+        );
+        let u = extract_codex_usage(stdout);
+        // cached_input_tokens folds into input (consumed input).
+        assert_eq!(u.input_tokens, 17162 + 5504);
+        // reasoning_output_tokens folds into output (billed output).
+        assert_eq!(u.output_tokens, 6 + 4);
+        // No turn.completed line → zeros (graceful / fail-open).
+        assert_eq!(extract_codex_usage("plain text").input_tokens, 0);
+        assert_eq!(
+            extract_codex_usage(r#"{"type":"turn.started"}"#).output_tokens,
+            0
+        );
+    }
+
+    #[test]
+    fn extract_codex_usage_last_turn_wins() {
+        // A resumed multi-turn run can emit several turn.completed lines; the
+        // last (cumulative) one wins.
+        let stdout = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":10}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":250,"output_tokens":30}}"#,
+        );
+        let u = extract_codex_usage(stdout);
+        assert_eq!(u.input_tokens, 250);
+        assert_eq!(u.output_tokens, 30);
+    }
+
+    #[test]
+    fn capabilities_reports_usage_and_streaming() {
+        // Codex now parses usage off turn.completed, so it must declare it.
+        let caps = CodexDriver::default().capabilities();
+        assert!(caps.reports_usage, "codex parses usage → must report it");
+        assert!(caps.streaming, "codex --json streams");
+        assert!(!caps.persistent_goal);
+        assert!(!caps.realtime_governance);
     }
 
     #[test]

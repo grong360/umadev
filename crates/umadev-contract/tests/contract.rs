@@ -157,6 +157,7 @@ fn validate_frontend_matching_call_no_violations() {
         file: "src/api.ts".into(),
         method: parse::HttpVerb::Get,
         path: "/api/users".into(),
+        method_known: true,
     }];
     let violations = validate_frontend_vs_contract(&calls, &spec);
     assert!(
@@ -176,6 +177,7 @@ fn validate_frontend_unmatched_call_violation() {
         file: "src/api.ts".into(),
         method: parse::HttpVerb::Get,
         path: "/api/unknown".into(),
+        method_known: true,
     }];
     let violations = validate_frontend_vs_contract(&calls, &spec);
     assert!(

@@ -57,8 +57,11 @@ where `<LAYER>` is one of:
 - `FLOW` — flow contract (Layer 2, §4)
 - `ART` — delivery artifacts (Layer 3, §5)
 - `EVID` — evidence chain (Layer 4, §6)
-- `HOST` — host surface mapping (§7)
 - `META` — versioning and conformance declaration (§8)
+
+§7 (host surface mapping) is **non-normative guidance**: it carries no
+clauses and therefore reserves no `UD-HOST-*` identifier space. Every
+normative clause lives under one of the prefixes listed above.
 
 Clause IDs are permanent. A clause MAY be deprecated in a later version
 but MUST NOT be renumbered or repurposed.

@@ -1394,7 +1394,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("/design <name>", "pick a design system"),
                     ("/template <name>", "pick a seed template"),
                     ("/status", "detailed pipeline status"),
-                    ("/pitfalls", "self-learning 踩坑 knowledge base"),
+                    ("/pitfalls", "self-learning pitfalls knowledge base"),
                     ("/runs", "run history + phase timing"),
                     ("/knowledge", "list knowledge + design files"),
                     ("/mcp", "manage MCP servers"),

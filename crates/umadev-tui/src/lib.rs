@@ -100,6 +100,11 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     // the panic message + backtrace still print normally.
     install_panic_hook();
     let mut terminal = setup_terminal().context("failed to set up terminal")?;
+    // Name the terminal window/tab `UmaDev — <backend>` so a user juggling
+    // several tabs can tell which one drives which base. Uses the configured
+    // backend (offline until the first-run picker resolves one); cleared on
+    // exit below.
+    set_terminal_title(app.backend.as_deref().unwrap_or("offline"));
     let result = event_loop(&mut terminal, &mut app, opts).await;
     // Graceful cleanup: kill any preview dev server the user started via
     // /preview, so quitting UmaDev never leaves an orphaned process.
@@ -222,14 +227,17 @@ enum Block {
     Continue(Gate),
 }
 
-/// Set the terminal window title via OSC escape sequence (like opencode).
-/// Shows "UmaDev | <slug> | <status>" in the terminal tab/title bar.
-#[allow(dead_code)]
-fn set_terminal_title(slug: &str, status: &str) {
-    // OSC 0 = set both window title and icon title.
-    // Safe to write to stdout — crossterm raw mode is already on.
+/// Set the terminal window/tab title to `UmaDev — <backend>` via an OSC
+/// escape sequence (the same trick opencode uses), so a user with several
+/// terminal tabs open can tell which one is driving which base. Cleared again
+/// on exit in [`run`]. Best-effort: failures (e.g. a terminal that ignores
+/// OSC 0) are swallowed — the title is cosmetic and must never block launch.
+fn set_terminal_title(backend: &str) {
+    // OSC 0 = set both the window title and the icon (tab) title. Safe to
+    // write to stdout — crossterm raw mode is already on by this point, so the
+    // sequence is consumed by the terminal rather than echoed to the screen.
     use std::io::Write;
-    let _ = write!(std::io::stdout(), "\x1b]0;UmaDev | {slug} | {status}\x07");
+    let _ = write!(std::io::stdout(), "\x1b]0;UmaDev \u{2014} {backend}\x07");
     let _ = std::io::stdout().flush();
 }
 
@@ -342,10 +350,9 @@ fn spawn_block(
         let brain = match build_brain(&spec, false, None, &options.project_root) {
             Ok(b) => b,
             Err(e) => {
-                sink.emit(EngineEvent::Note(format!(
-                    "[warn] 无法初始化 worker `{label}`: {e}\n  \
-                     请检查: 自定义 provider 的 kind/base_url/key 是否正确? \
-                     或用 /backend 选一个已登录的 CLI; /offline 切离线模板。"
+                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "worker.init_failed",
+                    &[&label, &e.to_string()],
                 )));
                 return;
             }
@@ -355,9 +362,9 @@ fn spawn_block(
         let outcome = match block {
             Block::Clarify => {
                 if let Err(e) = runner.start() {
-                    sink.emit(EngineEvent::Note(format!(
-                        "[warn] 流水线启动失败: {e}\n  \
-                         请检查: 工作目录是否可写? 磁盘空间是否充足?"
+                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "pipeline.start_failed",
+                        &[&e.to_string()],
                     )));
                     return;
                 }
@@ -365,9 +372,9 @@ fn spawn_block(
             }
             Block::Initial => {
                 if let Err(e) = runner.start() {
-                    sink.emit(EngineEvent::Note(format!(
-                        "[warn] 流水线启动失败: {e}\n  \
-                         请检查: 工作目录是否可写? 磁盘空间是否充足?"
+                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "pipeline.start_failed",
+                        &[&e.to_string()],
                     )));
                     return;
                 }
@@ -378,28 +385,17 @@ fn spawn_block(
         if let Err(e) = outcome {
             let err_str = e.to_string();
             let hint = if err_str.contains("timed out") {
-                format!(
-                    "Worker `{label}` 调用超时(5 分钟)。排查顺序:\n  \
-                     1) 先在终端跑一次该 CLI 确认能响应;\n  \
-                     2) 若是大需求,拆小后重试;\n  \
-                     3) 用 /doctor 检查 worker 健康,或 /offline 临时切到离线模板继续。"
-                )
+                umadev_i18n::tlf("worker.timeout", &[&label])
             } else if err_str.contains("not found on PATH") {
-                format!(
-                    "Worker CLI `{label}` 不在 PATH 里。\n  \
-                     用 /doctor 看哪些 worker 可用,或安装该 CLI 后重试;\n  \
-                     也可 /offline 切到离线模板。"
-                )
+                umadev_i18n::tlf("worker.not_on_path", &[&label])
             } else if err_str.contains("exited with code") {
-                "Worker 进程异常退出。查看上方 worker 输出定位原因;\n  \
-                 常见是未登录或额度用尽 —— 先在终端单独跑一次该 CLI 验证。"
-                    .to_string()
+                umadev_i18n::tl("worker.exited").to_string()
             } else {
-                "流水线遇到错误。已回退到 offline 模板继续(如适用)。用 /status 查看当前状态。"
-                    .to_string()
+                umadev_i18n::tl("pipeline.generic_error").to_string()
             };
-            sink.emit(EngineEvent::Note(format!(
-                "[warn] 流水线错误: {e}\n  {hint}"
+            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "pipeline.error_note",
+                &[&e.to_string(), &hint],
             )));
         }
     })
@@ -470,9 +466,9 @@ fn spawn_route(
         ) {
             Ok(b) => b,
             Err(e) => {
-                sink.emit(EngineEvent::Note(format!(
-                    "[warn] 无法初始化底座 `{label}`: {e}\n  \
-                     请检查当前底座配置,或用 /backend /offline 切换。"
+                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "base.init_failed",
+                    &[&label, &e.to_string()],
                 )));
                 return;
             }
@@ -496,7 +492,7 @@ fn spawn_route(
         if result.is_err() && attempted_resume {
             if let Ok(fresh) = build_brain(&spec, false, None, &project_root) {
                 sink.emit(EngineEvent::Note(
-                    "[info] 续接上次会话失败,已用新会话重试…".to_string(),
+                    umadev_i18n::tl("route.resume_retry").to_string(),
                 ));
                 result = fresh
                     .complete(route_request_single(text, request_model))
@@ -514,8 +510,9 @@ fn spawn_route(
                 } else {
                     let body = response.text.trim();
                     if body.is_empty() {
-                        sink.emit(EngineEvent::Note(format!(
-                            "[warn] 底座 `{label}` 没有返回内容。"
+                        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "base.empty_reply",
+                            &[&label],
                         )));
                     } else {
                         // Non-JSON but non-empty → treat the raw text as a
@@ -525,9 +522,9 @@ fn spawn_route(
                 }
             }
             Err(e) => {
-                sink.emit(EngineEvent::Note(format!(
-                    "[warn] 路由失败(底座 `{label}`): {e}\n  \
-                     你可以重试,或用 /run <需求> 显式启动流水线。"
+                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "route.failed",
+                    &[&label, &e.to_string()],
                 )));
             }
         }
@@ -1146,7 +1143,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                                 *g = Some(child);
                                             }
                                             sink.emit(EngineEvent::Note(
-                                                "[wait] dev server 启动中,等待端口就绪…".into(),
+                                                umadev_i18n::tl("preview.dev_starting").into(),
                                             ));
                                             let url2 = url.clone();
                                             let sink3 = sink.clone();
@@ -1158,27 +1155,34 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                                 .await;
                                                 if up {
                                                     let _ = open_url(&url2);
-                                                    sink3.emit(EngineEvent::Note(format!(
-                                                        "[ok] dev server 就绪,已打开浏览器:{url2}\n  /stop-preview 停止"
-                                                    )));
+                                                    sink3.emit(EngineEvent::Note(
+                                                        umadev_i18n::tlf(
+                                                            "preview.dev_ready",
+                                                            &[&url2],
+                                                        ),
+                                                    ));
                                                 } else {
-                                                    sink3.emit(EngineEvent::Note(format!(
-                                                        "[warn] dev server 15s 内未就绪({url2})。\n  可能仍在编译或端口被占。手动打开该地址,或查看宿主输出。"
-                                                    )));
+                                                    sink3.emit(EngineEvent::Note(
+                                                        umadev_i18n::tlf(
+                                                            "preview.dev_not_ready",
+                                                            &[&url2],
+                                                        ),
+                                                    ));
                                                 }
                                             });
                                         }
                                         Err(e) => {
-                                            sink.emit(EngineEvent::Note(format!(
-                                                "[warn] 无法启动 dev server ({command}): {e}\n  \
-                                                 请手动运行该命令,然后刷新 {url}"
+                                            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                                "preview.dev_spawn_failed",
+                                                &[&command, &e.to_string(), &url],
                                             )));
                                         }
                                     }
                                 } else {
                                     let _ = open_url(&url);
-                                    sink.emit(EngineEvent::Note(format!(
-                                        "ℹ 端口已被占用({url}),可能是你已有的 dev server。\n  已为你打开该地址。如需重启,先 /stop-preview 或关闭占用该端口的服务。"
+                                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                        "preview.port_busy",
+                                        &[&url],
                                     )));
                                 }
                             }
@@ -1189,8 +1193,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 let sink2 = sink.clone();
                                 let root = opts.project_root.clone();
                                 tokio::spawn(async move {
-                                    sink2.emit(EngineEvent::Note(format!(
-                                        "[deploy] 部署中,执行:`{command}` …"
+                                    sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                        "deploy.running",
+                                        &[&command],
                                     )));
                                     // stdin = /dev/null: the TUI owns the real
                                     // terminal, so a deploy CLI that wants an
@@ -1203,7 +1208,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         .current_dir(&root)
                                         .stdin(std::process::Stdio::null())
                                         .output();
-                                    let login_hint = "如果是首次部署,多数 CLI 需要先登录:在**单独的终端**里执行 `vercel login`(或 `netlify login`),登录后再回来 /deploy。";
+                                    let login_hint = umadev_i18n::tl("deploy.login_hint");
                                     match tokio::time::timeout(
                                         std::time::Duration::from_secs(300),
                                         fut,
@@ -1217,28 +1222,35 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                                 .lines()
                                                 .find(|l| l.contains("https://"))
                                                 .map(str::to_string);
-                                            sink2.emit(EngineEvent::Note(format!(
-                                                "[ok] 部署完成。{}",
-                                                url.clone().unwrap_or_else(|| "查看上方输出确认地址".into())
+                                            let addr = url.clone().unwrap_or_else(|| {
+                                                umadev_i18n::tl("deploy.done_no_url").into()
+                                            });
+                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                                "deploy.done",
+                                                &[&addr],
                                             )));
                                         }
                                         Ok(Ok(o)) => {
                                             let stderr = String::from_utf8_lossy(&o.stderr);
-                                            sink2.emit(EngineEvent::Note(format!(
-                                                "[warn] 部署失败(退出码 {}): {}\n  {login_hint}",
-                                                o.status.code().unwrap_or(-1),
-                                                stderr.chars().take(500).collect::<String>()
+                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                                "deploy.failed",
+                                                &[
+                                                    &o.status.code().unwrap_or(-1).to_string(),
+                                                    &stderr.chars().take(500).collect::<String>(),
+                                                    login_hint,
+                                                ],
                                             )));
                                         }
                                         Ok(Err(e)) => {
-                                            sink2.emit(EngineEvent::Note(format!(
-                                                "[warn] 无法执行部署命令 ({command}): {e}"
+                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                                "deploy.exec_failed",
+                                                &[&command, &e.to_string()],
                                             )));
                                         }
                                         Err(_) => {
-                                            sink2.emit(EngineEvent::Note(format!(
-                                                "[warn] 部署超时(>5 分钟,已中止)。{login_hint}\n  \
-                                                 或在终端手动执行:`{command}`"
+                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                                "deploy.timeout",
+                                                &[login_hint, &command],
                                             )));
                                         }
                                     }

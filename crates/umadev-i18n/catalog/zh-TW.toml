@@ -241,3 +241,54 @@
 "setup.nav_hint" = "↑↓ 選擇 · Enter 下一步 · Esc 返回/結束"
 "setup.more_above" = "↑ 上面還有 {} 項"
 "setup.more_below" = "↓ 下面還有 {} 項"
+
+# 路由記憶（餵給底座的對話上下文，不直接展示給使用者）
+"run.classified_build_memo" = "(進入 9 階段流水線,需求:{})"
+
+# 檔案檢查點 / 階段標籤
+"checkpoint.phase_label" = "階段開始: {}"
+"checkpoint.manual_label" = "手動檢查點"
+"checkpoint.created" = "已建立檔案檢查點 `{}`:{}\n用 /rewind 檢視,/rewind {} 回滾。"
+"checkpoint.git_required" = "無法建立檢查點——檢查點用影子 git 快照工作區檔案,需要本機安裝 git。"
+"rewind.empty" = "還沒有檔案檢查點。/checkpoint [說明] 手動建一個;每個階段開始也會自動建。"
+"rewind.list_header" = "檔案檢查點(新→舊)——用 /rewind <id> 回滾工作區檔案:\n"
+"rewind.restored" = "已把工作區檔案回滾到 `{}`(回滾前的現場已自動存檔,可再 /rewind 回去)。"
+"rewind.failed" = "回滾失敗:{}"
+
+# /model 分階段模型（plan / build 分級)
+"model.tiers_current" = "分階段模型 —— 規劃/文件: {} · 寫碼: {}(/model plan|build <模型> 調整,off 還原)"
+"model.tiers_hint" = "提示:可用 /model plan <便宜模型> 與 /model build <強模型> 給規劃/寫碼分別配模型,省時省錢。"
+"model.tiers_busy" = "執行進行中,不能修改模型分級 —— 等目前執行結束再設定。"
+"model.tiers_default" = "預設單模型"
+"model.tiers_default_paren" = "(預設單模型)"
+"model.tiers_updated" = "已更新模型分級 —— 規劃/文件階段: {} · 寫碼階段: {}\n規劃用便宜/快的、寫碼用強的,省時也省錢(對自帶 key/第三方更明顯)。"
+
+# /deploy 確認前自檢
+"deploy.confirm_preflight" = "準備部署(尚未執行)。將執行:\n  {}\n\n部署前自檢:1) 建置/測試已過  2) 環境變數與密鑰已在目標平台配好  3) 目標環境(prod/preview)正確  4) 資料庫遷移/回滾預案就緒。\n確認無誤後輸入 /deploy confirm 才真正部署。"
+
+# Worker / 底座 spawn 錯誤提示(後台任務裡發出,走行程級目前語言)
+"worker.init_failed" = "[warn] 無法初始化 worker `{}`: {}\n  請檢查: 自訂 provider 的 kind/base_url/key 是否正確? 或用 /backend 選一個已登入的 CLI; /offline 切離線範本。"
+"pipeline.start_failed" = "[warn] 流水線啟動失敗: {}\n  請檢查: 工作目錄是否可寫? 磁碟空間是否充足?"
+"worker.timeout" = "Worker `{}` 呼叫逾時(5 分鐘)。排查順序:\n  1) 先在終端跑一次該 CLI 確認能回應;\n  2) 若是大需求,拆小後重試;\n  3) 用 /doctor 檢查 worker 健康,或 /offline 暫時切到離線範本繼續。"
+"worker.not_on_path" = "Worker CLI `{}` 不在 PATH 裡。\n  用 /doctor 看哪些 worker 可用,或安裝該 CLI 後重試;\n  也可 /offline 切到離線範本。"
+"worker.exited" = "Worker 行程異常退出。檢視上方 worker 輸出定位原因;\n  常見是未登入或額度用盡 —— 先在終端單獨跑一次該 CLI 驗證。"
+"pipeline.generic_error" = "流水線遇到錯誤。已回退到 offline 範本繼續(如適用)。用 /status 檢視目前狀態。"
+"pipeline.error_note" = "[warn] 流水線錯誤: {}\n  {}"
+"base.init_failed" = "[warn] 無法初始化底座 `{}`: {}\n  請檢查目前底座設定,或用 /backend /offline 切換。"
+"route.resume_retry" = "[info] 續接上次工作階段失敗,已用新工作階段重試…"
+"base.empty_reply" = "[warn] 底座 `{}` 沒有回傳內容。"
+"route.failed" = "[warn] 路由失敗(底座 `{}`): {}\n  你可以重試,或用 /run <需求> 顯式啟動流水線。"
+
+# 預覽 dev server / 部署(後台任務,走行程級目前語言)
+"preview.dev_starting" = "[wait] dev server 啟動中,等待埠就緒…"
+"preview.dev_ready" = "[ok] dev server 就緒,已開啟瀏覽器:{}\n  /stop-preview 停止"
+"preview.dev_not_ready" = "[warn] dev server 15s 內未就緒({})。\n  可能仍在編譯或埠被占。手動開啟該地址,或檢視宿主輸出。"
+"preview.dev_spawn_failed" = "[warn] 無法啟動 dev server ({}): {}\n  請手動執行該指令,然後重新整理 {}"
+"preview.port_busy" = "ℹ 埠已被占用({}),可能是你已有的 dev server。\n  已為你開啟該地址。如需重啟,先 /stop-preview 或關閉占用該埠的服務。"
+"deploy.running" = "[deploy] 部署中,執行:`{}` …"
+"deploy.login_hint" = "如果是首次部署,多數 CLI 需要先登入:在**單獨的終端**裡執行 `vercel login`(或 `netlify login`),登入後再回來 /deploy。"
+"deploy.done" = "[ok] 部署完成。{}"
+"deploy.done_no_url" = "檢視上方輸出確認地址"
+"deploy.failed" = "[warn] 部署失敗(退出碼 {}): {}\n  {}"
+"deploy.exec_failed" = "[warn] 無法執行部署指令 ({}): {}"
+"deploy.timeout" = "[warn] 部署逾時(>5 分鐘,已中止)。{}\n  或在終端手動執行:`{}`"
