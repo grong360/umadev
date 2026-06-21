@@ -310,8 +310,7 @@ fn resolve_program(program: &str) -> String {
     let Ok(path_var) = std::env::var("PATH") else {
         return program.to_string();
     };
-    let pathext =
-        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     for dir in path_var.split(';') {
         if dir.is_empty() {
             continue;

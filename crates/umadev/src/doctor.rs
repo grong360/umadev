@@ -508,9 +508,13 @@ mod tests {
         assert_eq!(results.len(), 10);
         // No FAILs on a clean workspace — only a manifest WARN.
         assert!(results.iter().all(|r| r.status != Status::Failed));
+        // The "AI host backends" check warns iff no base CLI is on PATH,
+        // which differs between dev machines and CI -- exclude it so the only
+        // env-independent WARN asserted here is the missing manifest.
         assert_eq!(
             results
                 .iter()
+                .filter(|r| r.name != "AI host backends")
                 .filter(|r| r.status == Status::Warning)
                 .count(),
             1
@@ -524,7 +528,13 @@ mod tests {
             .write_to(tmp.path(), false)
             .unwrap();
         let results = run_all(tmp.path());
-        assert!(all_passed(&results));
+        // Everything passes except the env-dependent backend check, which
+        // warns when no base CLI is installed (e.g. in CI).
+        let non_backend: Vec<_> = results
+            .into_iter()
+            .filter(|r| r.name != "AI host backends")
+            .collect();
+        assert!(all_passed(&non_backend));
     }
 
     #[test]

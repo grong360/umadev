@@ -7434,10 +7434,7 @@ const x = 1;",
     #[test]
     fn secret_ignores_non_source_files() {
         // .env files legitimately hold secrets.
-        let d = check_hardcoded_secret(
-            ".env",
-            "API_KEY=stripe_R8xQ2mK7vN4pL9wB3yT6jH1sD5gF0",
-        );
+        let d = check_hardcoded_secret(".env", "API_KEY=stripe_R8xQ2mK7vN4pL9wB3yT6jH1sD5gF0");
         assert!(!d.block);
     }
 
