@@ -2,14 +2,15 @@ import type { NextConfig } from "next";
 
 const isGithubPages = process.env.GITHUB_PAGES === "true";
 const githubPagesRepo = process.env.GITHUB_PAGES_REPO ?? "umadev";
-const basePath = isGithubPages ? `/${githubPagesRepo}` : "";
+const customDomain = process.env.GITHUB_PAGES_DOMAIN;
+const basePath = isGithubPages && !customDomain ? `/${githubPagesRepo}` : "";
 
 const nextConfig: NextConfig = {
   ...(isGithubPages
     ? {
         output: "export",
         basePath,
-        assetPrefix: `${basePath}/`,
+        assetPrefix: basePath ? `${basePath}/` : undefined,
         images: {
           unoptimized: true,
         },
