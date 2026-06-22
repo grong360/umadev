@@ -39,7 +39,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyEventKind, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -133,6 +134,7 @@ fn install_panic_hook() {
         // Best-effort restoration — ignore errors, we're panicking anyway.
         let _ = disable_raw_mode();
         let _ = std::io::stdout().execute(DisableBracketedPaste);
+        let _ = std::io::stdout().execute(DisableMouseCapture);
         let _ = std::io::stdout().execute(LeaveAlternateScreen);
         let _ = std::io::stdout().execute(crossterm::cursor::Show);
         // Print a visible marker so the user knows it was a panic, not a
@@ -892,6 +894,13 @@ fn setup_terminal() -> Result<Term> {
     // IME commits, which most terminals deliver as a paste) arrive as one
     // atomic `Event::Paste` instead of a scrambled stream of `Char` events.
     stdout.execute(EnableBracketedPaste)?;
+    // Capture the mouse so the scroll wheel pages the transcript. This DOES
+    // take over the terminal's native click-drag text selection; the user can
+    // turn it back off with `/mouse` (releasing the wheel binding), and most
+    // terminals still let Shift+drag select through the capture. Teardown +
+    // the panic hook both DisableMouseCapture so the terminal is never left in
+    // mouse-reporting mode.
+    stdout.execute(EnableMouseCapture)?;
     // Show the terminal cursor so the user sees a blinking caret in the
     // input box (positioned via frame.set_cursor_position in render_prompt).
     stdout.execute(crossterm::cursor::Show)?;
@@ -902,6 +911,7 @@ fn setup_terminal() -> Result<Term> {
 fn restore_terminal(terminal: &mut Term) -> Result<()> {
     disable_raw_mode()?;
     let _ = terminal.backend_mut().execute(DisableBracketedPaste);
+    let _ = terminal.backend_mut().execute(DisableMouseCapture);
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
@@ -997,7 +1007,24 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 }
             }
             maybe_key = keys.next() => {
-                if let Some(Ok(Event::Paste(pasted))) = &maybe_key {
+                if let Some(Ok(Event::Resize(..))) = &maybe_key {
+                    // Resize: do nothing but fall through to the loop top, which
+                    // redraws the whole frame at the new size. This makes a drag-
+                    // resize repaint immediately instead of tearing until the next
+                    // tick / keypress.
+                } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
+                    // Wheel → transcript scrollback (~3 rows per notch, the usual
+                    // terminal step). Gated by `/mouse`; when off the wheel is
+                    // ignored so the terminal's native selection/copy works. Only
+                    // meaningful on the chat screen.
+                    if app.mouse_scroll && matches!(app.mode, crate::app::AppMode::Chat) {
+                        match me.kind {
+                            MouseEventKind::ScrollUp => app.transcript_scroll_up(3),
+                            MouseEventKind::ScrollDown => app.transcript_scroll_down(3),
+                            _ => {}
+                        }
+                    }
+                } else if let Some(Ok(Event::Paste(pasted))) = &maybe_key {
                     // Bracketed paste (and CJK IME commits, which most terminals
                     // deliver as a paste burst): insert the text atomically at the
                     // cursor instead of letting it arrive as a scrambled stream of

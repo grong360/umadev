@@ -627,7 +627,23 @@ fn render_picker(frame: &mut Frame, app: &App) {
 /// the middle, and a left-bar prompt pinned to the bottom. No outer chrome
 /// boxes — the visual rhythm comes from the per-message left bars and the
 /// background-tinted prompt, exactly like the reference.
+/// Minimum terminal size the chat screen needs to lay out the title, at least
+/// one transcript row, the input box and the status row without pushing a fixed
+/// region off-screen. Below this we show a "make the window bigger" card.
+const MIN_CHAT_WIDTH: u16 = 40;
+const MIN_CHAT_HEIGHT: u16 = 10;
+
 fn render_chat(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    // Tiny-terminal guard — when the window is too short/narrow the vertical
+    // solver would crush the transcript to 0 and clip the input + status bar OUT
+    // of view (the "looks frozen / can't see the bottom" failure). Show a
+    // centered hint and bail BEFORE laying out, so the fixed regions never fall
+    // off the screen.
+    if area.height < MIN_CHAT_HEIGHT || area.width < MIN_CHAT_WIDTH {
+        render_too_small(frame, area);
+        return;
+    }
     // Horizontal indent: both opencode and Claude Code indent their content
     // column by 2 cols on each side (paddingLeft/paddingRight = 2). Doing it
     // once here means the title, transcript, prompt and status row all line
@@ -639,15 +655,21 @@ fn render_chat(frame: &mut Frame, app: &App) {
             Constraint::Min(1),
             Constraint::Length(2),
         ])
-        .split(frame.area())[1];
+        .split(area)[1];
     // Prompt height tracks the wrapped input: 1 row when empty/short, growing
     // (capped) as the user types or it wraps — underline sits right under it.
-    let prompt_h = prompt_block_height(&app.input, inner.width, mode_prefix_width(app));
+    // CLAMP it so the title(1) + at least one transcript row + status(1) always
+    // fit: `area.height - 3` is the most the prompt may take. Without this a
+    // tall multi-line input on a short terminal would shove the status row (and
+    // the bottom of the input) past the viewport edge.
+    let prompt_h = prompt_block_height(&app.input, inner.width, mode_prefix_width(app))
+        .min(inner.height.saturating_sub(3))
+        .max(2);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),        // title row (borderless)
-            Constraint::Min(2),           // transcript (grows)
+            Constraint::Min(1),           // transcript (grows; ≥1 guaranteed)
             Constraint::Length(prompt_h), // prompt: input(N) + border(1) + meta(1)
             Constraint::Length(1),        // status row
         ])
@@ -664,6 +686,49 @@ fn render_chat(frame: &mut Frame, app: &App) {
     if !palette.is_empty() {
         render_palette_popover(frame, chunks[2], app, &palette);
     }
+}
+
+/// A centered "terminal too small" card, shown when the window is below
+/// [`MIN_CHAT_WIDTH`] × [`MIN_CHAT_HEIGHT`]. Keeping the whole chat layout off
+/// the screen in this state is what stops the input box / status bar from being
+/// clipped out of view (the "looks frozen" symptom). The message itself wraps
+/// and degrades gracefully even at 1×1.
+fn render_too_small(frame: &mut Frame, area: Rect) {
+    frame.render_widget(Clear, area);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Terminal too small",
+            Style::default()
+                .fg(theme::WARNING())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("Resize to at least {MIN_CHAT_WIDTH}×{MIN_CHAT_HEIGHT}"),
+            Style::default().fg(theme::TEXT_MUTED()),
+        )),
+        Line::from(Span::styled(
+            format!("now {}×{}", area.width, area.height),
+            Style::default().fg(theme::TEXT_MUTED()),
+        )),
+    ];
+    // Vertically center the 3-line card; horizontally center each line.
+    let card_h = u16::try_from(lines.len()).unwrap_or(3);
+    let top = area.height.saturating_sub(card_h) / 2;
+    let card = Rect {
+        x: area.x,
+        y: area
+            .y
+            .saturating_add(top)
+            .min(area.y + area.height.saturating_sub(1)),
+        width: area.width,
+        height: card_h.min(area.height),
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        card,
+    );
 }
 
 /// Thin, borderless title row: `UmaDev · <slug> · <phase>` with a subtle
@@ -855,17 +920,39 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         .sum();
     let para = Paragraph::new(rendered).wrap(Wrap { trim: false });
     let hidden_above = total.saturating_sub(inner_height);
-    let scroll = u16::try_from(hidden_above).unwrap_or(u16::MAX);
+
+    // Publish the scroll bounds for the key handlers (Home/End, Page, Ctrl-U/D,
+    // Shift+↑/↓, mouse wheel) — they clamp `transcript_scroll` against these
+    // width-aware numbers instead of guessing. `transcript_scroll` counts rows
+    // ABOVE the bottom; clamp it here so a stale value (e.g. after the window
+    // grew and content now fits) can't push the view off the end.
+    app.transcript_max_scroll.set(hidden_above);
+    app.transcript_viewport_rows.set(inner_height);
+    let user_offset = app.transcript_scroll.min(hidden_above);
+
+    // Effective scroll: bottom-pinned is `hidden_above`; scrolling up SUBTRACTS
+    // the user's offset so older content comes into view. At offset 0 the view
+    // auto-sticks to the newest line (the default).
+    let scroll_rows = hidden_above.saturating_sub(user_offset);
+    let scroll = u16::try_from(scroll_rows).unwrap_or(u16::MAX);
     let para = para.scroll((scroll, 0));
+
+    // Two-way scroll indicator: how many rows are hidden ABOVE the current view
+    // and BELOW it, so the user always knows there's more in either direction
+    // and which keys bring it on screen.
+    let rows_above = scroll_rows; // rows scrolled past, above the viewport
+    let rows_below = user_offset; // rows hidden below when scrolled up
     let para = if hidden_above == 0 {
         para
     } else {
+        let hint = if rows_below > 0 {
+            format!(" ↑ {rows_above} · ↓ {rows_below} more — End to bottom ")
+        } else {
+            format!(" ↑ {rows_above} lines above ")
+        };
         para.block(
             Block::default()
-                .title_top(Span::styled(
-                    format!(" ↑ {hidden_above} lines above "),
-                    Style::default().fg(theme::TEXT_MUTED()),
-                ))
+                .title_top(Span::styled(hint, Style::default().fg(theme::TEXT_MUTED())))
                 .title_alignment(ratatui::layout::Alignment::Right),
         )
     };
@@ -1847,6 +1934,127 @@ mod tests {
         for phantom in ["/gemini", "/droid", "/qwen", "/copilot", "/kimi", "/qoder"] {
             assert!(!out.contains(phantom), "help still lists phantom {phantom}");
         }
+    }
+
+    // --- Transcript scrollback (P0 viewport hardening) ---
+
+    /// Render the chat at an explicit size, returning the whole buffer as a
+    /// single string (row-major) so assertions can look for on-screen text.
+    fn render_chat_at(app: &App, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn app_with_long_transcript(rows: usize) -> App {
+        let mut app = app_with(Some("offline"));
+        for i in 0..rows {
+            app.apply_engine(umadev_agent::EngineEvent::Note(format!(
+                "scroll-content-line-{i}"
+            )));
+        }
+        app
+    }
+
+    #[test]
+    fn transcript_scroll_clamps_to_hidden_above() {
+        // After a render publishes the max scroll, scrolling far past it must
+        // clamp to exactly the rows hidden above — never overshoot.
+        let mut app = app_with_long_transcript(60);
+        let _ = render_chat_at(&app, 80, 18); // publishes transcript_max_scroll
+        let max = app.transcript_max_scroll.get();
+        assert!(
+            max > 0,
+            "long transcript should overflow an 18-row terminal"
+        );
+        // Ask for far more than exists.
+        app.transcript_scroll_up(10_000);
+        assert_eq!(
+            app.transcript_scroll, max,
+            "scroll-up must clamp at hidden_above"
+        );
+        // Scrolling back down past 0 re-pins to the bottom.
+        app.transcript_scroll_down(10_000);
+        assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn scrolling_up_stops_auto_stick_and_shows_down_indicator() {
+        // The bug: once content overflows, the view was hard-pinned to the
+        // bottom so older lines were unreachable. Scrolling up must reveal the
+        // top AND surface a "↓ more" indicator pointing back to the bottom.
+        let mut app = app_with_long_transcript(60);
+        // Bottom-pinned first: recent content is visible, the welcome banner at
+        // the very top of the session has scrolled off.
+        let bottom = render_chat_at(&app, 80, 18);
+        assert!(
+            bottom.contains("scroll-content-line-57"),
+            "bottom: {bottom}"
+        );
+        assert!(
+            !bottom.contains("▟▀▀▀▀▀▙"),
+            "welcome banner must be scrolled off when pinned to bottom"
+        );
+        // Scroll all the way up — the session's oldest content (the welcome
+        // banner) comes on screen, and the recent notes scroll off.
+        app.transcript_scroll_to_top();
+        let top = render_chat_at(&app, 80, 18);
+        assert!(top.contains("▟▀▀▀▀▀▙"), "top of session not shown: {top}");
+        assert!(!top.contains("scroll-content-line-57"));
+        // The two-way indicator now offers the way back down.
+        assert!(top.contains("End to bottom"), "missing down hint: {top}");
+        // End re-pins to the bottom (auto-stick resumes): recent content is back
+        // and the welcome banner is hidden again.
+        app.transcript_scroll_to_bottom();
+        assert_eq!(app.transcript_scroll, 0);
+        let back = render_chat_at(&app, 80, 18);
+        assert!(back.contains("scroll-content-line-57"));
+        assert!(!back.contains("▟▀▀▀▀▀▙"));
+    }
+
+    #[test]
+    fn tiny_terminal_shows_resize_card_not_a_clipped_layout() {
+        // Below the min size the chat layout would crush the transcript to 0 and
+        // clip the input/status off-screen. Instead we show a resize hint and
+        // never lay out the chat — so the fixed regions can't fall out of view.
+        let app = app_with(Some("offline"));
+        let out = render_chat_at(&app, 30, 6); // < MIN_CHAT_WIDTH × MIN_CHAT_HEIGHT
+        assert!(out.contains("too small"), "expected resize card: {out}");
+        // A roomy terminal lays out normally (no resize card).
+        let ok = render_chat_at(&app, 80, 24);
+        assert!(!ok.contains("too small"));
+    }
+
+    #[test]
+    fn prompt_height_is_clamped_so_status_row_stays_on_screen() {
+        // A tall multi-line input on a short terminal must not push the prompt
+        // past `area.height - 3`; the status row (and the input bottom) stay on
+        // screen. We assert the clamp arithmetic directly.
+        let inner_h: u16 = 12; // a short content column
+                               // A would-be very tall prompt (e.g. INPUT_MAX_ROWS + 2).
+        let raw = INPUT_MAX_ROWS + 2;
+        let clamped = raw.min(inner_h.saturating_sub(3)).max(2);
+        assert!(
+            clamped <= inner_h.saturating_sub(3),
+            "prompt must leave room for title + ≥1 transcript row + status"
+        );
+        assert!(clamped >= 2, "prompt keeps at least input + meta rows");
+        // And it renders without panicking even with a multi-line input on a
+        // short terminal (regression guard for the clip-out-of-view bug).
+        let mut app = app_with(Some("offline"));
+        app.insert_str_at_cursor("a\nb\nc\nd\ne\nf\ng\nh");
+        let out = render_chat_at(&app, 50, 12);
+        // The bottom status row (directory breadcrumb + /help) is still drawn.
+        assert!(out.contains("/help"), "status row clipped: {out}");
     }
 
     #[test]

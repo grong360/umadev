@@ -284,6 +284,31 @@ pub struct App {
     /// Bounded scrolling chat history (older lines roll off).
     pub history: VecDeque<ChatMessage>,
 
+    /// **Transcript scrollback** — how many wrapped rows the user has scrolled
+    /// UP from the bottom. `0` = pinned to the bottom (the default, auto-sticky
+    /// as new content arrives). Any positive value means the user is reviewing
+    /// history, so the renderer STOPS auto-sticking to the bottom until they
+    /// return (End / scroll back down to 0). Clamped each frame against
+    /// [`Self::transcript_max_scroll`].
+    pub transcript_scroll: usize,
+    /// The maximum the transcript can scroll up (= rows hidden above the
+    /// viewport), recomputed by the renderer every frame from the CURRENT
+    /// width/height. Interior-mutable so the pure `render` fn can publish it for
+    /// the key handlers to clamp [`Self::transcript_scroll`] against. `0` when
+    /// everything fits (nothing to scroll).
+    pub transcript_max_scroll: std::cell::Cell<usize>,
+    /// Rows that fit in the transcript viewport, published by the renderer so
+    /// the half-page (Ctrl-U/D) and full-page (PageUp/Down) scroll steps match
+    /// the actual visible height instead of a guessed constant.
+    pub transcript_viewport_rows: std::cell::Cell<usize>,
+    /// `true` when the mouse-wheel → transcript-scroll binding is active. A
+    /// `/mouse` toggle flips it: capturing the mouse takes over the terminal's
+    /// native text selection, so a user who wants to select/copy turns it off
+    /// (or holds Shift, which most terminals route around the capture). Default
+    /// on. Read by the event loop; the value itself lives here so it survives
+    /// across redraws.
+    pub mouse_scroll: bool,
+
     /// **Conversation memory** — the multi-turn transcript handed to the base
     /// on every routed turn so chat is a real conversation, not a sequence of
     /// amnesiac one-shots. Holds ONLY genuine chat turns (user message + base
@@ -463,6 +488,10 @@ impl App {
             input_history_idx: None,
             palette_selected: 0,
             history: VecDeque::new(),
+            transcript_scroll: 0,
+            transcript_max_scroll: std::cell::Cell::new(0),
+            transcript_viewport_rows: std::cell::Cell::new(0),
+            mouse_scroll: true,
             conversation: Vec::new(),
             host_chat_session_active: false,
             chat_session_id: None,
@@ -693,6 +722,48 @@ impl App {
     #[must_use]
     pub fn is_pipeline_active(&self) -> bool {
         self.run_started && !self.finished
+    }
+
+    // ---- transcript scrollback -------------------------------------------
+    //
+    // `transcript_scroll` is the number of wrapped rows the user has scrolled
+    // UP from the bottom (0 = pinned to bottom). The renderer publishes the
+    // current upper bound into `transcript_max_scroll` every frame, so these
+    // helpers clamp against the real, width-aware overflow instead of guessing.
+
+    /// Scroll the transcript UP by `rows` (toward older history). Any non-zero
+    /// scroll makes the renderer STOP auto-sticking to the bottom.
+    pub fn transcript_scroll_up(&mut self, rows: usize) {
+        let max = self.transcript_max_scroll.get();
+        self.transcript_scroll = self.transcript_scroll.saturating_add(rows).min(max);
+    }
+
+    /// Scroll the transcript DOWN by `rows` (toward the newest content). Hitting
+    /// `0` re-pins to the bottom and re-enables auto-stick.
+    pub fn transcript_scroll_down(&mut self, rows: usize) {
+        self.transcript_scroll = self.transcript_scroll.saturating_sub(rows);
+    }
+
+    /// Jump to the very top of the transcript (oldest content on screen).
+    pub fn transcript_scroll_to_top(&mut self) {
+        self.transcript_scroll = self.transcript_max_scroll.get();
+    }
+
+    /// Jump back to the bottom (newest content) and re-enable auto-stick.
+    pub fn transcript_scroll_to_bottom(&mut self) {
+        self.transcript_scroll = 0;
+    }
+
+    /// Half the transcript viewport, for Ctrl-U / Ctrl-D — at least one row so a
+    /// tiny window still scrolls.
+    fn transcript_half_page(&self) -> usize {
+        (self.transcript_viewport_rows.get() / 2).max(1)
+    }
+
+    /// A full transcript viewport (minus one row of overlap, the convention for
+    /// PageUp / PageDown), for the page keys — at least one row.
+    fn transcript_page(&self) -> usize {
+        self.transcript_viewport_rows.get().saturating_sub(1).max(1)
     }
 
     // ---- input editing helpers (char-cursor over a UTF-8 String) ---------
@@ -966,6 +1037,10 @@ impl App {
         ("changelog", "show CHANGELOG.md"),
         ("version", "show umadev / spec / worker versions"),
         ("help", "show all keybindings"),
+        (
+            "mouse",
+            "toggle mouse-wheel scrolling (off = native text selection)",
+        ),
         ("clear", "clear chat history"),
         ("quit", "exit"),
     ];
@@ -1686,12 +1761,49 @@ impl App {
                 self.move_cursor(1);
                 Action::None
             }
+            // ---- transcript scrollback (review history without losing input) --
+            // PageUp/Down + Ctrl-U/D page the transcript; Shift+↑/↓ nudge it one
+            // row. Any upward scroll un-pins the view from the bottom until End
+            // (or scrolling back to 0).
+            //
+            // Home/End are context-sensitive: with text in the box they keep
+            // their line-editing meaning (cursor to start/end); on an EMPTY box
+            // they jump the TRANSCRIPT to top/bottom — the place a user reaches
+            // for "scroll to the very top/bottom" when not mid-edit. Ctrl-A /
+            // Ctrl-E always do line-start/line-end regardless.
+            KeyCode::Home if self.input.is_empty() => {
+                self.transcript_scroll_to_top();
+                Action::None
+            }
+            KeyCode::End if self.input.is_empty() => {
+                self.transcript_scroll_to_bottom();
+                Action::None
+            }
             KeyCode::Home => {
                 self.input_cursor = 0;
                 Action::None
             }
             KeyCode::End => {
                 self.input_cursor = self.input_len();
+                Action::None
+            }
+            KeyCode::PageUp => {
+                let page = self.transcript_page();
+                self.transcript_scroll_up(page);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                let page = self.transcript_page();
+                self.transcript_scroll_down(page);
+                Action::None
+            }
+            // Shift+↑ / Shift+↓ scroll the transcript one row at a time.
+            KeyCode::Up if shift => {
+                self.transcript_scroll_up(1);
+                Action::None
+            }
+            KeyCode::Down if shift => {
+                self.transcript_scroll_down(1);
                 Action::None
             }
 
@@ -1759,6 +1871,10 @@ impl App {
                 if raw.is_empty() {
                     return Action::None;
                 }
+                // Submitting re-pins the transcript to the bottom so the user
+                // always sees their own new turn (and the reply) land, even if
+                // they were scrolled up reviewing history.
+                self.transcript_scroll_to_bottom();
                 self.remember_submission(&raw);
                 if let Some(action) = self.try_slash_command(&raw) {
                     return action;
@@ -1775,8 +1891,24 @@ impl App {
                 self.input_cursor = self.input_len();
                 Action::None
             }
+            // Ctrl-U: half-page scroll UP through the transcript when the input
+            // is empty (the common "I just want to read back" case); with text
+            // in the box it keeps its editing meaning (delete to line start).
+            KeyCode::Char('u') if ctrl && self.input.is_empty() => {
+                let half = self.transcript_half_page();
+                self.transcript_scroll_up(half);
+                Action::None
+            }
             KeyCode::Char('u') if ctrl => {
                 self.delete_to_line_start();
+                Action::None
+            }
+            // Ctrl-D: half-page scroll DOWN while reviewing history (scrolled
+            // up). Otherwise it keeps the shell convention below (quit on an
+            // empty input).
+            KeyCode::Char('d') if ctrl && self.input.is_empty() && self.transcript_scroll > 0 => {
+                let half = self.transcript_half_page();
+                self.transcript_scroll_down(half);
                 Action::None
             }
             KeyCode::Char('k') if ctrl => {
@@ -2258,6 +2390,7 @@ impl App {
             "clear" => {
                 self.history.clear();
                 self.conversation.clear();
+                self.transcript_scroll = 0;
                 // A cleared transcript means the base should start a fresh
                 // session on the next turn, not resume the old one.
                 self.host_chat_session_active = false;
@@ -2413,6 +2546,7 @@ impl App {
             }
             "usage" => self.slash_usage(),
             "animations" => self.slash_toggle_animations(),
+            "mouse" => self.slash_toggle_mouse(),
             "bug" => self.slash_bug(),
             "design" => self.slash_design(rest),
             "template" => self.slash_template(rest),
@@ -4359,6 +4493,22 @@ impl App {
         self.trust_ledger.save(&self.project_root);
     }
 
+    /// Toggle mouse-wheel transcript scrolling. ON (default) lets the wheel
+    /// page the history; OFF releases the terminal's native text selection /
+    /// copy (which the mouse capture otherwise intercepts). The event loop reads
+    /// `mouse_scroll` each turn and only routes wheel events when it's on; a
+    /// Shift-held drag bypasses the capture in most terminals regardless.
+    fn slash_toggle_mouse(&mut self) -> Action {
+        self.mouse_scroll = !self.mouse_scroll;
+        let msg = if self.mouse_scroll {
+            "mouse-wheel scrolling on — Shift+drag for native text selection"
+        } else {
+            "mouse-wheel scrolling off — native text selection restored"
+        };
+        self.push(ChatRole::System, msg);
+        Action::None
+    }
+
     fn slash_toggle_animations(&mut self) -> Action {
         let path = std::env::var("HOME")
             .map(|h| {
@@ -5180,6 +5330,74 @@ mod tests {
             std::path::PathBuf::from(format!("/tmp/sd-test-cfg-{id}.toml")),
             workspace,
         )
+    }
+
+    #[test]
+    fn shift_up_scrolls_transcript_and_stops_auto_stick() {
+        let mut app = fresh_app(Some("offline"));
+        // Simulate a render having published a scroll bound + viewport.
+        app.transcript_max_scroll.set(20);
+        app.transcript_viewport_rows.set(10);
+        // Shift+↑ nudges the transcript up one row (un-pins from the bottom).
+        let _ = app.apply_key_with_mods(
+            crossterm::event::KeyCode::Up,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.transcript_scroll, 1);
+        // Shift+↓ brings it back.
+        let _ = app.apply_key_with_mods(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn page_and_home_end_scroll_against_published_viewport() {
+        let mut app = fresh_app(Some("offline"));
+        app.transcript_max_scroll.set(100);
+        app.transcript_viewport_rows.set(20);
+        // PageUp = viewport - 1 rows.
+        let _ = app.apply_key(crossterm::event::KeyCode::PageUp);
+        assert_eq!(app.transcript_scroll, 19);
+        // Home jumps to the very top (= max scroll).
+        let _ = app.apply_key(crossterm::event::KeyCode::Home);
+        assert_eq!(app.transcript_scroll, 100);
+        // End re-pins to the bottom.
+        let _ = app.apply_key(crossterm::event::KeyCode::End);
+        assert_eq!(app.transcript_scroll, 0);
+        // Ctrl-U on empty input = half a page up.
+        let _ = app.apply_key_with_mods(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert_eq!(app.transcript_scroll, 10);
+    }
+
+    #[test]
+    fn submitting_a_turn_repins_transcript_to_bottom() {
+        let mut app = fresh_app(Some("offline"));
+        app.transcript_max_scroll.set(50);
+        app.transcript_scroll = 30; // user is reviewing history
+        for c in "hello".chars() {
+            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
+        }
+        let _ = app.apply_key(crossterm::event::KeyCode::Enter);
+        assert_eq!(
+            app.transcript_scroll, 0,
+            "submitting must snap back to the newest content"
+        );
+    }
+
+    #[test]
+    fn slash_mouse_toggles_wheel_scroll_flag() {
+        let mut app = fresh_app(Some("offline"));
+        assert!(app.mouse_scroll, "wheel scroll defaults on");
+        for c in "/mouse".chars() {
+            let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
+        }
+        let _ = app.apply_key(crossterm::event::KeyCode::Enter);
+        assert!(!app.mouse_scroll, "/mouse turns the wheel binding off");
     }
 
     #[test]
