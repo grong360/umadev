@@ -83,10 +83,11 @@ These rules apply every time you write or edit a file. They are NOT suggestions:
 - After completing a feature, run build + lint. Fix errors before moving on.
 
 ### CLI Commands During Coding
-- Run `umadev enforce validate` after writing UI code.
-- Run `umadev quality` after completing a feature.
-- Run `umadev review --state ui` after frontend is done.
-- Run `umadev release proof-pack` before final delivery.
+- After completing a feature, run `umadev verify` to run the project's real test/build/lint sequence; add `--runtime` to also boot the app and probe its routes (writes `runtime-proof.json`).
+- Before a PR, run `umadev report --review` to generate the PR-ready review report and run the pre-PR security scan.
+- For brownfield repos, run `umadev adopt` first so UmaDev indexes the existing source and reverse-derives the API contract before changing anything.
+- At handoff, use `umadev deploy` (detect target; add `--run` to deploy) and `umadev pr` (dry run by default; add `--create` to open the PR).
+- Inspect what the run learned/spent with `umadev lessons` (high-frequency pitfalls + proven patterns) and `umadev usage` (token usage + rough cost).
 
 ## Four-Layer Governance Model
 
@@ -103,7 +104,7 @@ PreToolUse hooks validate every file write. PostToolUse hooks audit results.
 Hooks are auto-registered when /umadev is invoked.
 
 **Layer 4 — CLI Commands & Optional Plugin Enhancement (On-Demand Checks)**
-Run `umadev enforce validate` / `umadev quality` for deeper checks.
+Run `umadev verify` (add `--runtime` for a real boot+route proof) and `umadev report --review` for deeper checks.
 These are triggered at key milestones, not every turn.
 If Claude Code surfaces repo plugins, `.claude-plugin/marketplace.json` + `plugins/umadev-claude/.claude-plugin/plugin.json` should enhance the same UmaDev flow rather than fork it.
 

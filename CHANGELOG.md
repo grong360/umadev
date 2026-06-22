@@ -2,6 +2,19 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] — 角色裁判团 · 自我进化记忆 · brownfield 接管 · 部署/PR 闭环 · 信任分级
+
+### 新增
+
+- **角色裁判团（`critics`）**：把流水线里隐式扮演的角色（PM 立项 / tech-lead 文档评审 / 资深设计评审 / 验收总监）统一成 `RoleVerdict` schema + `RoleCritic` trait——每个角色在**只读的 fork 会话**上交叉评审共享工件并返回结构化裁决。fail-open、advisory-only（永不驱动循环终止）、绝不写盘、不新增模型端点（复用同一借来的脑）。
+- **自我进化记忆升级**：`lessons` 的踩坑库按归一化签名去重并**频率驱动召回**；当某踩坑在修复后仍复发时，向底座请求一条更高层的纠正**策略**并把 `Reflection` 快照进 `.umadev/reflections/`；检索新增 HyDE 式"假设答案"查询扩展，经 RRF 与原 query 排名融合，叠加在既有 BM25↔向量双通道融合之上。
+- **brownfield 接管（`adopt` / `umadev adopt`）**：接管既有仓库——探测技术栈 + 恢复 test/build/lint 命令 + 索引源码 + 从既有前端调用反推 API 契约 + 写 `UMADEV.md` 边界简报 + 落 `adopt.json` 基线标记（偏向增量改而非重写）。幂等、不改用户源码。
+- **运行时证据（`verify --runtime` / `runtime_proof`）**：不止"能编译"——启动 dev server、对路由做 HTTP 探测，把真启动证据写 `.umadev/audit/runtime-proof.json`，并入 proof-pack。
+- **部署闭环（`umadev deploy` / `deploy`）**：从工件探测部署目标（Vercel / Netlify / Fly / Cloudflare Pages / 容器镜像 / 静态托管），默认只打印配方；`--run` 经你已登录的平台 CLI 真部署并写 `deploy-proof.json`。UmaDev 不持有凭证、不注入任何东西。
+- **PR 模式（`umadev pr` / `report --review` / `review` / `security`）**：`report --review` 跑 pre-PR 安全扫描并生成 PR 级评审报告；`umadev pr` 默认 dry-run，`--create` 才真正推送并 `gh pr create`。
+- **信任分级模式（`trust` / `run --mode`）**：`plan`（只读、只研究+规划）/ `guarded`（默认、每道 gate 暂停）/ `auto`（全自动）三档。**不可逆动作**（.git / 网络 / 破坏性 shell）即便 `auto` 也始终二次确认。
+- **新命令**：`usage`（worker token 用量 + 粗略成本）、`lessons`（高频踩坑 + 已验证模式）、`quick`（轻量单点改动）、`redo`（重跑某阶段）。
+
 ## [Unreleased] — 纯底座驱动 · 模型/推理同步 · 升级与卸载
 
 ### 移除
