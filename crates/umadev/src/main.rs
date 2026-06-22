@@ -2158,8 +2158,19 @@ fn continuous_resume_phase(gate: umadev_agent::Gate) -> umadev_spec::Phase {
 /// paths print identically. The continuous path emits its detailed progress over
 /// the live event sink; this report carries only the terminal phase + the gate
 /// it paused at (if any), which is all `print_report` needs.
-fn continuous_report(outcome: &umadev_agent::RunOutcome) -> RunReport {
+fn continuous_report(outcome: &umadev_agent::RunOutcome, requirement: &str) -> RunReport {
     use umadev_agent::RunOutcome;
+    // P1-C: a lean plan (Bugfix / Refactor / Light) has NO Delivery phase. Mapping
+    // its `Completed` to `final_phase = Delivery` made `print_report` lie "pipeline
+    // complete / proof pack lives in release/" — but a lean run never builds a
+    // proof pack. Use the plan's ACTUAL last phase so the Completed report is
+    // honest (the call site routes a no-Delivery plan to `print_lean_report`).
+    let plan = umadev_agent::plan_phases(requirement);
+    let completed_phase = plan
+        .phases
+        .last()
+        .copied()
+        .unwrap_or(umadev_spec::Phase::Delivery);
     match outcome {
         RunOutcome::PausedAtGate(gate) => RunReport {
             final_phase: match gate {
@@ -2171,7 +2182,7 @@ fn continuous_report(outcome: &umadev_agent::RunOutcome) -> RunReport {
             completed: Vec::new(),
         },
         RunOutcome::Completed => RunReport {
-            final_phase: umadev_spec::Phase::Delivery,
+            final_phase: completed_phase,
             paused_at: None,
             completed: Vec::new(),
         },
@@ -2183,6 +2194,52 @@ fn continuous_report(outcome: &umadev_agent::RunOutcome) -> RunReport {
             paused_at: None,
             completed: Vec::new(),
         },
+    }
+}
+
+/// Whether the plan for `requirement` includes the Delivery phase (i.e. it is a
+/// heavyweight/one-sided build that produces a release proof-pack). Lean plans
+/// (Bugfix / Refactor / Light) do not — they must NOT be reported as "released".
+fn plan_has_delivery(requirement: &str) -> bool {
+    umadev_agent::plan_phases(requirement).includes(umadev_spec::Phase::Delivery)
+}
+
+/// Print a continuous run's terminal report with the RIGHT printer (P1-C): a plan
+/// that has a Delivery phase uses the full [`print_report`] (which can honestly
+/// say "pipeline complete / proof pack in release/" on a real Completed); a lean
+/// plan with no Delivery routes a `Completed` to [`print_lean_report`] so it never
+/// claims a release it didn't build. A non-Completed outcome (gate pause / hard
+/// stop) always uses the full report — those messages are correct for both.
+fn print_continuous_report(
+    project_root: &Path,
+    label: &str,
+    requirement: &str,
+    outcome: &umadev_agent::RunOutcome,
+) {
+    use umadev_agent::RunOutcome;
+    let report = continuous_report(outcome, requirement);
+    match outcome {
+        // Honest lean completion — no release/proof-pack claim.
+        RunOutcome::Completed if !plan_has_delivery(requirement) => print_lean_report(
+            project_root,
+            label,
+            umadev_i18n::tl("continuous.lean_complete"),
+            &report,
+        ),
+        // P2-J: a HARD STOP carries the REAL reason (zero source / a failed phase /
+        // a dead base session / a failed quality gate). The generic `print_report`
+        // unconditionally says "quality gate blocked", which is wrong for a
+        // zero-source or base-crash stop — so print the honest, machine-true reason
+        // verbatim here instead of routing through that one canned line.
+        RunOutcome::HardStop(reason) => {
+            println!(
+                "{}",
+                umadev_i18n::tlf("continuous.hardstop_report", &[reason])
+            );
+            println!("  workspace: {}", project_root.display());
+            println!("  runtime: {label}");
+        }
+        _ => print_report(project_root, label, &report),
     }
 }
 
@@ -2199,8 +2256,24 @@ async fn drive_continuous_run(
     session: &mut dyn umadev_runtime::BaseSession,
     mode: umadev_agent::TrustMode,
 ) -> Result<umadev_agent::RunOutcome> {
+    drive_continuous_run_from(runner, session, mode, umadev_spec::Phase::Research).await
+}
+
+/// Like [`drive_continuous_run`] but starts the FIRST block at `start_after`
+/// rather than [`umadev_spec::Phase::Research`]. Used by the CLI `continue` resume
+/// (P0-A): a fresh continuous session is driven from the gate-anchored phase the
+/// run paused at (Spec after the docs gate, Backend after the preview gate). Under
+/// `guarded` it drives exactly that one block to the NEXT gate (or completion);
+/// under `auto` it walks across the remaining gates to the end, same as a fresh
+/// run.
+async fn drive_continuous_run_from(
+    runner: &AgentRunner<OfflineRuntime>,
+    session: &mut dyn umadev_runtime::BaseSession,
+    mode: umadev_agent::TrustMode,
+    start_after: umadev_spec::Phase,
+) -> Result<umadev_agent::RunOutcome> {
     use umadev_agent::RunOutcome;
-    let mut start_after = umadev_spec::Phase::Research;
+    let mut start_after = start_after;
     // A finite hop ceiling: research→docs gate→spec→preview gate→backend covers
     // at most three blocks; cap a touch higher so a defensive resume can't loop.
     for _ in 0..6 {
@@ -2334,6 +2407,10 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                         "{}",
                         umadev_i18n::tlf("continuous.session_active", &[backend.id()])
                     );
+                    // Capture the requirement before `opts` moves into the runner —
+                    // the terminal report needs it to pick the honest printer
+                    // (P1-C: a lean plan must not claim a release it never built).
+                    let requirement = opts.requirement.clone();
                     // The runner here is only an options + event-sink carrier for
                     // the continuous driver (which drives the session directly,
                     // not `R::complete`); the offline runtime is never invoked.
@@ -2348,7 +2425,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                     drop(runner);
                     let _ = printer.await;
                     let outcome = outcome?;
-                    print_report(&project_root, &label, &continuous_report(&outcome));
+                    print_continuous_report(&project_root, &label, &requirement, &outcome);
                     return Ok(());
                 }
                 Err(e) => {
@@ -2912,6 +2989,76 @@ async fn drive_gate_block(
             driver.display_name(),
             backend.id()
         );
+
+        // P0-A (CLI continue): when the DEFAULT continuous path is active, a
+        // `continue` must resume on the SAME continuous engine from the door the
+        // run actually paused at — NOT silently fall back to the single-shot
+        // `continue_from_gate` (which re-feeds the base via per-phase `--print`
+        // processes, a different engine + a different gate set than the run was
+        // built on). The prior process's live base session is gone, so we open a
+        // FRESH continuous session and drive from the gate-anchored resume phase;
+        // the continuous directives reference "the approved documents you wrote",
+        // which are on disk, so the fresh session is coherent. Revise stays on the
+        // single-shot regen path (it rewrites the producing block's artifacts).
+        // Fail-open: if the continuous session can't open, fall through to the
+        // single-shot continue below — `continue` still works, just on the legacy
+        // engine, never a dead end.
+        //
+        // Engine match: resume on the SAME engine the run was actually driven on.
+        // The continuous driver stamps its persisted state note with a "continuous
+        // session" marker (see `persist_state`); the single-shot `transition` writes
+        // "(worker: …)" instead. So a state NOT carrying the continuous marker means
+        // the run fell back to (or opted into) the single-shot engine — and
+        // `continue` MUST stay single-shot to match the state it left (otherwise a
+        // fake / `--print`-only base whose continuous `session_for` "opens" but
+        // produces nothing would silently swap engines mid-run). The continuous path
+        // also never emits a `ClarifyGate`, so that gate is excluded for symmetry.
+        let continuous_origin = state.note.contains("continuous session");
+        if mode == GateBlock::Continue
+            && continuous_origin
+            && gate != Gate::ClarifyGate
+            && umadev_agent::continuous_enabled_from_env()
+        {
+            let trust = umadev_agent::TrustMode::Guarded;
+            match umadev_host::session_for(
+                backend.id(),
+                project_root,
+                &opts.model,
+                continuous_autonomous(trust),
+            )
+            .await
+            {
+                Ok(mut session) => {
+                    println!(
+                        "{}",
+                        umadev_i18n::tlf("continuous.session_active", &[backend.id()])
+                    );
+                    let requirement = opts.requirement.clone();
+                    let runner =
+                        AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
+                    runner.start().context("failed to start agent")?;
+                    let (runner, printer) = attach_live_sink(runner);
+                    let start_after = continuous_resume_phase(gate);
+                    let outcome =
+                        drive_continuous_run_from(&runner, session.as_mut(), trust, start_after)
+                            .await;
+                    let _ = session.end().await;
+                    drop(runner);
+                    let _ = printer.await;
+                    let outcome = outcome?;
+                    print_continuous_report(project_root, &label, &requirement, &outcome);
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        umadev_i18n::tlf("continuous.session_unavailable", &[&e.to_string()])
+                    );
+                    // Fall through to the single-shot continue with `opts` intact.
+                }
+            }
+        }
+
         let runner = AgentRunner::new(driver, opts);
         runner.start().context("failed to start agent")?;
         let (runner, printer) = attach_live_sink(runner);
@@ -4225,20 +4372,47 @@ mod tests {
     #[test]
     fn continuous_report_maps_each_outcome() {
         use umadev_agent::RunOutcome;
-        let paused = continuous_report(&RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        // A heavyweight (greenfield) requirement → the plan includes Delivery, so a
+        // Completed reports the Delivery phase.
+        let heavy = "build a SaaS dashboard with login and a database";
+        let paused = continuous_report(&RunOutcome::PausedAtGate(Gate::DocsConfirm), heavy);
         assert_eq!(paused.paused_at, Some(Gate::DocsConfirm));
 
-        let done = continuous_report(&RunOutcome::Completed);
+        let done = continuous_report(&RunOutcome::Completed, heavy);
         assert_eq!(done.paused_at, None);
         assert_eq!(done.final_phase, umadev_spec::Phase::Delivery);
 
-        let stopped = continuous_report(&RunOutcome::HardStop("no code".into()));
+        let stopped = continuous_report(&RunOutcome::HardStop("no code".into()), heavy);
         assert_eq!(stopped.paused_at, None);
         assert_ne!(
             stopped.final_phase,
             umadev_spec::Phase::Delivery,
             "a hard stop must NOT report as a completed delivery"
         );
+    }
+
+    /// P1-C: a LEAN plan (no Delivery phase) must NOT report its Completed as a
+    /// Delivery — so `print_report` can't claim "complete / proof pack in release/".
+    /// `continuous_report` reports the plan's real last phase, and the call-site
+    /// helper routes it to the honest lean printer.
+    #[test]
+    fn continuous_report_lean_completed_is_not_delivery() {
+        use umadev_agent::RunOutcome;
+        // A lean Bugfix plan: phases end at Quality, never Delivery.
+        let lean = "修复登录按钮点击没反应";
+        assert!(!plan_has_delivery(lean), "a bugfix plan has no Delivery");
+        let done = continuous_report(&RunOutcome::Completed, lean);
+        assert_eq!(done.paused_at, None);
+        assert_ne!(
+            done.final_phase,
+            umadev_spec::Phase::Delivery,
+            "a lean Completed must NOT be reported as a Delivery / release"
+        );
+        assert_eq!(done.final_phase, umadev_spec::Phase::Quality);
+        // The heavyweight side still has a Delivery to report.
+        assert!(plan_has_delivery(
+            "build a SaaS dashboard with login and a database"
+        ));
     }
 
     // ---- intra-phase resume recovery ----

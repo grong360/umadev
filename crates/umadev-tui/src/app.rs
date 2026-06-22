@@ -2268,7 +2268,15 @@ impl App {
                 umadev_i18n::tf(self.lang, "gate.revision_received", &[&text]),
             );
             Action::Revise(text)
-        } else if self.run_started && self.finished {
+        } else if self.run_started && (self.finished || self.aborted) {
+            // A SETTLED run (delivered, or aborted/hard-stopped) is no longer
+            // active — free text is a fresh chat turn, routed to the base. P1-G:
+            // the old condition only matched `finished`, so an ABORTED run (which
+            // keeps `run_started = true`, `finished = false`) fell through to the
+            // `else` and queued the message into `queued_steer` — a queue that
+            // never drains after an abort (no more phase/gate gaps come), so the
+            // input was silently swallowed (dead input). Treating aborted as
+            // "settled, route to chat" matches `is_pipeline_active()` exactly.
             self.record_user_turn(&text);
             self.thinking = true; // animated "thinking…" until the base replies
             self.thinking_started = Some(std::time::Instant::now());
@@ -3002,7 +3010,14 @@ impl App {
                 Action::None
             }
             "cancel" | "abort" => {
-                if self.is_pipeline_active() {
+                // P1-H: `/cancel` must also abort an in-flight AGENTIC round (the
+                // base inspecting/editing the repo outside the full pipeline).
+                // `agentic_in_flight` is true but `is_pipeline_active()` is false in
+                // that state, so the old pipeline-only check left `/cancel` unable to
+                // stop a streaming agentic subprocess — only Ctrl-C could. Mirror the
+                // Ctrl-C path, which already routes both to `Action::Cancel` (the
+                // event loop aborts `run_task`; `cancel_run` clears the flags).
+                if self.is_pipeline_active() || self.agentic_in_flight {
                     Action::Cancel
                 } else {
                     self.push(
@@ -3085,6 +3100,20 @@ impl App {
     }
 
     fn slash_backend(&mut self, backend: Option<&str>) -> Action {
+        // P1-I: refuse to switch the base mid-run. A live run (continuous or
+        // single-shot) is driving a base session pinned to the CURRENT backend;
+        // swapping `self.backend` + persisting it to config now would (a) leave the
+        // in-flight run on the old base while the UI/config claim the new one, and
+        // (b) make the NEXT resume/continue open a session on a base the run was
+        // never built against — a silent backend mismatch. Reject and tell the user
+        // to cancel first; the run, its parked session, and config all stay coherent.
+        if self.is_pipeline_active() {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "backend.busy_no_switch"),
+            );
+            return Action::None;
+        }
         let id = backend.unwrap_or("offline").to_string();
         self.commit_backend(backend.map(str::to_string));
         self.push(
@@ -6965,6 +6994,98 @@ mod tests {
         a.cancel_run();
         assert!(!a.is_pipeline_active());
         assert!(a.history.iter().any(|m| m.body.contains("已取消")));
+    }
+
+    #[test]
+    fn slash_cancel_aborts_an_in_flight_agentic_round() {
+        // P1-H: an agentic round (`agentic_in_flight`, but NOT a full pipeline) must
+        // be cancellable via `/cancel`. The old pipeline-only check left it
+        // un-cancellable from the prompt (only Ctrl-C worked).
+        let mut a = fresh_app(Some("offline"));
+        a.agentic_in_flight = true;
+        assert!(
+            !a.is_pipeline_active(),
+            "an agentic round is not a pipeline"
+        );
+        for c in "/cancel".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert!(
+            matches!(a.apply_key(KeyCode::Enter), Action::Cancel),
+            "/cancel must abort an in-flight agentic round"
+        );
+    }
+
+    #[test]
+    fn aborted_run_free_text_routes_to_chat_not_a_dead_queue() {
+        // P1-G: after an abort the run keeps `run_started = true`, `finished =
+        // false`, `aborted = true`. Free text in that state must route to the base
+        // as a fresh chat turn (Action::Route) — NOT get queued into `queued_steer`,
+        // which never drains after an abort (no further phase/gate gaps), silently
+        // swallowing the input.
+        let mut a = fresh_app(Some("offline"));
+        a.run_started = true;
+        a.finished = false;
+        a.aborted = true;
+        assert!(!a.is_pipeline_active(), "an aborted run is not active");
+        for c in "hello again".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(
+            action,
+            Action::Route("hello again".to_string()),
+            "aborted-state free text must route to chat"
+        );
+        assert!(
+            a.queued_steer.is_empty(),
+            "aborted-state input must NOT land in the never-draining steer queue"
+        );
+    }
+
+    #[test]
+    fn slash_backend_is_rejected_during_an_active_run() {
+        // P1-I: switching the base mid-run would leave the in-flight run on the old
+        // base while config/UI claim the new one (a silent backend mismatch on the
+        // next resume). `/backend` must refuse while a run is active and leave the
+        // backend unchanged.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "build a dashboard".into(),
+        });
+        assert!(a.is_pipeline_active());
+        let before = a.backend.clone();
+        // `/codex` is the backend-switch verb (TUI uses per-base verbs, not
+        // `/backend <id>`); it routes through `slash_backend`.
+        for c in "/codex".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(
+            action,
+            Action::None,
+            "mid-run base switch is a rejected no-op"
+        );
+        assert_eq!(a.backend, before, "the backend must be unchanged mid-run");
+        assert!(
+            a.history.iter().any(|m| m.body.contains("/cancel")),
+            "the rejection tells the user to /cancel first"
+        );
+    }
+
+    #[test]
+    fn slash_backend_switches_when_no_run_is_active() {
+        // The guard is scoped to an ACTIVE run only — switching at the idle prompt
+        // still works exactly as before.
+        let mut a = fresh_app(Some("offline"));
+        assert!(!a.is_pipeline_active());
+        for c in "/codex".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::BackendChanged);
+        assert_eq!(a.backend.as_deref(), Some("codex"));
     }
 
     #[test]

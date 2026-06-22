@@ -180,6 +180,7 @@
 
 # /backend and /model
 "backend.switched" = "已切換工人到 `{}` — 下一個 run 起用此 backend。"
+"backend.busy_no_switch" = "目前底座上有執行進行中 —— 請先 /cancel 再切換底座,以免執行與其會話錯配。"
 "model.base_default" = "(底座預設)"
 "model.menu.claude" = "  Claude(別名或完整 id 均可):\n    · /model opus —— 最強  · /model sonnet —— 均衡(預設)  · /model haiku —— 最快\n    · 完整 id 如 claude-opus-4-8 / claude-sonnet-4-6"
 "model.menu.codex" = "  Codex(OpenAI 模型 id):\n    · /model gpt-5.1-codex  · /model gpt-5  · /model o4-mini"
@@ -569,6 +570,8 @@
 "continuous.session_active" = "持續會話已啟用({})—— 預設的長會話路徑。"
 "continuous.session_unavailable" = "  [continuous] 會話不可用({});回退到單次逐階段路徑。"
 "continuous.auto_gate_resumed" = "[auto] 關卡 {} 已自動通過 —— 繼續推進。"
+"continuous.lean_complete" = "輕量任務已完成(無交付物料包 —— 這是一次小範圍改動)"
+"continuous.hardstop_report" = "UmaDev —— 流水線在交付前停止:{}"
 "continuous.tui_session_unavailable" = "持續會話不可用({})—— 設 UMADEV_CONTINUOUS=0 可改用逐階段路徑。"
 "continuous.block_aborted_busy" = "本輪已中止:本會話已有一個 run 佔用工作區(底座 {})。稍候片刻讓上一輪收尾後重試,或先 /status 查看目前進度。"
 "continuous.block_aborted_locked" = "本輪已中止:另一個 run 正佔用該工作區(底座 {})。\n{}"

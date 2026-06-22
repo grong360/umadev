@@ -504,6 +504,24 @@ fn continuous_autonomous(mode: umadev_agent::TrustMode) -> bool {
     mode.gates_auto_approve()
 }
 
+/// The continuous start phase for RE-DRIVING the block that PRODUCED a gate, when
+/// the user revises / steers at that gate (P1-D). Unlike [`continuous_resume_phase`]
+/// (which advances PAST the gate), this re-enters the producing block on the SAME
+/// held session with the revision folded into the requirement, so the base reworks
+/// the right artifacts in context instead of being orphaned onto a single-shot
+/// re-feed:
+///   - docs gate → re-drive from `Research` (regenerate the three docs)
+///   - preview gate → re-drive from `Spec` (regenerate spec → frontend, keeping
+///     the already-approved docs)
+fn continuous_revise_phase(gate: Gate) -> umadev_spec::Phase {
+    match gate {
+        Gate::PreviewConfirm => umadev_spec::Phase::Spec,
+        // DocsConfirm + the (never-on-continuous) ClarifyGate → regenerate from the
+        // top of the producing block.
+        Gate::DocsConfirm | Gate::ClarifyGate => umadev_spec::Phase::Research,
+    }
+}
+
 /// Spawn ONE continuous-session block for the TUI's `run` intent — the long-
 /// session counterpart of [`spawn_block`]. Drives the held persistent
 /// [`umadev_runtime::BaseSession`] (the director's brain) over
@@ -1824,6 +1842,22 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             maybe_event = engine_rx.recv() => {
                 if let Some(ev) = maybe_event {
                     app.apply_engine(ev);
+                    // P1-F: a continuous run that has reached a TERMINAL state
+                    // (delivery completed, or an honest abort / hard-stop carrying
+                    // the `ABORT_SENTINEL`) must drop the `continuous_run_active`
+                    // flag AND close + clear the parked director session — otherwise
+                    // the next free-text `run` intent would reuse a dead/settled
+                    // session holder and a stale "still continuous" flag (residual
+                    // state). `apply_engine` already flipped `finished` / `aborted`;
+                    // we react to that here, mirroring the cancel path's cleanup.
+                    if continuous_run_active && (app.finished || app.aborted) {
+                        if let Ok(mut g) = session_holder.try_lock() {
+                            if let Some(mut s) = g.take() {
+                                let _ = s.end().await;
+                            }
+                        }
+                        continuous_run_active = false;
+                    }
                     // After processing the event, check if an auto-approve
                     // is pending (auto_approve_gates = true). If so, fire
                     // the Continue action immediately so the pipeline
@@ -1857,21 +1891,38 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // a revision (mirrors the Action::Revise path).
                     if let Some(text) = app.pending_steer.take() {
                         sink.emit(EngineEvent::Note(format!("queued steer: {text}")));
-                        let mut run_opts = current_run_options(app, &opts);
-                        run_opts.requirement =
-                            format!("{}\n\n## Revision request\n{text}", app.requirement);
-                        let block = match app.active_gate {
-                            Some(Gate::PreviewConfirm) => Block::Continue(Gate::DocsConfirm),
-                            Some(Gate::ClarifyGate) => Block::Clarify,
-                            _ => Block::Initial,
-                        };
+                        let gate = app.active_gate;
                         app.active_gate = None;
-                        run_task = Some(spawn_block(
-                            run_opts,
-                            app.brain_spec(),
-                            sink.clone(),
-                            block,
-                        ));
+                        // P1-D: a continuous run must feed the steer back into the
+                        // SAME held director session (re-driving the producing block
+                        // on the continuous engine) — NOT spawn a single-shot block,
+                        // which would orphan the held session (leaked, never
+                        // `end()`-ed) and silently swap to the per-phase re-feed.
+                        run_task = Some(if continuous_run_active {
+                            let mut run_opts = current_run_options(app, &opts);
+                            run_opts.requirement =
+                                format!("{}\n\n## Revision request\n{text}", app.requirement);
+                            let autonomous = continuous_autonomous(run_opts.mode);
+                            let start_after =
+                                continuous_revise_phase(gate.unwrap_or(Gate::DocsConfirm));
+                            spawn_continuous_block(
+                                run_opts,
+                                sink.clone(),
+                                session_holder.clone(),
+                                start_after,
+                                autonomous,
+                            )
+                        } else {
+                            let mut run_opts = current_run_options(app, &opts);
+                            run_opts.requirement =
+                                format!("{}\n\n## Revision request\n{text}", app.requirement);
+                            let block = match gate {
+                                Some(Gate::PreviewConfirm) => Block::Continue(Gate::DocsConfirm),
+                                Some(Gate::ClarifyGate) => Block::Clarify,
+                                _ => Block::Initial,
+                            };
+                            spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
+                        });
                     }
                 }
             }
@@ -1988,17 +2039,47 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     // the live env (which races in parallel).
                                     strict_coverage: umadev_agent::strict_coverage_from_env(),
                                 };
-                                run_task = Some(spawn_block(
-                                    run_opts,
-                                    app.brain_spec(),
-                                    sink.clone(),
-                                    Block::Clarify,
-                                ));
+                                // P1-E: an explicit `/run` must drive the SAME engine
+                                // a direct-input run does — when continuous is on and
+                                // the brain is a host CLI, the director run goes
+                                // through the persistent session (`spawn_continuous_block`),
+                                // NOT a single-shot `Block::Clarify`. Otherwise the
+                                // same intent typed two ways (chat vs `/run`) would
+                                // run two different engines with two different gate
+                                // sets. Offline / non-host brains stay single-shot.
+                                let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
+                                continuous_run_active = tui_continuous_enabled() && host_cli;
+                                run_task = Some(if continuous_run_active {
+                                    let autonomous = continuous_autonomous(run_opts.mode);
+                                    spawn_continuous_block(
+                                        run_opts,
+                                        sink.clone(),
+                                        session_holder.clone(),
+                                        umadev_spec::Phase::Research,
+                                        autonomous,
+                                    )
+                                } else {
+                                    spawn_block(
+                                        run_opts,
+                                        app.brain_spec(),
+                                        sink.clone(),
+                                        Block::Clarify,
+                                    )
+                                });
                             }
                             Action::StartQuick(task) => {
                                 // Lightweight fast track — same RunOptions as a
                                 // normal start, but driven through the lean
-                                // single-shot Light block (no gates).
+                                // single-shot Light block (no gates). P1-E note:
+                                // `/quick` deliberately stays on the single-shot
+                                // lean engine on BOTH invocation forms (there is only
+                                // one `/quick`), so it is already self-consistent —
+                                // the divergence P1-E fixes is `/run` vs direct-input
+                                // general runs, which now share the continuous engine.
+                                // The continuous path classifies via `planner::plan`
+                                // (not `plan_light`), so routing `/quick` through it
+                                // could silently run the FULL pipeline and break the
+                                // forced-lean promise; we keep the forced-Light block.
                                 let run_opts = RunOptions {
                                     project_root: opts.project_root.clone(),
                                     requirement: task,
@@ -2066,29 +2147,44 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     // the live env (which races in parallel).
                                     strict_coverage: umadev_agent::strict_coverage_from_env(),
                                 };
-                                let block = match app.active_gate {
-                                    Some(Gate::PreviewConfirm) => {
-                                        Block::Continue(Gate::DocsConfirm)
-                                    }
-                                    // A revise AT the clarify gate re-asks the
-                                    // clarifying questions with the new info —
-                                    // NOT a jump straight to research/docs
-                                    // (Block::Initial skips clarify entirely).
-                                    Some(Gate::ClarifyGate) => Block::Clarify,
-                                    // docs_confirm or unknown → regenerate docs
-                                    _ => Block::Initial,
-                                };
+                                let gate = app.active_gate;
                                 // The producing block is re-running, so the gate
                                 // is no longer active — clear it so the status
                                 // bar / prompt don't keep showing the old gate
                                 // (and its timers) during the rework.
                                 app.active_gate = None;
-                                run_task = Some(spawn_block(
-                                    run_opts,
-                                    app.brain_spec(),
-                                    sink.clone(),
-                                    block,
-                                ));
+                                // P1-D: on a continuous run, feed the revision back
+                                // into the SAME held director session by re-driving
+                                // the producing block on the continuous engine —
+                                // NOT a single-shot `spawn_block`, which would orphan
+                                // the held session (leaked, never `end()`-ed) and
+                                // silently swap to the per-phase re-feed engine.
+                                run_task = Some(if continuous_run_active {
+                                    let autonomous = continuous_autonomous(run_opts.mode);
+                                    let start_after =
+                                        continuous_revise_phase(gate.unwrap_or(Gate::DocsConfirm));
+                                    spawn_continuous_block(
+                                        run_opts,
+                                        sink.clone(),
+                                        session_holder.clone(),
+                                        start_after,
+                                        autonomous,
+                                    )
+                                } else {
+                                    let block = match gate {
+                                        Some(Gate::PreviewConfirm) => {
+                                            Block::Continue(Gate::DocsConfirm)
+                                        }
+                                        // A revise AT the clarify gate re-asks the
+                                        // clarifying questions with the new info —
+                                        // NOT a jump straight to research/docs
+                                        // (Block::Initial skips clarify entirely).
+                                        Some(Gate::ClarifyGate) => Block::Clarify,
+                                        // docs_confirm or unknown → regenerate docs
+                                        _ => Block::Initial,
+                                    };
+                                    spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
+                                });
                             }
                             Action::StartPreview { url, command } => {
                                 let (dir, prog, args) = parse_run_command(&command, &opts.project_root);
@@ -3133,6 +3229,29 @@ mod tests {
         assert_eq!(
             continuous_resume_phase(Gate::PreviewConfirm),
             umadev_spec::Phase::Backend
+        );
+    }
+
+    /// P1-D: a revise re-drives the PRODUCING block on the held session — the docs
+    /// gate regenerates from Research, the preview gate from Spec (NOT the approved
+    /// docs). Distinct from `continuous_resume_phase` (which advances PAST the gate).
+    #[test]
+    fn continuous_revise_phase_re_enters_the_producing_block() {
+        // Docs gate revise → regenerate the three docs from the top (Research).
+        assert_eq!(
+            continuous_revise_phase(Gate::DocsConfirm),
+            umadev_spec::Phase::Research
+        );
+        // Preview gate revise → regenerate spec → frontend (Spec), keeping docs.
+        assert_eq!(
+            continuous_revise_phase(Gate::PreviewConfirm),
+            umadev_spec::Phase::Spec
+        );
+        // It is the INVERSE direction of the resume phase at the preview gate:
+        // resume advances to Backend, revise re-enters at Spec.
+        assert_ne!(
+            continuous_revise_phase(Gate::PreviewConfirm),
+            continuous_resume_phase(Gate::PreviewConfirm)
         );
     }
 

@@ -180,6 +180,7 @@
 
 # /backend and /model
 "backend.switched" = "Switched worker to `{}` — the next run uses this backend."
+"backend.busy_no_switch" = "A run is in progress on the current base — /cancel it before switching the base, so the run and its session stay coherent."
 "model.base_default" = "(base default)"
 "model.menu.claude" = "  Claude (alias or full id both work):\n    · /model opus —— strongest  · /model sonnet —— balanced (default)  · /model haiku —— fastest\n    · full ids like claude-opus-4-8 / claude-sonnet-4-6"
 "model.menu.codex" = "  Codex (OpenAI model id):\n    · /model gpt-5.1-codex  · /model gpt-5  · /model o4-mini"
@@ -569,6 +570,8 @@
 "continuous.session_active" = "Continuous session active ({}) — the default long-session path."
 "continuous.session_unavailable" = "  [continuous] session unavailable ({}); falling back to the single-shot per-phase path."
 "continuous.auto_gate_resumed" = "[auto] gate {} auto-approved — resuming."
+"continuous.lean_complete" = "lean task complete (no release proof-pack — this was a small-scope change)"
+"continuous.hardstop_report" = "UmaDev — pipeline stopped before delivery: {}"
 "continuous.tui_session_unavailable" = "continuous session unavailable ({}) — set UMADEV_CONTINUOUS=0 to use the per-phase path."
 "continuous.block_aborted_busy" = "This round was aborted: this session already has a run holding the workspace (base {}). Wait a moment for the previous round to finish and retry, or /status to see current progress."
 "continuous.block_aborted_locked" = "This round was aborted: another run is holding this workspace (base {}).\n{}"

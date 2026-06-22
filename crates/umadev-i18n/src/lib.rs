@@ -391,6 +391,8 @@ mod tests {
             "continuous.session_active",
             "continuous.session_unavailable",
             "continuous.auto_gate_resumed",
+            "continuous.lean_complete",
+            "continuous.hardstop_report",
             "continuous.tui_session_unavailable",
             "continuous.block_aborted_busy",
             "continuous.block_aborted_locked",

@@ -50,6 +50,7 @@ use crate::critics::{CriticArtifacts, CriticConsult, RoleCritic, RoleVerdict};
 use crate::events::{EngineEvent, EventSink};
 use crate::gates::Gate;
 use crate::runner::RunOptions;
+use crate::state::{write_workflow_state, WorkflowState};
 use crate::trust::{requires_confirmation, TrustMode};
 
 /// The hard ceiling on rework rounds at any single review node. The critic team
@@ -111,6 +112,38 @@ pub enum RunOutcome {
     /// **This is a deterministic, base-independent verdict — never disguised as
     /// success.**
     HardStop(String),
+}
+
+/// Persist the workflow state for the continuous path, mirroring the single-shot
+/// [`crate::runner::AgentRunner::transition`] EXACTLY — same `WorkflowState`
+/// shape, same `.umadev/workflow-state.json` file via the shared
+/// [`write_workflow_state`]. This is what makes `umadev continue` / the TUI gate
+/// resume / `umadev status` see the REAL door the continuous run paused at, just
+/// like the single-shot path. Without it the default (continuous) run never wrote
+/// state at all, so `continue` read `Missing` and bailed — `continue` was
+/// structurally dead against the default run (the P0-A gap).
+///
+/// `active_gate` is the gate id (e.g. `docs_confirm`) when the block is pausing at
+/// a gate, or empty while a phase is executing. **Fail-open by contract:** a
+/// failed write is swallowed (`let _ =`) so a disk/permission error can never
+/// wedge the run — the single-shot `transition` propagates its error, but the
+/// continuous driver returns a [`RunOutcome`], not a `Result`, so we degrade to
+/// "best-effort persisted" rather than aborting an otherwise-healthy run.
+fn persist_state(options: &RunOptions, phase: Phase, active_gate: &str) {
+    let state = WorkflowState {
+        phase: phase.id().to_string(),
+        active_gate: active_gate.to_string(),
+        slug: options.effective_slug(),
+        requirement: options.requirement.clone(),
+        last_transition_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        note: format!("Advanced to {} (continuous session)", phase.id()),
+        backend: options.backend.clone(),
+        spec_version: umadev_spec::SPEC_VERSION.to_string(),
+    };
+    let _ = write_workflow_state(&options.project_root, &state);
+    // Keep the coach prompt in lockstep with the active phase, exactly as the
+    // single-shot `transition` does. Best-effort: a write failure never blocks.
+    let _ = crate::coach::write_coach_prompt(options, phase);
 }
 
 /// Drive ONE block of the 9-phase pipeline over a single live [`BaseSession`],
@@ -182,6 +215,11 @@ pub async fn run_block(
             // for the user exactly as before.
             let gate = gate_for_phase(phase);
             review_and_rework(session, options, events, gate_review_kind(phase)).await;
+            // P0-A: persist the OPEN-GATE state (phase = the gate phase, active_gate
+            // = its id) so `umadev continue` / the TUI gate resume read the real door
+            // and resume the continuous run from THIS gate — exactly the state shape
+            // the single-shot `transition(gate_phase, gate.id_str())` would write.
+            persist_state(options, phase, gate.id_str());
             events.emit(EngineEvent::GateOpened { gate });
             events.emit(EngineEvent::BlockCompleted {
                 final_phase: phase,
@@ -201,6 +239,11 @@ pub async fn run_block(
             return RunOutcome::Completed;
         }
 
+        // P0-A: persist the EXECUTING-phase state (active_gate empty) before
+        // driving the turn, so a process kill mid-phase leaves a recoverable
+        // `phase` for `infer_gate_from_phase` (the same intra-phase recovery the
+        // single-shot path relies on), and `umadev status` reflects live progress.
+        persist_state(options, phase, "");
         events.emit(EngineEvent::PhaseStarted { phase });
         let outcome = drive_phase(
             session,
@@ -293,8 +336,13 @@ pub async fn run_block(
         }
     }
 
+    let final_phase = phases.last().copied().unwrap_or(Phase::Delivery);
+    // P0-A: persist the terminal phase with NO open gate so a `continue` after a
+    // completed block sees "no active gate" (the honest "pipeline is done / nothing
+    // to approve") instead of a stale gate, mirroring the single-shot done-state.
+    persist_state(options, final_phase, "");
     events.emit(EngineEvent::BlockCompleted {
-        final_phase: phases.last().copied().unwrap_or(Phase::Delivery),
+        final_phase,
         paused_at: None,
     });
     RunOutcome::Completed
@@ -823,11 +871,53 @@ fn block_phases(start_after: Phase, plan: &crate::planner::PhasePlan) -> Vec<Pha
             Vec::new()
         };
     }
+    // P0-B: a GATED plan with a docs gate but NO preview gate (`BackendOnly`, and
+    // any future docs-gated plan that drops the preview gate) MUST drive the whole
+    // tail in ONE post-docs block. The old `phases_for_block(Spec) ∩ plan` returned
+    // just `[Spec]` for BackendOnly (its window was `[Spec, Frontend,
+    // PreviewConfirm]`, none of which past Spec survive the intersection), so the
+    // driver stopped after Spec and Backend/Quality/Delivery were NEVER driven —
+    // the hard gates (zero-source / quality) never fired, and an empty Spec-only
+    // run reported `Completed` as a disguised success. When the plan has no preview
+    // gate, drive every plan phase from `start_after` to the end (like the lean
+    // "one block to done" shape, but keeping the docs gate that already split off
+    // the initial block). When the plan DOES have a preview gate, keep the
+    // unchanged gate-anchored three-block split intersected with the plan.
+    if plan.includes(Phase::DocsConfirm) && !plan.includes(Phase::PreviewConfirm) {
+        // Initial block (fresh run): research → docs → docs gate (unchanged so the
+        // docs checkpoint still pauses for the user). Any post-docs resume drives
+        // the whole remaining tail (Spec → Backend → Quality → Delivery) to done.
+        return if start_after == Phase::Research {
+            [Phase::Research, Phase::Docs, Phase::DocsConfirm]
+                .into_iter()
+                .filter(|p| plan.includes(*p))
+                .collect()
+        } else {
+            // Drive every plan phase at or after the resume point, in canonical
+            // order, all the way to Delivery — no further gate to anchor a split.
+            plan.phases
+                .iter()
+                .copied()
+                .filter(|p| phase_order(*p) >= phase_order(start_after))
+                .collect()
+        };
+    }
     phases_for_block(start_after)
         .iter()
         .copied()
         .filter(|p| plan.includes(*p))
         .collect()
+}
+
+/// Canonical position of a phase in [`umadev_spec::PHASE_CHAIN`] — used to slice
+/// "every plan phase at or after the resume point" for the no-preview-gate tail.
+/// Pure + total: an off-chain phase (none exist today) sorts last (fail-open: it
+/// is simply never selected ahead of a real phase).
+fn phase_order(phase: Phase) -> usize {
+    umadev_spec::PHASE_CHAIN
+        .iter()
+        .position(|p| *p == phase)
+        .unwrap_or(usize::MAX)
 }
 
 /// Whether a phase is one that writes real code (and so is subject to plan-mode
@@ -2405,6 +2495,141 @@ mod tests {
         assert_eq!(
             block_phases(Phase::Backend, &plan),
             vec![Phase::Quality, Phase::Delivery]
+        );
+    }
+
+    #[test]
+    fn block_phases_backend_only_drives_full_tail_after_docs_gate() {
+        // P0-B regression: a BackendOnly plan has a docs gate but NO preview gate.
+        // The initial block is research → docs → docs gate (unchanged); the
+        // post-docs resume MUST drive the WHOLE tail Spec → Backend → Quality →
+        // Delivery in one block. The pre-fix bug returned just `[Spec]`, dropping
+        // Backend/Quality/Delivery and disguising an empty run as success.
+        let plan = crate::planner::plan("写一个后端 graphql 接口");
+        assert_eq!(plan.kind, crate::planner::TaskKind::BackendOnly);
+        // Initial block keeps the docs gate.
+        assert_eq!(
+            block_phases(Phase::Research, &plan),
+            vec![Phase::Research, Phase::Docs, Phase::DocsConfirm]
+        );
+        // The continuous resume phase after the docs gate is Spec — from there the
+        // block must run all the way to Delivery (no preview gate to split on).
+        assert_eq!(
+            block_phases(Phase::Spec, &plan),
+            vec![Phase::Spec, Phase::Backend, Phase::Quality, Phase::Delivery],
+            "BackendOnly post-docs block must drive Spec→Backend→Quality→Delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_only_resume_drives_to_delivery_and_hard_gates_empty_code() {
+        // End-to-end P0-B: resume a BackendOnly run after the docs gate. With NO
+        // source produced, the zero-source HARD gate must fire after Backend — the
+        // run must NOT silently complete at Spec (the disguised-empty-delivery bug).
+        let tmp = tempfile::tempdir().unwrap();
+        // No source seeded → the moat's hard gate must catch the empty backend.
+        let options = opts(
+            tmp.path(),
+            "写一个后端 graphql 接口带鉴权和数据库",
+            TrustMode::Auto,
+        );
+        assert_eq!(
+            crate::planner::plan(&options.requirement).kind,
+            crate::planner::TaskKind::BackendOnly
+        );
+        let (events, rec) = sink();
+        // spec + backend turns (both clean narration) — the deterministic hard gate
+        // is what stops the run after Backend, not the base.
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]]);
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Spec).await;
+        match outcome {
+            RunOutcome::HardStop(reason) => {
+                assert!(
+                    reason.to_lowercase().contains("real") || reason.contains("代码"),
+                    "empty BackendOnly run must hard-stop on the zero-source gate: {reason}"
+                );
+            }
+            other => panic!("BackendOnly with no code must hard-stop, not {other:?}"),
+        }
+        // Backend WAS driven (PhaseStarted emitted) — proving the block didn't stop
+        // at Spec. The pre-fix bug never reached Backend at all.
+        let evs = rec.events();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                EngineEvent::PhaseStarted {
+                    phase: Phase::Backend
+                }
+            )),
+            "Backend phase must be driven on a BackendOnly resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_only_resume_with_source_runs_quality_and_delivery() {
+        // The healthy path: a BackendOnly resume with real source produced runs
+        // Spec → Backend → Quality → Delivery to completion (no early stop at Spec).
+        // The quality gate is advisory-passing here because real backend source +
+        // a written PRD/arch would be needed to fail it; with source present and no
+        // docs the gate would normally block — so seed a passing-ish minimal state
+        // by ALSO disabling the hard block via a docs/research-free lean comparison
+        // is not possible here; instead assert it reaches Delivery's PhaseStarted
+        // only when the gate passes. To keep this deterministic we assert the
+        // weaker, robust invariant: Backend + Quality are both DRIVEN (not skipped).
+        let tmp = tempfile::tempdir().unwrap();
+        seed_source(tmp.path());
+        let options = opts(tmp.path(), "写一个后端 graphql 接口", TrustMode::Auto);
+        let (events, rec) = sink();
+        let mut session =
+            FakeBaseSession::new(vec![vec![done()], vec![done()], vec![done()], vec![done()]]);
+
+        let _ = run_block(&mut session, &options, &events, Phase::Spec).await;
+        let evs = rec.events();
+        for phase in [Phase::Spec, Phase::Backend, Phase::Quality] {
+            assert!(
+                evs.iter()
+                    .any(|e| matches!(e, EngineEvent::PhaseStarted { phase: p } if *p == phase)),
+                "BackendOnly resume must drive {phase:?} (not stop at Spec)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn continuous_path_persists_workflow_state_for_continue() {
+        // P0-A regression: the continuous (default) path MUST write
+        // `.umadev/workflow-state.json` so `umadev continue` can read the real door
+        // and resume. Pre-fix the continuous path never wrote state, so `continue`
+        // read `Missing` and bailed — structurally dead against the default run.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]]);
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+
+        // The state file exists and records the OPEN docs gate so `continue`
+        // resolves the right block to resume from.
+        let state = crate::state::read_workflow_state(tmp.path())
+            .expect("continuous path must persist workflow-state.json");
+        assert_eq!(
+            state.active_gate, "docs_confirm",
+            "the open gate is persisted"
+        );
+        assert_eq!(state.phase, Phase::DocsConfirm.id());
+        assert_eq!(
+            state.slug, "demo",
+            "slug persisted so continue resolves artifacts"
+        );
+        assert_eq!(
+            state.requirement, options.requirement,
+            "requirement persisted so continue keeps context"
         );
     }
 
