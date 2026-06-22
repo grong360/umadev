@@ -41,6 +41,99 @@ use crate::state::{write_workflow_state, WorkflowState};
 /// this; the docs phase keeps the full configured budget.
 const RESEARCH_MAX_REVIEW_ROUNDS: usize = 1;
 
+/// Default wall-clock budget for ONE **advisory** `consult` call (critic /
+/// judge / surfacer), in seconds. These calls are ALL fail-open and discardable
+/// — a missed verdict never sinks a hard gate — so they must NOT inherit the
+/// 600s generation-grade ceiling the *worker* calls use. Without this, a single
+/// review can hang for ten-plus minutes, and the critic teams run N of them
+/// serially, so the advisory layer alone could stall a run for half an hour. A
+/// short cap turns a slow/wedged judge into a fast fail-open `None`. Override
+/// via `UMADEV_ADVISORY_TIMEOUT_SECS` (>0). See [`advisory_timeout_secs`].
+const ADVISORY_TIMEOUT_SECS: u64 = 120;
+
+/// Default wall-clock budget for ONE **heavy phase** (research / docs / spec /
+/// frontend / backend / quality), in seconds. Each of these phases makes
+/// SEVERAL base calls — generate + review→fix rounds + governance catch-up +
+/// critic teams + acceptance — whose single-call timeouts silently stack into
+/// tens of minutes with no phase-level ceiling. A phase budget caps that: when a
+/// phase overruns, we keep whatever partial artifacts it already wrote, mark it
+/// `degraded`, emit a clear warn Note, and fail-open to the next step (never
+/// wedge, never discard already-written files). Override via
+/// `UMADEV_PHASE_BUDGET_SECS` (>0). See [`phase_budget`].
+const PHASE_BUDGET_SECS: u64 = 900;
+
+/// Default wall-clock budget for a whole AUTO run, in seconds. The `auto` tier
+/// drives past every gate unattended; without an upper bound a pathological run
+/// could churn indefinitely. When the cumulative run time crosses this soft
+/// budget, the auto loop STOPS at the current gate (it does not force-kill the
+/// in-flight block) and emits a Note telling the user to take over — turning an
+/// unbounded auto-run into a bounded one. Default 1 hour. Override via
+/// `UMADEV_RUN_BUDGET_SECS` (>0). See [`run_budget`].
+const RUN_BUDGET_SECS: u64 = 3600;
+
+/// Test-only millisecond override for the advisory-consult timeout — lets tests
+/// drive the fail-open path in milliseconds instead of waiting whole seconds,
+/// WITHOUT mutating the process-global env (which races under parallel tests).
+/// `0` = unset (use the env / default). Same pattern as the retry-base override.
+#[cfg(test)]
+static ADVISORY_TIMEOUT_MS_TEST_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only millisecond override for the per-phase budget. `0` = unset.
+#[cfg(test)]
+static PHASE_BUDGET_MS_TEST_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Resolve the advisory-consult timeout: `UMADEV_ADVISORY_TIMEOUT_SECS` when set
+/// to a positive integer, else [`ADVISORY_TIMEOUT_SECS`]. Fail-open: a missing /
+/// empty / non-numeric / zero value falls back to the default so a bad override
+/// can never DISABLE the cap.
+fn advisory_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = ADVISORY_TIMEOUT_MS_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    let secs = std::env::var("UMADEV_ADVISORY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(ADVISORY_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Resolve the per-phase wall-clock budget: `UMADEV_PHASE_BUDGET_SECS` when set
+/// to a positive integer, else [`PHASE_BUDGET_SECS`]. Same fail-open clamp as
+/// [`advisory_timeout`].
+fn phase_budget() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = PHASE_BUDGET_MS_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    let secs = std::env::var("UMADEV_PHASE_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(PHASE_BUDGET_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Resolve the whole-run soft budget: `UMADEV_RUN_BUDGET_SECS` when set to a
+/// positive integer, else [`RUN_BUDGET_SECS`]. Same fail-open clamp.
+fn run_budget() -> std::time::Duration {
+    let secs = std::env::var("UMADEV_RUN_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(RUN_BUDGET_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Whether the markdown section starting at byte `heading_pos` (the heading
 /// line for `heading`) has any non-empty body content before the next `##`
 /// heading. Catches "present but empty" sections a bare `## goal` would
@@ -427,6 +520,39 @@ impl<R: Runtime> AgentRunner<R> {
         let label = format!("phase: {}", phase.id());
         let _ = crate::checkpoint::create_phase_checkpoint(&self.options.project_root, &label);
         self.emit(EngineEvent::PhaseStarted { phase });
+    }
+
+    /// Run a heavy phase's WORKER body under a wall-clock budget.
+    ///
+    /// `fut` is the part of a phase that makes the multiple base calls (generate,
+    /// review→fix, governance catch-up, critic team, acceptance) — the part that,
+    /// unbounded, lets single-call timeouts stack into tens of minutes.
+    /// When `fut` finishes within [`phase_budget`], its output is returned and
+    /// `timed_out` is `false`. When it overruns, we ABANDON the in-flight body
+    /// (drop the future) and return `(None, true)` — the caller then records the
+    /// phase from WHATEVER files the body already wrote to disk and marks it
+    /// `degraded`, so no partial artifact is lost and the pipeline fails open to
+    /// the next step instead of wedging. A clear warn Note is emitted on overrun.
+    ///
+    /// Fully fail-open: the budget only ever turns a slow phase into a degraded
+    /// one; it never errors and never blocks. The body's own file writes are the
+    /// product — dropping the future only stops *further* work, it cannot unwrite
+    /// what already landed on disk.
+    async fn with_phase_budget<T, F>(&self, phase: Phase, fut: F) -> (Option<T>, bool)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        if let Ok(out) = tokio::time::timeout(phase_budget(), fut).await {
+            (Some(out), false)
+        } else {
+            let mins = phase_budget().as_secs() / 60;
+            self.emit(EngineEvent::Note(format!(
+                "[warn] {} 阶段超出时间预算(约 {mins} 分钟)— 保留已生成的产物,标记为降级,\
+                 继续推进下一步(顾问/评审为非阻塞,丢弃不影响硬门)。",
+                phase.id()
+            )));
+            (None, true)
+        }
     }
 
     /// At a block boundary, loudly re-state every phase that DEGRADED to an
@@ -1049,6 +1175,15 @@ impl<R: Runtime> AgentRunner<R> {
     /// any block returning `Err` propagates exactly as the single-block paths
     /// already do.
     pub async fn run_auto_to_completion(&self, use_runtime: bool) -> std::io::Result<RunReport> {
+        // Run-level soft budget: the `auto` tier drives unattended past every
+        // gate, so without an upper bound a pathological run could churn for
+        // hours. We don't force-kill an in-flight block (each block already has
+        // its own phase budgets + per-call timeouts) — instead, once cumulative
+        // run time crosses the soft budget we STOP at the current gate and hand
+        // control back. Fail-open: a default budget always exists; an env value
+        // only adjusts it, never disables the cap.
+        let run_started = std::time::Instant::now();
+        let budget = run_budget();
         let mut report = self.run_clarify(use_runtime).await?;
         // Only the `auto` tier drives past gates. `guarded` pauses for a human;
         // `plan` is read-only and stops at `docs_confirm` by design.
@@ -1066,6 +1201,18 @@ impl<R: Runtime> AgentRunner<R> {
                 // lean plan with no further gates). Done.
                 return Ok(report);
             };
+            // Soft run budget: if we've already spent more than the budget, stop
+            // at THIS gate instead of auto-advancing further. The report still
+            // carries `paused_at`, so the user can `continue` to resume manually.
+            if run_started.elapsed() >= budget {
+                let mins = budget.as_secs() / 60;
+                self.emit(EngineEvent::Note(format!(
+                    "[warn] 本次自动运行已超出运行时间预算(约 {mins} 分钟),停在当前 gate({})。\
+                     已完成的阶段产物已保留;用 `umadev continue` 接手继续推进。",
+                    gate.id_str()
+                )));
+                return Ok(report);
+            }
             // The `[auto] auto-approved …` announcement now lives in
             // `continue_from_gate` itself, so EVERY auto path — this headless
             // loop, the TUI's `Block::Continue` auto-advance, any future caller —
@@ -1216,7 +1363,11 @@ impl<R: Runtime> AgentRunner<R> {
                     top_files.len(),
                 )));
             }
-            let text = if use_runtime {
+            // Wrap the research worker body in the phase budget: research is the
+            // single most expensive call and its review→fix can stack, so it's the
+            // most likely phase to blow a wall-clock budget. On overrun we keep
+            // whatever it already wrote, flag degraded, and move on.
+            let (text, phase_timed_out) = if use_runtime {
                 let research_digest = crate::phases::phase_knowledge_digest_with_retrieval(
                     &self.options,
                     Phase::Research,
@@ -1244,19 +1395,25 @@ impl<R: Runtime> AgentRunner<R> {
                 // only clamps research, and only DOWNWARD (a config that already
                 // asked for 0 reviews still gets 0).
                 let research_reviews = max_reviews.min(RESEARCH_MAX_REVIEW_ROUNDS);
-                self.generate_with_review(
-                    Phase::Research,
-                    rp,
-                    Self::review_research,
-                    research_reviews,
-                )
-                .await
+                let (out, timed_out) = self
+                    .with_phase_budget(
+                        Phase::Research,
+                        self.generate_with_review(
+                            Phase::Research,
+                            rp,
+                            Self::review_research,
+                            research_reviews,
+                        ),
+                    )
+                    .await;
+                (out.flatten(), timed_out)
             } else {
-                None
+                (None, false)
             };
             // #1: runtime was on but the base produced nothing → the research
             // artifact is the offline placeholder, not real output. Flag degraded.
-            let degraded = use_runtime && text.is_none();
+            // A phase-budget overrun is ALSO degraded (partial/no real output).
+            let degraded = use_runtime && (text.is_none() || phase_timed_out);
             completed.push(self.record_phase_maybe_degraded(
                 Phase::Research,
                 run_research(&self.options, text.as_deref()),
@@ -1270,19 +1427,31 @@ impl<R: Runtime> AgentRunner<R> {
         // 2. docs
         let phase_start = std::time::Instant::now();
         self.start_phase(Phase::Docs);
-        let docs_content = if use_runtime {
-            self.generate_docs_content(research_text.as_deref()).await
+        // Wrap the docs generation (PRD + architecture + UIUX, each a base call
+        // with its own review→fix) in the phase budget. On overrun, whatever docs
+        // were already written stay on disk; the rest fall back to templates and
+        // the phase is flagged degraded.
+        let (docs_content, docs_timed_out) = if use_runtime {
+            let (out, timed_out) = self
+                .with_phase_budget(
+                    Phase::Docs,
+                    self.generate_docs_content(research_text.as_deref()),
+                )
+                .await;
+            (out.unwrap_or_default(), timed_out)
         } else {
-            DocsContent::default()
+            (DocsContent::default(), false)
         };
 
         // #1: docs degrades when runtime is on but ALL three core docs fell back
         // to templates (every body is None) — that means the base was offline for
         // the whole docs phase, so the PRD/architecture/UIUX are placeholders.
+        // A budget overrun is ALSO degraded (the docs are partial / template).
         let docs_degraded = use_runtime
-            && docs_content.prd.is_none()
-            && docs_content.architecture.is_none()
-            && docs_content.uiux.is_none();
+            && (docs_timed_out
+                || (docs_content.prd.is_none()
+                    && docs_content.architecture.is_none()
+                    && docs_content.uiux.is_none()));
         let docs = self.record_phase_maybe_degraded(
             Phase::Docs,
             run_docs(&self.options, &docs_content),
@@ -2252,7 +2421,16 @@ impl<R: Runtime> AgentRunner<R> {
             user,
         };
         let req = prompt.into_request(&self.options.model, 1500);
-        let resp = runtime.complete(req).await.ok()?;
+        // Advisory consults are ALL fail-open and discardable — bound them with a
+        // SHORT dedicated timeout (not the 600s generation ceiling the worker
+        // uses) so one wedged judge can't hang for ten-plus minutes, and a serial
+        // critic team can't stack N such hangs into half an hour. A timeout is
+        // treated exactly like any other consult failure: fail-open to `None`, so
+        // the caller falls back to its deterministic heuristic.
+        let resp = tokio::time::timeout(advisory_timeout(), runtime.complete(req))
+            .await
+            .ok()? // Err = timed out → fail-open None
+            .ok()?; // Err = provider error → fail-open None
         let json = extract_json_object(&resp.text)?;
         serde_json::from_str(&json).ok()
     }
@@ -2570,7 +2748,16 @@ impl<R: Runtime> AgentRunner<R> {
             // or resurrect an already-passed gate, and it's a costly ~30 KB call.
             // The DETERMINISTIC count governs the loop; this is advisory signal.
             if round == 1 {
-                if let Some(verdict) = self.judge_acceptance(slug).await {
+                // The acceptance judge is a single ~30 KB consult with no inner
+                // streaming — wrap it so the user sees a leading [wait] + periodic
+                // beats instead of a silent 10-30s stall (fail-open passthrough).
+                if let Some(verdict) = self
+                    .with_heartbeat(
+                        "智能验收评审(对照 PRD 验收标准)",
+                        self.judge_acceptance(slug),
+                    )
+                    .await
+                {
                     // Team hook-up (zero behavior change): ALSO record the
                     // acceptance director's existing verdict in the team ledger.
                     self.ledger_role_verdict(
@@ -2699,6 +2886,16 @@ impl<R: Runtime> AgentRunner<R> {
              that must be built, and the key risks. Be concrete, no fluff. JSON \
              shape: {\"product_type\": \"…\", \"complexity\": \"simple|medium|complex\", \
              \"core_features\": [\"…\", …], \"key_risks\": [\"…\", …]}";
+        // This single consult has no inner streaming — without a leading Note it
+        // is a silent 10-30s gap right at the start of a run. Announce it (only
+        // when there's a brain, so an offline run stays quiet) so the screen
+        // reads as working, not hung. Fail-open: the consult still returns None.
+        if self.runtime.is_offline() {
+            return;
+        }
+        self.emit(EngineEvent::Note(
+            "[plan] 智能评审中…正在理解你的需求(产品类型 / 复杂度 / 核心功能 / 风险)".to_string(),
+        ));
         let Some(v): Option<IntakePlan> = self
             .consult(system, format!("需求:{}", self.options.requirement))
             .await
@@ -2761,6 +2958,14 @@ impl<R: Runtime> AgentRunner<R> {
             excerpt_sections(&arch, 3000),
             excerpt_sections(&uiux, 2000)
         );
+        // A single non-streaming consult — announce it so the docs-gate review
+        // isn't a silent stall (quiet when offline; fail-open below).
+        if !self.runtime.is_offline() {
+            self.emit(EngineEvent::Note(
+                "[docs] 智能评审中…技术负责人审查三份核心文档(最大风险 / 缺失项 / 是否可开工)"
+                    .to_string(),
+            ));
+        }
         let Some(v): Option<DocsVerdict> = self.consult(system, user).await else {
             return;
         };
@@ -3147,6 +3352,14 @@ impl<R: Runtime> AgentRunner<R> {
             "## Frontend notes\n{}\n\n## Delivered UI code\n{code}",
             excerpt(&notes, 3000)
         );
+        // A single non-streaming consult — announce it so the preview-gate review
+        // isn't a silent stall (quiet when offline; fail-open below).
+        if !self.runtime.is_offline() {
+            self.emit(EngineEvent::Note(
+                "[preview] 智能评审中…技术负责人审查前端预览(最大风险 / 弱项 / 是否可进入后端)"
+                    .to_string(),
+            ));
+        }
         let Some(v): Option<DocsVerdict> = self.consult(system, user).await else {
             return;
         };
@@ -3528,56 +3741,69 @@ impl<R: Runtime> AgentRunner<R> {
         self.start_phase(Phase::Spec);
         // #1: tracks whether the base produced a real execution plan; stays
         // `false` for offline runs (no base expected) and flips on only when a
-        // runtime base call returned nothing.
+        // runtime base call returned nothing — or the phase budget overran.
         let mut spec_degraded = false;
         if use_runtime {
             self.emit(EngineEvent::Note(
                 "[docs] Worker generating execution plan + task breakdown...".to_string(),
             ));
-            let slug = self.options.effective_slug();
-            // Read approved docs for context
-            let prd = std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-prd.md")),
-            )
-            .unwrap_or_default();
-            let arch = std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-architecture.md")),
-            )
-            .unwrap_or_default();
-            let context = format!(
-                "PRD excerpt:\n{}\n\nArchitecture excerpt:\n{}",
-                excerpt_sections(&prd, 2000),
-                excerpt_sections(&arch, 2000)
-            );
-            let spec_text = self
-                .try_generate(
-                    Phase::Spec,
-                    Prompt {
-                        system: format!(
-                            "Role: senior engineering manager.\n\
-                             Write an execution plan with sprint breakdown, coding standards, \
-                             and definition of done. Based on these approved documents:\n\n{context}"
-                        ),
-                        user: format!("Write the execution plan for: {}", self.options.requirement),
-                    },
-                )
+            // Wrap the spec generation in the phase budget. The async block
+            // returns `true` when the base produced nothing (degraded). On a
+            // budget overrun the block is abandoned (no plan written) → degraded.
+            let (gen_degraded, timed_out) = self
+                .with_phase_budget(Phase::Spec, async {
+                    let slug = self.options.effective_slug();
+                    // Read approved docs for context
+                    let prd = std::fs::read_to_string(
+                        self.options
+                            .project_root
+                            .join(format!("output/{slug}-prd.md")),
+                    )
+                    .unwrap_or_default();
+                    let arch = std::fs::read_to_string(
+                        self.options
+                            .project_root
+                            .join(format!("output/{slug}-architecture.md")),
+                    )
+                    .unwrap_or_default();
+                    let context = format!(
+                        "PRD excerpt:\n{}\n\nArchitecture excerpt:\n{}",
+                        excerpt_sections(&prd, 2000),
+                        excerpt_sections(&arch, 2000)
+                    );
+                    let spec_text = self
+                        .try_generate(
+                            Phase::Spec,
+                            Prompt {
+                                system: format!(
+                                    "Role: senior engineering manager.\n\
+                                     Write an execution plan with sprint breakdown, coding \
+                                     standards, and definition of done. Based on these approved \
+                                     documents:\n\n{context}"
+                                ),
+                                user: format!(
+                                    "Write the execution plan for: {}",
+                                    self.options.requirement
+                                ),
+                            },
+                        )
+                        .await;
+                    if let Some(text) = spec_text {
+                        let plan_path = self
+                            .options
+                            .project_root
+                            .join(format!("output/{slug}-execution-plan.md"));
+                        if let Some(parent) = plan_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = crate::phases::atomic_write(&plan_path, &text);
+                        false
+                    } else {
+                        true
+                    }
+                })
                 .await;
-            if let Some(text) = spec_text {
-                let plan_path = self
-                    .options
-                    .project_root
-                    .join(format!("output/{slug}-execution-plan.md"));
-                if let Some(parent) = plan_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = crate::phases::atomic_write(&plan_path, &text);
-            } else {
-                spec_degraded = true;
-            }
+            spec_degraded = timed_out || gen_degraded.unwrap_or(true);
         }
         completed.push(self.record_phase_maybe_degraded(
             Phase::Spec,
@@ -3650,47 +3876,56 @@ impl<R: Runtime> AgentRunner<R> {
                 "[preview] Worker implementing frontend (components, pages, API client)..."
                     .to_string(),
             ));
-            let slug = self.options.effective_slug();
-            let uiux = std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-uiux.md")),
-            )
-            .unwrap_or_default();
-            let arch = std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-architecture.md")),
-            )
-            .unwrap_or_default();
-            let prd = std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-prd.md")),
-            )
-            .unwrap_or_default();
-            self.emit(EngineEvent::SubTaskStarted {
-                phase: Phase::Frontend,
-                task_id: "frontend.implement".into(),
-                label: "worker generating components/styling/state".into(),
-            });
-            let fe_p = self.with_expert_knowledge(
-                frontend_prompt(
-                    &slug,
-                    &self.options.requirement,
-                    &excerpt_sections(&uiux, 3000),
-                    &excerpt_sections(&arch, 2000),
-                    &excerpt_sections(&prd, 1500),
-                ),
-                &["frontend-lead", "uiux-designer"],
-            );
-            let fe_ok = self.try_generate(Phase::Frontend, fe_p).await.is_some();
-            fe_degraded = !fe_ok;
-            self.emit(EngineEvent::SubTaskCompleted {
-                phase: Phase::Frontend,
-                task_id: "frontend.implement".into(),
-                ok: fe_ok,
-            });
+            // Wrap the frontend implementation in the phase budget. The async
+            // block returns `true` when the base produced nothing. On overrun the
+            // block is abandoned and the phase is flagged degraded; whatever code
+            // the base already wrote stays on disk.
+            let (fe_ok_opt, timed_out) = self
+                .with_phase_budget(Phase::Frontend, async {
+                    let slug = self.options.effective_slug();
+                    let uiux = std::fs::read_to_string(
+                        self.options
+                            .project_root
+                            .join(format!("output/{slug}-uiux.md")),
+                    )
+                    .unwrap_or_default();
+                    let arch = std::fs::read_to_string(
+                        self.options
+                            .project_root
+                            .join(format!("output/{slug}-architecture.md")),
+                    )
+                    .unwrap_or_default();
+                    let prd = std::fs::read_to_string(
+                        self.options
+                            .project_root
+                            .join(format!("output/{slug}-prd.md")),
+                    )
+                    .unwrap_or_default();
+                    self.emit(EngineEvent::SubTaskStarted {
+                        phase: Phase::Frontend,
+                        task_id: "frontend.implement".into(),
+                        label: "worker generating components/styling/state".into(),
+                    });
+                    let fe_p = self.with_expert_knowledge(
+                        frontend_prompt(
+                            &slug,
+                            &self.options.requirement,
+                            &excerpt_sections(&uiux, 3000),
+                            &excerpt_sections(&arch, 2000),
+                            &excerpt_sections(&prd, 1500),
+                        ),
+                        &["frontend-lead", "uiux-designer"],
+                    );
+                    let fe_ok = self.try_generate(Phase::Frontend, fe_p).await.is_some();
+                    self.emit(EngineEvent::SubTaskCompleted {
+                        phase: Phase::Frontend,
+                        task_id: "frontend.implement".into(),
+                        ok: fe_ok,
+                    });
+                    fe_ok
+                })
+                .await;
+            fe_degraded = timed_out || !fe_ok_opt.unwrap_or(false);
         }
         let fe = self.record_phase_maybe_degraded(
             Phase::Frontend,
@@ -3759,40 +3994,48 @@ impl<R: Runtime> AgentRunner<R> {
                 "[backend] Worker implementing backend (routes, database, auth, tests)..."
                     .to_string(),
             ));
-            let slug = self.options.effective_slug();
-            let arch = std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-architecture.md")),
-            )
-            .unwrap_or_default();
-            let prd = std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-prd.md")),
-            )
-            .unwrap_or_default();
-            self.emit(EngineEvent::SubTaskStarted {
-                phase: Phase::Backend,
-                task_id: "backend.implement".into(),
-                label: "worker generating routes/database/auth/tests".into(),
-            });
-            let be_p = self.with_expert_knowledge(
-                backend_prompt(
-                    &slug,
-                    &self.options.requirement,
-                    &excerpt_sections(&arch, 3000),
-                    &excerpt_sections(&prd, 1500),
-                ),
-                &["backend-lead", "architect"],
-            );
-            let be_ok = self.try_generate(Phase::Backend, be_p).await.is_some();
-            be_degraded = !be_ok;
-            self.emit(EngineEvent::SubTaskCompleted {
-                phase: Phase::Backend,
-                task_id: "backend.implement".into(),
-                ok: be_ok,
-            });
+            // Wrap the backend implementation in the phase budget. On overrun the
+            // block is abandoned (flagged degraded); whatever code the base already
+            // wrote stays on disk.
+            let (be_ok_opt, timed_out) = self
+                .with_phase_budget(Phase::Backend, async {
+                    let slug = self.options.effective_slug();
+                    let arch = std::fs::read_to_string(
+                        self.options
+                            .project_root
+                            .join(format!("output/{slug}-architecture.md")),
+                    )
+                    .unwrap_or_default();
+                    let prd = std::fs::read_to_string(
+                        self.options
+                            .project_root
+                            .join(format!("output/{slug}-prd.md")),
+                    )
+                    .unwrap_or_default();
+                    self.emit(EngineEvent::SubTaskStarted {
+                        phase: Phase::Backend,
+                        task_id: "backend.implement".into(),
+                        label: "worker generating routes/database/auth/tests".into(),
+                    });
+                    let be_p = self.with_expert_knowledge(
+                        backend_prompt(
+                            &slug,
+                            &self.options.requirement,
+                            &excerpt_sections(&arch, 3000),
+                            &excerpt_sections(&prd, 1500),
+                        ),
+                        &["backend-lead", "architect"],
+                    );
+                    let be_ok = self.try_generate(Phase::Backend, be_p).await.is_some();
+                    self.emit(EngineEvent::SubTaskCompleted {
+                        phase: Phase::Backend,
+                        task_id: "backend.implement".into(),
+                        ok: be_ok,
+                    });
+                    be_ok
+                })
+                .await;
+            be_degraded = timed_out || !be_ok_opt.unwrap_or(false);
         }
         completed.push(self.record_phase_maybe_degraded(
             Phase::Backend,
@@ -3851,13 +4094,21 @@ impl<R: Runtime> AgentRunner<R> {
         // to the team ledger, and surfaces their advisory blocking. ADVISORY only:
         // it never sinks the deterministic gate or controls the loop (invariant 2).
         if use_runtime {
-            let advisory = self
-                .with_heartbeat_opts(
-                    "质量阶段角色团队交叉评审(QA + 安全)",
-                    false,
-                    self.run_quality_critic_team(&self.options.effective_slug()),
+            // The quality critic team runs N advisory consults serially; bound the
+            // whole team with the phase budget on top of each consult's own
+            // advisory timeout. On overrun → empty advisory (fail-open: the
+            // deterministic quality gate above is the hard signal, untouched).
+            let (advisory_opt, _timed_out) = self
+                .with_phase_budget(
+                    Phase::Quality,
+                    self.with_heartbeat_opts(
+                        "质量阶段角色团队交叉评审(QA + 安全)",
+                        false,
+                        self.run_quality_critic_team(&self.options.effective_slug()),
+                    ),
                 )
                 .await;
+            let advisory = advisory_opt.unwrap_or_default();
             if !advisory.is_empty() {
                 let list = advisory
                     .iter()
@@ -5218,6 +5469,59 @@ not json at all
         RETRY_BASE_MS_TEST_OVERRIDE.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// RAII guard: set the advisory-consult timeout to `ms` for the test, reset
+    /// to `0` (unset) on drop. Keeps the override from leaking into other tests.
+    struct AdvisoryTimeoutGuard;
+    impl AdvisoryTimeoutGuard {
+        fn set(ms: u64) -> Self {
+            ADVISORY_TIMEOUT_MS_TEST_OVERRIDE.store(ms, std::sync::atomic::Ordering::Relaxed);
+            Self
+        }
+    }
+    impl Drop for AdvisoryTimeoutGuard {
+        fn drop(&mut self) {
+            ADVISORY_TIMEOUT_MS_TEST_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// RAII guard: set the per-phase budget to `ms` for the test, reset on drop.
+    struct PhaseBudgetGuard;
+    impl PhaseBudgetGuard {
+        fn set(ms: u64) -> Self {
+            PHASE_BUDGET_MS_TEST_OVERRIDE.store(ms, std::sync::atomic::Ordering::Relaxed);
+            Self
+        }
+    }
+    impl Drop for PhaseBudgetGuard {
+        fn drop(&mut self) {
+            PHASE_BUDGET_MS_TEST_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A brain whose every `complete` SLEEPS past any short test timeout, then
+    /// would return valid verdict JSON. Used to prove the advisory-consult /
+    /// phase-budget timeouts fire and fail open BEFORE the sleep resolves.
+    struct SlowRuntime;
+
+    #[async_trait]
+    impl Runtime for SlowRuntime {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, RuntimeError> {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(CompletionResponse {
+                text: "{\"unmet\":[],\"commercial_ready\":true,\"notes\":\"ok\"}".into(),
+                id: "slow".into(),
+                model: "slow".into(),
+                usage: Usage::default(),
+            })
+        }
+    }
+
     struct FakeRuntime;
 
     #[async_trait]
@@ -6499,6 +6803,183 @@ error TS2304: Cannot find name 'Foo'
         let v = v.expect("JSON verdict should parse");
         assert!(!v.commercial_ready);
         assert_eq!(v.unmet, vec!["登录功能未实现".to_string()]);
+    }
+
+    // ── Wave-2 stabilization: budgets / timeouts / heartbeats ──────────────
+
+    #[test]
+    fn timeout_env_helpers_default_and_clamp() {
+        // No test override + (assumed) no env → the compiled defaults.
+        // (These env vars aren't set in CI; the helpers fail open to the const.)
+        assert_eq!(advisory_timeout().as_secs(), ADVISORY_TIMEOUT_SECS);
+        assert_eq!(phase_budget().as_secs(), PHASE_BUDGET_SECS);
+        assert_eq!(run_budget().as_secs(), RUN_BUDGET_SECS);
+        // A test override wins and is honoured in ms; the guard resets on drop.
+        {
+            let _g = AdvisoryTimeoutGuard::set(50);
+            assert_eq!(advisory_timeout().as_millis(), 50);
+        }
+        assert_eq!(advisory_timeout().as_secs(), ADVISORY_TIMEOUT_SECS);
+        {
+            let _g = PhaseBudgetGuard::set(40);
+            assert_eq!(phase_budget().as_millis(), 40);
+        }
+        assert_eq!(phase_budget().as_secs(), PHASE_BUDGET_SECS);
+    }
+
+    #[tokio::test]
+    async fn advisory_consult_times_out_fail_open_to_none() {
+        // A brain that sleeps 30s past a 50ms advisory cap → the consult must
+        // fail open to None WELL before the sleep resolves (so the caller falls
+        // back to its deterministic heuristic instead of hanging).
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into();
+        let runner = AgentRunner::new(SlowRuntime, o);
+        let _g = AdvisoryTimeoutGuard::set(50);
+        let started = std::time::Instant::now();
+        let v: Option<AcceptanceVerdict> = runner.consult("judge", "x".into()).await;
+        assert!(
+            v.is_none(),
+            "a timed-out advisory consult must fail open to None"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "must return at the cap, not wait the full 30s sleep"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_phase_budget_overrun_preserves_artifacts_and_flags_degraded() {
+        // A phase body that WRITES a file and then overruns the budget must:
+        // (1) return (None, true) so the caller flags degraded, (2) emit a [warn]
+        // budget Note, and (3) leave the already-written file on disk untouched.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+        let _g = PhaseBudgetGuard::set(60);
+        let marker = tmp.path().join("partial-artifact.txt");
+        let marker_for_body = marker.clone();
+        let (out, timed_out): (Option<()>, bool) = runner
+            .with_phase_budget(Phase::Research, async move {
+                // Side effect lands on disk BEFORE the overrun, mirroring a phase
+                // that wrote a partial artifact then ran long.
+                std::fs::write(&marker_for_body, "partial").unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            })
+            .await;
+        assert!(out.is_none(), "an overrun body yields no output");
+        assert!(timed_out, "overrun must report timed_out=true");
+        assert!(
+            marker.exists(),
+            "the partial artifact the body already wrote must be preserved"
+        );
+        assert!(
+            sink.events().iter().any(|e| matches!(
+                e,
+                EngineEvent::Note(n) if n.starts_with("[warn]") && n.contains("时间预算")
+            )),
+            "must emit a [warn] budget-overrun Note"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_phase_budget_within_budget_passes_output_through() {
+        // A fast body finishes within budget → (Some(out), false), no warn Note.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+        // Large budget; the body is instant.
+        let (out, timed_out) = runner
+            .with_phase_budget(Phase::Spec, async { 99_u32 })
+            .await;
+        assert_eq!(out, Some(99));
+        assert!(!timed_out);
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n.starts_with("[warn]"))),
+            "a within-budget phase must not emit a budget warn"
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_intake_plan_announces_before_consulting() {
+        // The one-shot intake consult must emit a leading "智能评审中…" Note so it
+        // isn't a silent stall at the start of a run. (FakeRuntime replies non-JSON
+        // → the verdict fails open, but the announce Note must still have fired.)
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into();
+        let runner = AgentRunner::new(FakeRuntime, o).with_event_sink(Arc::new(sink.clone()));
+        runner.surface_intake_plan().await;
+        assert!(
+            sink.events().iter().any(|e| matches!(
+                e,
+                EngineEvent::Note(n) if n.contains("智能评审中") && n.starts_with("[plan]")
+            )),
+            "surface_intake_plan must announce before the consult"
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_intake_plan_stays_silent_when_offline() {
+        // Offline (no brain) → no announce Note (don't promise a review we can't run).
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let runner = AgentRunner::new(umadev_runtime::OfflineRuntime::default(), opts(tmp.path()))
+            .with_event_sink(Arc::new(sink.clone()));
+        runner.surface_intake_plan().await;
+        assert!(
+            !sink
+                .events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("智能评审中"))),
+            "offline run must not announce an intake review"
+        );
+    }
+
+    #[tokio::test]
+    async fn surface_docs_assessment_announces_before_consulting() {
+        // With real docs on disk, the docs-gate review consult must announce first.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-prd.md"),
+            "# PRD\n\n## Goals\nbuild login",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# Arch\n\n## API\n- POST /login",
+        )
+        .unwrap();
+        let sink = RecordingSink::new();
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into();
+        let runner = AgentRunner::new(FakeRuntime, o).with_event_sink(Arc::new(sink.clone()));
+        runner.surface_docs_assessment("demo").await;
+        assert!(
+            sink.events().iter().any(|e| matches!(
+                e,
+                EngineEvent::Note(n) if n.contains("智能评审中") && n.starts_with("[docs]")
+            )),
+            "surface_docs_assessment must announce before the consult"
+        );
     }
 
     #[test]
