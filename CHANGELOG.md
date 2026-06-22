@@ -2,6 +2,12 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.7] — 安装健壮性：全局命令 PATH 兜底
+
+### 修复 / 改进
+
+- **安装后 PATH 兜底**：`npm i -g umadev` 后，若命令所在目录不在 `$PATH` 上（Homebrew node 等环境的常见坑——npm 全局 bin 落在 PATH 之外），装完会立刻打印清晰的双语警告 + 一行修复命令，而不是让用户事后撞上一句无解释的 "command not found"。**fail-open**：该检测每条路径都以退出码 0 结束、整体 `try/catch` 包裹，绝不会让 `npm install` 失败；仅对全局安装（`npm i -g`）生效，命令目录已在 PATH 上时完全静默。包本身与 1.0.6 一致（Rust 二进制无变化）。
+
 ## [1.0.6] — Windows 检测铁桶 · 交互硬化 · 锁与稳定性（含角色裁判团 · 自我进化记忆 · brownfield · 部署/PR · 信任分级）
 
 ### 修复与交互硬化（本轮重点）
