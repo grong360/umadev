@@ -582,6 +582,7 @@
 "continuous.dangerous_action_denied" = "[gate] 危险动作需用户确认,本回合按拒绝处理:{} -> {}"
 "continuous.tool_call_blocked" = "[gov] {} 阶段:底座工具调用触发 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 阶段被截断(底座到达回合上限),保留已产出,继续。"
+"continuous.phase_truncated_degraded" = "[降级] {} 阶段被截断且关键产物缺失({}),产出不完整——下游质量门/硬门会拦截。请重跑或 /continue 补全。"
 "continuous.node.docs" = "文档门"
 "continuous.node.preview" = "预览门"
 "continuous.node.quality" = "质量"

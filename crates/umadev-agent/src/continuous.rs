@@ -416,7 +416,9 @@ async fn drive_phase(
                     return PhaseResult::Failed(format!("respond: {e}"));
                 }
             }
-            SessionEvent::TurnDone { status } => return finish_turn(events, phase, status),
+            SessionEvent::TurnDone { status } => {
+                return finish_turn(options, events, phase, status)
+            }
         }
     }
 }
@@ -529,22 +531,100 @@ fn approval_decision(mode: TrustMode, action: &str, target: &str) -> ApprovalDec
 }
 
 /// Turn the [`TurnStatus`] into a [`PhaseResult`] + the right operator note.
-fn finish_turn(events: &Arc<dyn EventSink>, phase: Phase, status: TurnStatus) -> PhaseResult {
+///
+/// On [`TurnStatus::Truncated`] the work is partial — we still ACCEPT it
+/// (fail-open: the deterministic hard / quality gates downstream are the real
+/// stop signals, and forcing a `Failed` here would hard-stop a run that may have
+/// produced usable output). But before, a truncated phase was reported with the
+/// SAME soft Note whether it left a complete deliverable or nothing at all, so a
+/// Docs phase truncated after writing only the PRD (no architecture / UI-UX)
+/// slipped past silently and the critic team then fail-open-ACCEPTed the empty
+/// surfaces. Now a truncation is split: if the phase's KEY artifacts exist, it is
+/// the benign "ran long but finished the deliverable" case (the soft Note); if
+/// they are MISSING, it is a genuinely incomplete phase, surfaced with a stronger
+/// DEGRADED warning so the operator (and the downstream gates) treat the output
+/// as suspect rather than clean.
+fn finish_turn(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    phase: Phase,
+    status: TurnStatus,
+) -> PhaseResult {
     match status {
         TurnStatus::Completed => PhaseResult::Done,
         TurnStatus::Truncated => {
-            // The base hit a turn/budget ceiling with partial work. Accept what
-            // exists and move on (the hard gate / verify floor catches an
-            // empty result downstream) — but flag it so the block boundary can
-            // warn the output may be incomplete.
-            events.emit(EngineEvent::Note(umadev_i18n::tlf(
-                "continuous.phase_truncated",
-                &[phase.id()],
-            )));
+            let missing = truncated_missing_artifacts(options, phase);
+            if missing.is_empty() {
+                // Partial-but-complete: the deliverable exists, just produced over
+                // the turn budget. Benign — the soft warning, then proceed.
+                events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "continuous.phase_truncated",
+                    &[phase.id()],
+                )));
+            } else {
+                // Truncated AND the key deliverable is missing → DEGRADED. We still
+                // proceed (fail-open), but the stronger warning names what's absent
+                // so the downstream quality/hard gates are the ones that decide.
+                events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "continuous.phase_truncated_degraded",
+                    &[phase.id(), &missing.join(", ")],
+                )));
+            }
             PhaseResult::Done
         }
         TurnStatus::Interrupted => PhaseResult::Failed(format!("{} interrupted", phase.id())),
         TurnStatus::Failed(reason) => PhaseResult::Failed(reason),
+    }
+}
+
+/// The KEY deliverables a phase MUST have produced, that are MISSING on disk —
+/// the existence check a truncated phase is held to. Empty = the phase left its
+/// expected output (so a truncation there is benign); non-empty = a genuinely
+/// incomplete phase (→ the DEGRADED warning). Pure + fail-open: an unreadable
+/// workspace simply yields "nothing missing" rather than a panic, so this check
+/// can never itself wedge or hard-stop a run.
+///
+/// - `Docs` → the three core documents (`prd` / `architecture` / `uiux`): a Docs
+///   turn truncated after only the PRD must NOT slip through as clean.
+/// - `Spec` → the execution-plan artifact (`*-execution-plan.md`) — the canonical
+///   spec surface `run_spec` writes; lenient (the base may name the tasks file
+///   variously) so a real plan never trips a false degraded warning.
+/// - `Frontend` / `Backend` → at least one real source file in the tree (the same
+///   "produced real code" surface the zero-source hard gate keys off).
+/// - other phases (research / quality / delivery / gates) have no single
+///   file-existence invariant here → never reported missing (the soft path).
+fn truncated_missing_artifacts(options: &RunOptions, phase: Phase) -> Vec<String> {
+    let slug = options.effective_slug();
+    let root = &options.project_root;
+    // A doc is "present" only when it exists AND is non-trivially sized (a 0-byte
+    // touch is not a deliverable). Fail-open: an unreadable path reads as absent.
+    let doc_present = |name: &str| -> bool {
+        let p = root.join(format!("output/{slug}-{name}.md"));
+        std::fs::metadata(&p).map(|m| m.len() > 16).unwrap_or(false)
+    };
+    match phase {
+        Phase::Docs => ["prd", "architecture", "uiux"]
+            .into_iter()
+            .filter(|n| !doc_present(n))
+            .map(|n| format!("{n}.md"))
+            .collect(),
+        Phase::Spec => {
+            if doc_present("execution-plan") {
+                Vec::new()
+            } else {
+                vec!["execution-plan.md".to_string()]
+            }
+        }
+        Phase::Frontend | Phase::Backend => {
+            if crate::acceptance::source_files(root).is_empty() {
+                vec!["source files".to_string()]
+            } else {
+                Vec::new()
+            }
+        }
+        // No single existence invariant → the soft path.
+        Phase::Research | Phase::Quality | Phase::Delivery => Vec::new(),
+        Phase::DocsConfirm | Phase::PreviewConfirm => Vec::new(),
     }
 }
 
@@ -1289,15 +1369,20 @@ async fn run_review_team(
         &[kind_label(kind), &team.len().to_string()],
     )));
 
-    // PARALLEL: fork one read-only session per seat up front (each `fork()` is a
-    // quick `&mut` borrow that returns an OWNED, independent session), then drive
-    // every critic concurrently — the reviews hold only their own forks, never
-    // the main session. `fork()` is independent per call, so the N reviews never
-    // collide and never touch the main writer (single-writer invariant). A fork
-    // failure is per-seat fail-open: that seat consults nothing and ACCEPTS.
+    // Fork one read-only session per seat up front. `fork()` takes `&mut self`, so
+    // the N establishments are necessarily SERIAL (you can't hold N `&mut` borrows
+    // of the main session at once) — but each returns an OWNED, independent session,
+    // so the REVIEW turns below run CONCURRENTLY (`join_all_ordered`), which is where
+    // the wall-clock actually goes (a fork handshake is cheap, a judge turn is a full
+    // base round-trip). Each `fork()` is bounded by a TIMEOUT so a base whose fork
+    // handshake wedges (codex/opencode never returning `initialize`, whose reader
+    // only errors when the base closes) can NEVER freeze the whole gate: a timed-out
+    // fork degrades to an `Err`, which `review_one` already treats as a fail-open
+    // ACCEPT (that seat consults nothing). `fork()` is independent per call, so the
+    // reviews never collide and never touch the main writer (single-writer invariant).
     let mut forks = Vec::with_capacity(team.len());
     for _ in team {
-        forks.push(session.fork().await);
+        forks.push(fork_with_timeout(session).await);
     }
     let reviews = team
         .iter()
@@ -1331,6 +1416,25 @@ async fn run_review_team(
         }
     }
     blocking
+}
+
+/// Establish ONE read-only fork, bounded by [`fork_establish_timeout`]. A fork
+/// handshake that wedges (e.g. a codex/opencode base that never returns its
+/// `initialize`, whose stdout reader only errors once the base CLOSES) would
+/// otherwise hang here forever and freeze the entire gate — `judge` has its own
+/// turn timeout, but it never runs if the fork never finishes opening. The
+/// timeout converts that hang into a [`SessionError::Start`], which `review_one`
+/// already treats as a fail-open ACCEPT (the seat consults nothing). Fail-open by
+/// contract: a wedged fork degrades one seat to advisory-accept, never blocks.
+async fn fork_with_timeout(
+    session: &mut dyn BaseSession,
+) -> Result<Box<dyn BaseSession>, SessionError> {
+    match tokio::time::timeout(fork_establish_timeout(), session.fork()).await {
+        Ok(res) => res,
+        Err(_) => Err(SessionError::Start(
+            "fork handshake timed out — seat fail-open ACCEPT".to_string(),
+        )),
+    }
 }
 
 /// Drive ONE critic over its (possibly failed) fork, fail-open to an accepting
@@ -1653,6 +1757,23 @@ fn review_turn_timeout() -> std::time::Duration {
         )
 }
 
+/// Timeout for ESTABLISHING one read-only fork (the `initialize`/`thread/fork`/
+/// `POST /session` handshake), distinct from the per-turn judge timeout above. A
+/// fork that never completes its handshake must not freeze the gate, so a stuck
+/// `fork()` is bounded and degraded to a fail-open ACCEPT. Kept short (the
+/// handshake is cheap when healthy) but overridable via
+/// `UMADEV_FORK_ESTABLISH_TIMEOUT_SECS` for slow machines / CI.
+fn fork_establish_timeout() -> std::time::Duration {
+    std::env::var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or_else(
+            || std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs,
+        )
+}
+
 /// Short, LOCALIZED human label for a review node (for operator Notes). Routes
 /// through the i18n catalog so the node name follows the user's UI language.
 fn kind_label(kind: ReviewKind) -> &'static str {
@@ -1706,6 +1827,10 @@ mod tests {
         fork_script: Arc<Mutex<std::collections::VecDeque<Option<String>>>>,
         /// How many forks were opened (asserted by tests).
         forks_opened: Arc<Mutex<usize>>,
+        /// When true, `fork()` AWAITS FOREVER instead of returning — models a base
+        /// whose fork handshake wedges (never returns `initialize`). The
+        /// `fork_with_timeout` wrapper must bound it and fail-open to ACCEPT.
+        fork_hangs: bool,
     }
 
     impl FakeBaseSession {
@@ -1718,11 +1843,18 @@ mod tests {
                 die: false,
                 fork_script: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 forks_opened: Arc::new(Mutex::new(0)),
+                fork_hangs: false,
             }
         }
         fn dying() -> Self {
             let mut s = Self::new(vec![]);
             s.die = true;
+            s
+        }
+        /// A session whose every `fork()` hangs forever (a wedged fork handshake).
+        fn fork_wedged() -> Self {
+            let mut s = Self::new(vec![vec![done()], vec![done()]]);
+            s.fork_hangs = true;
             s
         }
         /// Script the successive `fork()` calls with the given verdict replies
@@ -1755,6 +1887,11 @@ mod tests {
     impl BaseSession for FakeBaseSession {
         async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
             *self.forks_opened.lock().unwrap() += 1;
+            // A wedged fork handshake: await forever so `fork_with_timeout` must be
+            // the thing that ends the wait (fail-open ACCEPT), not this returning.
+            if self.fork_hangs {
+                std::future::pending::<()>().await;
+            }
             // Pop the next scripted fork outcome. An empty script → a default
             // accepting verdict (so a test that doesn't care still gets a clean,
             // fail-open ACCEPT). `None` → this fork fails (fail-open path).
@@ -1970,6 +2107,123 @@ mod tests {
 
         let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
         assert!(matches!(outcome, RunOutcome::HardStop(_)));
+    }
+
+    // ── Truncated turn: degraded when key artifacts missing (P2-3) ─────────
+
+    #[test]
+    fn truncated_missing_artifacts_flags_incomplete_docs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Guarded);
+        // Nothing written → a truncated Docs phase is missing ALL three docs.
+        let missing = truncated_missing_artifacts(&options, Phase::Docs);
+        assert_eq!(missing.len(), 3, "all three docs missing: {missing:?}");
+
+        // Write only the PRD → a Docs truncation is STILL degraded (architecture +
+        // uiux absent). This is exactly the slip the fix closes.
+        let dir = tmp.path().join("output");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("demo-prd.md"), "# PRD\n\nsubstantive content body").unwrap();
+        let missing = truncated_missing_artifacts(&options, Phase::Docs);
+        assert!(
+            missing.iter().any(|m| m.contains("architecture"))
+                && missing.iter().any(|m| m.contains("uiux")),
+            "partial docs still flagged: {missing:?}"
+        );
+        assert!(
+            !missing.iter().any(|m| m.contains("prd")),
+            "the written PRD is not flagged: {missing:?}"
+        );
+
+        // All three present → a truncation there is benign (nothing missing).
+        for n in ["architecture", "uiux"] {
+            std::fs::write(
+                dir.join(format!("demo-{n}.md")),
+                format!("# {n}\n\nsubstantive content body"),
+            )
+            .unwrap();
+        }
+        assert!(
+            truncated_missing_artifacts(&options, Phase::Docs).is_empty(),
+            "complete docs → benign truncation"
+        );
+    }
+
+    #[test]
+    fn truncated_missing_artifacts_for_code_phases_checks_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Guarded);
+        // No source → a truncated Frontend/Backend is degraded.
+        assert!(!truncated_missing_artifacts(&options, Phase::Frontend).is_empty());
+        assert!(!truncated_missing_artifacts(&options, Phase::Backend).is_empty());
+        // With source present → benign.
+        seed_source(tmp.path());
+        assert!(truncated_missing_artifacts(&options, Phase::Frontend).is_empty());
+        // Phases with no single existence invariant are never flagged.
+        assert!(truncated_missing_artifacts(&options, Phase::Quality).is_empty());
+        assert!(truncated_missing_artifacts(&options, Phase::Research).is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_docs_with_missing_artifacts_emits_degraded_warning() {
+        // End-to-end: a Docs phase that TRUNCATES having written nothing must emit
+        // the stronger DEGRADED warning (not the benign soft truncation note), so a
+        // half-finished docs phase no longer slips through silently.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, rec) = sink();
+        // research clean, docs TRUNCATED (no files written).
+        let trunc = SessionEvent::TurnDone {
+            status: TurnStatus::Truncated,
+        };
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![trunc]]);
+
+        let _ = run_block(&mut session, &options, &events, Phase::Research).await;
+
+        // A DEGRADED note (not just the soft truncated note) must have fired — match
+        // the language-independent marker present in every catalog string.
+        let evs = rec.events();
+        let degraded = evs.iter().any(|e| {
+            matches!(e, EngineEvent::Note(n)
+                if n.contains("DEGRADED") || n.contains("降级"))
+        });
+        assert!(
+            degraded,
+            "a truncated docs phase with missing artifacts must warn DEGRADED: {evs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_docs_with_all_artifacts_is_benign_soft_note() {
+        // The benign case: a Docs phase truncates but the three docs DO exist (ran
+        // long, still produced the deliverable) → the soft truncated note, NOT the
+        // degraded one.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, rec) = sink();
+        let trunc = SessionEvent::TurnDone {
+            status: TurnStatus::Truncated,
+        };
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![trunc]]);
+
+        let _ = run_block(&mut session, &options, &events, Phase::Research).await;
+
+        let evs = rec.events();
+        // No DEGRADED note when the deliverables are all present.
+        assert!(
+            !evs.iter().any(|e| matches!(e, EngineEvent::Note(n)
+                if n.contains("DEGRADED") || n.contains("降级"))),
+            "complete docs → no degraded warning: {evs:?}"
+        );
     }
 
     // ── Hard gate: plan demands code but zero source produced ──────────────
@@ -2326,6 +2580,52 @@ mod tests {
             sent.lock().unwrap().len(),
             2,
             "fork-fail fail-open → no rework"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_with_timeout_fails_open_accept_on_wedged_handshake() {
+        // P2-4: a base whose fork handshake WEDGES (never returns) must not freeze
+        // the gate. `fork_with_timeout` bounds it; the timed-out fork degrades to an
+        // Err → `review_one` fail-open ACCEPTs → no blocking → the gate proceeds.
+        // Use a tiny timeout via the env override so the test is fast; restore it.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        let saved = std::env::var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS").ok();
+        std::env::set_var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS", "1");
+
+        let mut session = FakeBaseSession::fork_wedged();
+        let sent = session.sent_handle();
+        let forks = session.forks_handle();
+
+        // Bound the WHOLE run too, as a backstop: if the timeout regressed this
+        // would hang forever, so the test asserts it returns well under the cap.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_block(&mut session, &options, &events, Phase::Research),
+        )
+        .await
+        .expect("run must not hang on a wedged fork — the timeout must fire");
+
+        match saved {
+            Some(v) => std::env::set_var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_FORK_ESTABLISH_TIMEOUT_SECS"),
+        }
+
+        // The gate still PAUSED (the wedged forks all fail-open ACCEPT → no rework).
+        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        // Forks WERE attempted (one per seat), and no rework was injected.
+        assert!(*forks.lock().unwrap() >= 1, "forks were attempted");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "wedged-fork fail-open → research + docs only, no rework"
         );
     }
 

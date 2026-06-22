@@ -582,6 +582,7 @@
 "continuous.dangerous_action_denied" = "[gate] Irreversible action needs user confirmation; denied this turn: {} -> {}"
 "continuous.tool_call_blocked" = "[gov] {} phase: base tool call tripped {} — {} (target: {})"
 "continuous.phase_truncated" = "[warn] {} phase was truncated (base hit its turn limit); keeping what was produced, continuing."
+"continuous.phase_truncated_degraded" = "[DEGRADED] {} phase was truncated AND its key deliverables are missing ({}); the output is incomplete — the quality/hard gates downstream will catch this. Re-run or /continue to finish."
 "continuous.node.docs" = "docs gate"
 "continuous.node.preview" = "preview gate"
 "continuous.node.quality" = "quality"

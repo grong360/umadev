@@ -755,9 +755,24 @@ fn emit_file_change(item: &Value, event_tx: &EventTx) {
     } else {
         "Edit"
     };
+    // CONTENT for content-governance (emoji / hardcoded color / secret / AI-slop).
+    // codex's `fileChange` item does NOT carry the new file text in a `content`
+    // field — it carries a unified `diff`. The orchestrator's `evaluate_tool_call`
+    // scans `input.content` / `input.new_string`, which would be EMPTY for codex,
+    // so codex writes would dodge the content scan entirely (and codex has no
+    // PreToolUse hook to backstop it). We extract the ADDED lines from the diff
+    // and surface them as `content` so the same scanner sees the real written text.
+    // Best-effort: when no diff is present the field is simply absent (the scanner
+    // then degrades to path-only, exactly as before — fail-open, never a panic).
+    let added = first_change_added_content(item);
+    let input = if added.is_empty() {
+        json!({ "file_path": path })
+    } else {
+        json!({ "file_path": path, "content": added })
+    };
     let _ = event_tx.send(SessionEvent::ToolCall {
         name: name.to_string(),
-        input: json!({ "file_path": path }),
+        input,
     });
     let status = item.get("status").and_then(Value::as_str).unwrap_or("");
     let _ = event_tx.send(SessionEvent::ToolResult {
@@ -774,6 +789,88 @@ fn first_change_kind(item: &Value) -> String {
     } else {
         k
     }
+}
+
+/// The new file CONTENT a `fileChange` item wrote, recovered for content
+/// governance. codex's item does not expose a plain `content` field — it exposes
+/// either a `content` (some shapes do), a unified `diff` string, or `changes[]`
+/// entries each carrying their own `content`/`diff`. We prefer an explicit
+/// `content`, else reconstruct the ADDED text from the diff(s): the lines a
+/// unified diff prefixes with `+` (excluding the `+++` file header) ARE the new
+/// content, which is exactly what the emoji / color / secret / AI-slop scanner
+/// needs to see. Pure + fail-open: an absent/odd shape yields `String::new()`
+/// (the scanner then degrades to path-only), never a panic.
+fn first_change_added_content(item: &Value) -> String {
+    // An explicit top-level `content` (rare but cheapest) wins.
+    if let Some(c) = item.get("content").and_then(Value::as_str) {
+        if !c.is_empty() {
+            return c.to_string();
+        }
+    }
+    // Otherwise reconstruct from every `changes[]` entry's content/diff. We fold
+    // ALL entries (a single item can touch multiple hunks) so nothing escapes.
+    let mut out = String::new();
+    if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+        for ch in changes {
+            if let Some(c) = ch.get("content").and_then(Value::as_str) {
+                push_block(&mut out, c);
+            } else if let Some(diff) = ch.get("diff").and_then(Value::as_str) {
+                push_block(&mut out, &added_lines_of_diff(diff));
+            }
+        }
+    }
+    // A top-level `diff` (some item shapes put it there) as a final fallback.
+    if out.is_empty() {
+        if let Some(diff) = item.get("diff").and_then(Value::as_str) {
+            out = added_lines_of_diff(diff);
+        }
+    }
+    out
+}
+
+/// Append `block` to `acc` separated by a newline (skips empties).
+fn push_block(acc: &mut String, block: &str) {
+    if block.is_empty() {
+        return;
+    }
+    if !acc.is_empty() {
+        acc.push('\n');
+    }
+    acc.push_str(block);
+}
+
+/// Extract the ADDED lines from a unified diff: every line starting with a single
+/// `+` (but NOT the `+++` new-file header), with the leading `+` stripped. A
+/// string that is not a diff at all (no `@@`/`+++`/`---` markers, no `+`-prefixed
+/// lines) is returned verbatim so a base that already hands us plain content
+/// still gets scanned. Pure.
+fn added_lines_of_diff(diff: &str) -> String {
+    // If there is no diff structure AND no added-line markers, treat it as plain
+    // content (some bases put the raw new text in the `diff` field).
+    let looks_like_diff = diff.lines().any(|l| {
+        l.starts_with("@@")
+            || l.starts_with("+++")
+            || l.starts_with("---")
+            || l.starts_with('+')
+            || l.starts_with('-')
+    });
+    if !looks_like_diff {
+        return diff.to_string();
+    }
+    let mut out = String::new();
+    for line in diff.lines() {
+        // `+++ b/path` is a header, not content. A bare `+` line is added content.
+        if let Some(rest) = line.strip_prefix('+') {
+            if rest.starts_with("++") {
+                continue; // the `+++` file header
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(rest);
+        }
+    }
+    out
 }
 
 /// Emit a [`SessionEvent::TurnDone`] from a `turn/completed` payload and clear
@@ -1128,6 +1225,103 @@ mod tests {
             panic!("expected ToolCall");
         };
         assert_eq!(name, "Edit", "kind=update → Edit");
+    }
+
+    #[test]
+    fn added_lines_of_diff_extracts_added_text_only() {
+        // A real unified diff: only the `+` lines (minus the `+++` header) are the
+        // new content; context + removed lines are dropped.
+        assert_eq!(
+            added_lines_of_diff("--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n keep\n-gone\n+next\n+more\n"),
+            "next\nmore"
+        );
+        // A non-diff string (no markers) is returned verbatim so plain content is
+        // still scanned.
+        assert_eq!(
+            added_lines_of_diff("plain new file body"),
+            "plain new file body"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_change_surfaces_added_content_for_governance() {
+        // The P2-1 fix: a codex `fileChange` item carries a DIFF, not a `content`
+        // field. The translator must reconstruct the added text into `input.content`
+        // so the orchestrator's content scanner (emoji / color / secret / AI-slop)
+        // actually sees what codex wrote — otherwise codex writes dodge governance
+        // (codex has no PreToolUse hook to backstop it).
+        let (tx, mut rx) = chan();
+        emit_item(
+            &json!({
+                "type": "fileChange",
+                "status": "completed",
+                "changes": [{
+                    "path": "src/x.tsx",
+                    "kind": "add",
+                    "diff": "+++ b/src/x.tsx\n@@ -0,0 +1,2 @@\n+const color = \"#ff0000\";\n+const ok = 1;\n",
+                }],
+            }),
+            &tx,
+        );
+        let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
+            panic!("expected ToolCall");
+        };
+        assert_eq!(name, "Write");
+        assert_eq!(input["file_path"], "src/x.tsx");
+        // The reconstructed content carries the ADDED lines, including the hardcoded
+        // color the governance scanner must catch — the whole point of the fix.
+        let content = input["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("#ff0000"),
+            "added content must reach the scanner: {content}"
+        );
+        assert!(!content.contains("+++"), "the +++ header is not content");
+    }
+
+    #[tokio::test]
+    async fn file_change_with_explicit_content_is_surfaced_directly() {
+        // Some shapes DO carry a `content` per change — prefer it verbatim, so an
+        // emoji in the written text still reaches the scanner. The emoji is built
+        // via a `\u{...}` escape so this source file stays emoji-free (UD-CODE-001).
+        let (tx, mut rx) = chan();
+        let rocket = '\u{1F680}'.to_string();
+        emit_item(
+            &json!({
+                "type": "fileChange",
+                "status": "completed",
+                "changes": [{ "path": "a.md", "kind": "add", "content": format!("# Title {rocket} launch") }],
+            }),
+            &tx,
+        );
+        let SessionEvent::ToolCall { input, .. } = rx.recv().await.unwrap() else {
+            panic!("expected ToolCall");
+        };
+        let content = input["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains('\u{1F680}'),
+            "explicit content (with its emoji) reaches the scanner: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_change_without_content_degrades_to_path_only() {
+        // No diff / content at all → no `content` key (the scanner degrades to
+        // path-only, exactly as before — fail-open, never a spurious empty scan
+        // that masquerades as "clean").
+        let (tx, mut rx) = chan();
+        emit_item(
+            &v(
+                r#"{"type":"fileChange","status":"completed","changes":[{"path":"b.rs","kind":"update"}]}"#,
+            ),
+            &tx,
+        );
+        let SessionEvent::ToolCall { input, .. } = rx.recv().await.unwrap() else {
+            panic!("expected ToolCall");
+        };
+        assert!(
+            input.get("content").is_none(),
+            "no recoverable content → no content key: {input}"
+        );
     }
 
     #[tokio::test]

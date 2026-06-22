@@ -1201,9 +1201,11 @@ pub async fn session_for(
         }
         "opencode" => {
             // `build` agent; pass the model through only when non-empty so the
-            // base falls back to its own configured default otherwise.
+            // base falls back to its own configured default otherwise. `autonomous`
+            // selects the permission ruleset (wildcard allow vs guarded ask), so
+            // opencode's gate posture matches codex / claude.
             let model = (!model.is_empty()).then_some(model);
-            let s = OpenCodeSession::start(workspace, Some("build"), model).await?;
+            let s = OpenCodeSession::start(workspace, Some("build"), model, autonomous).await?;
             Ok(Box::new(s))
         }
         other => Err(umadev_runtime::SessionError::Start(format!(

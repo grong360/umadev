@@ -582,6 +582,7 @@
 "continuous.dangerous_action_denied" = "[gate] 危險動作需使用者確認,本回合按拒絕處理:{} -> {}"
 "continuous.tool_call_blocked" = "[gov] {} 階段:底座工具呼叫觸發 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 階段被截斷(底座到達回合上限),保留已產出,繼續。"
+"continuous.phase_truncated_degraded" = "[降級] {} 階段被截斷且關鍵產物缺失({}),產出不完整——下游品質關卡/硬關卡會攔截。請重跑或 /continue 補全。"
 "continuous.node.docs" = "文件關卡"
 "continuous.node.preview" = "預覽關卡"
 "continuous.node.quality" = "品質"

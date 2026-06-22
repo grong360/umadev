@@ -134,14 +134,25 @@ impl OpenCodeSession {
     /// pick its default. `model` is an opencode provider/model id
     /// (`provider/model`); `None` (the default) uses whatever model the base is
     /// already configured with — UmaDev injects no model endpoint of its own.
+    ///
+    /// `autonomous` selects the session's permission ruleset, mirroring codex's
+    /// `approvalPolicy` tiering so all three bases behave consistently: `true`
+    /// (the `auto` trust tier) installs a wildcard `allow` ruleset so the agentic
+    /// loop runs silently; `false` (the `guarded` tier) installs a finer ruleset
+    /// that routes writes / dangerous bash through `permission.asked` (→ a
+    /// `NeedApproval` the orchestrator answers), so the guarded human-in-the-loop
+    /// posture is the same on opencode as on codex (`on-request`) and claude
+    /// (`default`). Governance still audits every tool call via the event stream
+    /// regardless of tier.
     pub async fn start(
         workspace: &Path,
         agent: Option<&str>,
         model: Option<&str>,
+        autonomous: bool,
     ) -> Result<Self, SessionError> {
         let program =
             std::env::var("UMADEV_OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
-        Self::start_with_program(&program, workspace, agent, model).await
+        Self::start_with_program(&program, workspace, agent, model, autonomous).await
     }
 
     /// Start a session against an explicit `program` (mainly for tests, where
@@ -153,9 +164,17 @@ impl OpenCodeSession {
         workspace: &Path,
         agent: Option<&str>,
         model: Option<&str>,
+        autonomous: bool,
     ) -> Result<Self, SessionError> {
-        Self::start_with_program_timeout(program, workspace, agent, model, serve_start_timeout())
-            .await
+        Self::start_with_program_timeout(
+            program,
+            workspace,
+            agent,
+            model,
+            autonomous,
+            serve_start_timeout(),
+        )
+        .await
     }
 
     /// Start with an explicit serve-start `timeout` — the testable core, so a
@@ -166,6 +185,7 @@ impl OpenCodeSession {
         workspace: &Path,
         agent: Option<&str>,
         model: Option<&str>,
+        autonomous: bool,
         serve_timeout: Duration,
     ) -> Result<Self, SessionError> {
         let password = random_password();
@@ -208,9 +228,10 @@ impl OpenCodeSession {
 
         let http = HttpCtx::new(base_url, &password, workspace);
 
-        // Open the one session for the whole run, with a wildcard ruleset so
-        // tool calls are pre-approved (no per-event permission round-trip).
-        let session_id = match http.create_session(agent, model).await {
+        // Open the one session for the whole run. The ruleset follows the autonomy
+        // tier (`autonomous` → wildcard allow; guarded → writes/dangerous bash ask),
+        // so opencode's gate posture matches codex / claude.
+        let session_id = match http.create_session(agent, model, autonomous).await {
             Ok(id) => id,
             Err(e) => {
                 let _ = child.start_kill();
@@ -443,20 +464,22 @@ impl HttpCtx {
             .header("x-opencode-directory", &self.directory)
     }
 
-    /// `POST /session` with a wildcard permission ruleset (pre-approve all tool
-    /// calls so the agentic loop runs without per-event round-trips). Returns
-    /// the created `session.id`. The `model` here, if any, uses CREATE's shape
-    /// `{id,providerID,variant?}` (distinct from prompt's `{providerID,modelID}`).
+    /// `POST /session` with a permission ruleset chosen by the autonomy tier
+    /// (see [`session_ruleset`]). Returns the created `session.id`. The `model`
+    /// here, if any, uses CREATE's shape `{id,providerID,variant?}` (distinct from
+    /// prompt's `{providerID,modelID}`).
     async fn create_session(
         &self,
         agent: Option<&str>,
         model: Option<&str>,
+        autonomous: bool,
     ) -> Result<String, String> {
         let mut body = json!({
-            // Ruleset: `[{permission,pattern,action}]` (permission.ts Rule).
-            // `*`/`*`/`allow` = "approve every tool call" so writes/bash are
-            // silent. Governance still audits via the tool-call event stream.
-            "permission": [{ "permission": "*", "pattern": "*", "action": "allow" }],
+            // Ruleset: `[{permission,pattern,action}]` (permission.ts Rule). The
+            // tier picks it: autonomous → wildcard allow (silent); guarded →
+            // writes / dangerous bash `ask` (→ `permission.asked`). Governance
+            // still audits every tool call via the event stream regardless.
+            "permission": session_ruleset(autonomous),
         });
         if let Some(a) = agent {
             body["agent"] = json!(a);
@@ -867,6 +890,51 @@ fn split_provider_model(id: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Build the `POST /session` permission ruleset for the autonomy tier — the
+/// opencode counterpart of codex's `approvalPolicy` (`never` vs `on-request`) and
+/// claude's `--permission-mode` (`acceptEdits` vs `default`), so all three bases
+/// share ONE gate posture.
+///
+/// - `autonomous == true` (the `auto` trust tier): a single wildcard `allow` rule
+///   — every tool call is silently pre-approved, the agentic loop runs without a
+///   per-event round-trip. Governance still audits each call via the event stream.
+/// - `autonomous == false` (the `guarded` tier): writes (`edit`/`write`) and
+///   DANGEROUS bash patterns route to `ask`, so the server raises
+///   `permission.asked` (→ a `NeedApproval` the orchestrator answers via the
+///   trust-tiered `approval_decision`); everything else stays `allow`. opencode
+///   evaluates rules so that a more specific pattern wins, so the broad `*/*`
+///   `allow` is the floor and the narrower `ask` rules override it for the
+///   sensitive surfaces. Mirrors codex's `on-request` (where the server asks
+///   before a command/file change) — a consistent human-in-the-loop tier.
+///
+/// **Fail-open posture:** the guarded ruleset is the CONSERVATIVE choice (it asks
+/// rather than silently allowing), so even if a finer rule fails to register the
+/// session never silently runs an ungoverned write — at worst it asks more than
+/// needed, which the orchestrator answers. Pure; exposed for tests.
+#[must_use]
+pub fn session_ruleset(autonomous: bool) -> Value {
+    if autonomous {
+        // The whole loop runs silently (audited, not gated).
+        return json!([{ "permission": "*", "pattern": "*", "action": "allow" }]);
+    }
+    // Guarded: allow by default, but ASK before a write / a dangerous shell verb.
+    // Order matters only for human readability — opencode resolves by specificity,
+    // not array order — so the broad allow comes first as the floor.
+    json!([
+        { "permission": "*", "pattern": "*", "action": "allow" },
+        { "permission": "edit", "pattern": "*", "action": "ask" },
+        { "permission": "write", "pattern": "*", "action": "ask" },
+        // Destructive / irreversible shell verbs the orchestrator must vet. The
+        // patterns mirror the dangerous-bash floor governance enforces elsewhere.
+        { "permission": "bash", "pattern": "rm *", "action": "ask" },
+        { "permission": "bash", "pattern": "*rm -rf*", "action": "ask" },
+        { "permission": "bash", "pattern": "git push*", "action": "ask" },
+        { "permission": "bash", "pattern": "*sudo *", "action": "ask" },
+        { "permission": "bash", "pattern": "*curl *", "action": "ask" },
+        { "permission": "bash", "pattern": "*wget *", "action": "ask" },
+    ])
+}
+
 /// The fixed `opencode serve` argument vector: loopback host, OS-assigned port.
 /// Exposed for tests.
 #[must_use]
@@ -1261,7 +1329,10 @@ mod tests {
         // Build a session directly against the fake server (bypass the serve
         // spawn — that path is covered by the unix fake-sh port-parse test).
         let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
-        let session_id = http.create_session(Some("build"), None).await.unwrap();
+        let session_id = http
+            .create_session(Some("build"), None, true)
+            .await
+            .unwrap();
         assert_eq!(session_id, "ses_fake");
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAP);
@@ -1338,6 +1409,126 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn session_ruleset_autonomous_is_wildcard_allow() {
+        // The `auto` tier: one wildcard `allow` rule — the loop runs silently.
+        let r = session_ruleset(true);
+        let arr = r.as_array().expect("ruleset is an array");
+        assert_eq!(arr.len(), 1, "autonomous = a single wildcard rule");
+        assert_eq!(arr[0]["permission"], "*");
+        assert_eq!(arr[0]["pattern"], "*");
+        assert_eq!(arr[0]["action"], "allow");
+    }
+
+    #[test]
+    fn session_ruleset_guarded_asks_on_writes_and_dangerous_bash() {
+        // The `guarded` tier: allow is the floor, but writes/edits and dangerous
+        // shell verbs route to `ask` so the server raises `permission.asked`
+        // (→ NeedApproval) — opencode's counterpart of codex `on-request`.
+        let r = session_ruleset(false);
+        let arr = r.as_array().expect("ruleset is an array");
+        // There is a broad allow floor …
+        assert!(
+            arr.iter()
+                .any(|x| x["permission"] == "*" && x["action"] == "allow"),
+            "guarded keeps a broad allow floor: {arr:?}"
+        );
+        // … and an `ask` rule for each write permission.
+        for perm in ["edit", "write"] {
+            assert!(
+                arr.iter()
+                    .any(|x| x["permission"] == perm && x["action"] == "ask"),
+                "guarded must ASK before a {perm}: {arr:?}"
+            );
+        }
+        // … and at least one dangerous-bash `ask` rule.
+        assert!(
+            arr.iter()
+                .any(|x| x["permission"] == "bash" && x["action"] == "ask"),
+            "guarded must ASK before a dangerous bash verb: {arr:?}"
+        );
+        // No rule silently DENIES (the floor is allow/ask, never a blanket deny —
+        // that's the read-only fork's posture, not the main writer's).
+        assert!(
+            !arr.iter().any(|x| x["action"] == "deny"),
+            "the guarded main session never blanket-denies: {arr:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_create_session_sends_ask_ruleset() {
+        // End-to-end: a guarded (`autonomous = false`) create_session POSTs the
+        // ask-on-writes ruleset, so opencode will raise `permission.asked` for a
+        // write — the same human-in-the-loop posture codex gets from `on-request`.
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // The guarded body carries an `ask` action (not pure wildcard allow).
+                assert!(
+                    req.contains("\"action\":\"ask\""),
+                    "guarded session must request an ask ruleset: {req}"
+                );
+                let body = br#"{"id":"ses_guarded"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body).await;
+            }
+        });
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let id = http
+            .create_session(Some("build"), None, false)
+            .await
+            .expect("guarded session created");
+        assert_eq!(id, "ses_guarded");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn autonomous_create_session_sends_pure_allow_ruleset() {
+        // The auto tier POSTs a pure wildcard allow — no `ask`, so the loop never
+        // pauses for a per-write approval.
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                assert!(
+                    req.contains("\"action\":\"allow\"") && !req.contains("\"action\":\"ask\""),
+                    "autonomous session must request a pure allow ruleset: {req}"
+                );
+                let body = br#"{"id":"ses_auto"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body).await;
+            }
+        });
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let id = http
+            .create_session(Some("build"), None, true)
+            .await
+            .expect("autonomous session created");
+        assert_eq!(id, "ses_auto");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn create_session_fails_open_on_http_error() {
         use tokio::net::TcpListener;
@@ -1356,7 +1547,7 @@ mod tests {
         });
         let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
         // A 500 surfaces as an Err string, not a panic (fail-open at the caller).
-        let res = http.create_session(None, None).await;
+        let res = http.create_session(None, None, true).await;
         assert!(res.is_err(), "HTTP 500 must surface as Err: {res:?}");
         server.abort();
     }
@@ -1439,6 +1630,7 @@ mod tests {
             dir.path(),
             None,
             None,
+            true,
             Duration::from_secs(10),
         )
         .await
@@ -1464,6 +1656,7 @@ mod tests {
             dir.path(),
             None,
             None,
+            true,
             Duration::from_secs(1),
         )
         .await;

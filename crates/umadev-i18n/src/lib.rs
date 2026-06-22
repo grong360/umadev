@@ -403,6 +403,7 @@ mod tests {
             "continuous.dangerous_action_denied",
             "continuous.tool_call_blocked",
             "continuous.phase_truncated",
+            "continuous.phase_truncated_degraded",
             "continuous.node.docs",
             "continuous.node.preview",
             "continuous.node.quality",

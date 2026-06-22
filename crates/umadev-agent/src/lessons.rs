@@ -1597,11 +1597,41 @@ const BELIEF_MIN_CLUSTER: usize = 2;
 /// can't bloat a long-lived repo. Lowest-evidence, oldest beliefs evict first.
 const MAX_BELIEFS: usize = 200;
 
-/// The `"domain\u{0}title"` evidence key of a lesson — the stable identity a
-/// belief stores per folded lesson. `first_seen` is intentionally omitted so a
-/// recurrence under a refreshed timestamp still resolves to the same evidence.
+/// The stable evidence key a belief stores per folded lesson:
+/// `"domain\u{0}title\u{0}<advice-hash>"`. `first_seen` is intentionally OMITTED so
+/// a true recurrence under a refreshed timestamp still resolves to the same key
+/// (the original intent). But `domain\0title` ALONE collided: the belief titles are
+/// template-generated, so two genuinely-DIFFERENT lessons from different runs could
+/// share `domain\0title` and then a belief covering one would wrongly demote /
+/// downgrade the other (P2-7). Folding in a short hash of the ADVICE CONTENT
+/// (root_cause + fix) disambiguates different lessons while a real recurrence (same
+/// advice) still hashes identically — so the recurrence-matching intent is kept and
+/// the collision is closed. Pure + deterministic.
 fn evidence_key(l: &Lesson) -> String {
-    format!("{}\u{0}{}", l.domain, l.title)
+    format!(
+        "{}\u{0}{}\u{0}{:016x}",
+        l.domain,
+        l.title,
+        advice_content_hash(l)
+    )
+}
+
+/// A stable 64-bit hash of a lesson's ADVICE CONTENT (`root_cause` + `fix`) — the
+/// disambiguator folded into [`evidence_key`] so two lessons that merely share a
+/// template-generated `domain\0title` but carry DIFFERENT advice get different
+/// keys, while a true recurrence of the same advice hashes the same. Uses the std
+/// `DefaultHasher` (SipHash with FIXED keys → deterministic across processes for a
+/// given std version), so a re-fold in a later run still matches a previously-
+/// persisted key. Fail-open even if the std algorithm ever changed: a key that no
+/// longer matches just mints a fresh belief (which `prune_beliefs` caps), never a
+/// panic or a wrong demotion.
+fn advice_content_hash(l: &Lesson) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    l.root_cause.trim().hash(&mut h);
+    "\u{0}".hash(&mut h);
+    l.fix.trim().hash(&mut h);
+    h.finish()
 }
 
 /// Fold the current raw lessons into the belief ledger: cluster similar
@@ -1650,18 +1680,34 @@ pub fn fold_beliefs(project_root: &Path) -> usize {
         let members: Vec<&Lesson> = cluster.iter().map(|&i| pool[i]).collect();
         let ev_keys: std::collections::BTreeSet<String> =
             members.iter().map(|l| evidence_key(l)).collect();
-        // Does an existing belief already cover any of these lessons? If so,
-        // UPDATE it (supersede with the refreshed, possibly-larger evidence set).
-        let existing = beliefs
-            .iter_mut()
-            .find(|b| b.evidence.iter().any(|k| ev_keys.contains(k)));
+        // Which existing beliefs already cover ANY of these lessons? A cluster can
+        // span MORE THAN ONE prior belief (two earlier folds whose evidence the new,
+        // larger cluster now unifies). Pre-fix only the FIRST overlapping belief was
+        // UPDATEd and the rest survived as duplicates (P2-7); now we collect ALL of
+        // them, fold the cluster into the first, and REMOVE the others so the cluster
+        // ends as exactly ONE belief — the union, not a leftover duplicate.
+        let matching: Vec<usize> = beliefs
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.evidence.iter().any(|k| ev_keys.contains(k)))
+            .map(|(i, _)| i)
+            .collect();
         let folded = fold_one_cluster(&members, &ev_keys, &now);
-        if let Some(b) = existing {
-            // Carry trust forward (accumulated belief reputation), refresh the
-            // rule + evidence set + freshness stamp.
-            let carried_trust = b.trust;
-            *b = folded;
-            b.trust = carried_trust;
+        if let Some(&keep) = matching.first() {
+            // Carry the STRONGEST accumulated trust across every merged belief (a
+            // belief proven across folds shouldn't lose reputation on a merge), then
+            // refresh the rule + evidence set + freshness stamp on the kept slot.
+            let carried_trust = matching
+                .iter()
+                .map(|&i| beliefs[i].trust)
+                .fold(folded.trust, f32::max);
+            beliefs[keep] = folded;
+            beliefs[keep].trust = carried_trust;
+            // Drop every OTHER overlapping belief (high index → low so the earlier
+            // removals don't shift the indices we still need to remove).
+            for &idx in matching.iter().skip(1).rev() {
+                beliefs.remove(idx);
+            }
         } else {
             beliefs.push(folded);
         }
@@ -1854,14 +1900,77 @@ const CONTRA_TOPIC_OVERLAP: i64 = 4;
 
 /// Maximum body text Jaccard (token-set overlap) for two same-topic lessons to
 /// count as CONTRADICTORY — the SECOND half. Below this, two lessons share the
-/// topic but phrase their advice so differently they likely disagree. `0.25`:
-/// the bodies share at most a quarter of their tokens.
+/// topic but phrase their advice so differently they MIGHT disagree. `0.25`: the
+/// bodies share at most a quarter of their tokens. NOTE: low overlap alone is NOT
+/// enough — two lessons that AGREE but are worded differently also score low here,
+/// so a third gate ([`antonym_conflict`]) is required before we INVALIDATE.
 const CONTRA_TEXT_SIM_MAX: f64 = 0.25;
 
-/// Scan the raw ledgers for same-topic / different-text lesson pairs (likely
-/// contradictions) and route each hit through the INVALIDATE path, marking the
-/// OLDER lesson invalid. Returns how many lessons were invalidated. Bounded
-/// O(n²); deterministic; pure-local; fail-open.
+/// Minimum advice-token count BOTH lessons must clear before a low-overlap pair is
+/// even eligible to be judged a contradiction. Two very short / boilerplate-
+/// dominated advices trivially fail the Jaccard gate (few tokens → low overlap)
+/// without actually disagreeing, so a pair where EITHER side is this thin is a
+/// NOOP — the heuristic abstains rather than risk a false invalidation.
+const CONTRA_MIN_ADVICE_TOKENS: usize = 4;
+
+/// Antonym pairs whose CO-OCCURRENCE across two same-topic lessons is the positive
+/// signal of a genuine contradiction: one lesson says "add / enable / always /
+/// use …", the other says the opposite. Requiring an explicit opposing verb makes
+/// the scan demand evidence of DISAGREEMENT, not merely different phrasing — the
+/// fix for "two lessons that agree but word it differently get mis-invalidated".
+/// Each entry is `(positive, negative)`; the check is symmetric (either lesson may
+/// hold either pole). Lowercased ASCII tokens (the advice is tokenised the same
+/// way), so this is language-light but covers the common engineering-advice verbs.
+const CONTRA_ANTONYMS: &[(&str, &str)] = &[
+    ("add", "remove"),
+    ("add", "drop"),
+    ("enable", "disable"),
+    ("always", "never"),
+    ("use", "avoid"),
+    ("prefer", "avoid"),
+    ("allow", "deny"),
+    ("allow", "block"),
+    ("include", "exclude"),
+    ("show", "hide"),
+    ("increase", "decrease"),
+    ("more", "fewer"),
+    ("more", "less"),
+    ("keep", "delete"),
+    ("create", "delete"),
+    ("open", "close"),
+    ("on", "off"),
+    ("required", "optional"),
+    ("sync", "async"),
+    ("synchronous", "asynchronous"),
+];
+
+/// Whether two lessons' advice carries OPPOSING verbs from [`CONTRA_ANTONYMS`] —
+/// the positive contradiction signal. True iff, for some antonym pair, ONE lesson's
+/// advice tokens contain the positive pole and the OTHER's contain the negative
+/// pole (in either assignment). Pure; tokenised exactly like the Jaccard gate so
+/// the two halves see the same token set.
+fn antonym_conflict(
+    a: &std::collections::HashSet<String>,
+    b: &std::collections::HashSet<String>,
+) -> bool {
+    CONTRA_ANTONYMS.iter().any(|(pos, neg)| {
+        let pos = (*pos).to_string();
+        let neg = (*neg).to_string();
+        (a.contains(&pos) && b.contains(&neg)) || (a.contains(&neg) && b.contains(&pos))
+    })
+}
+
+/// Scan the raw ledgers for same-topic lesson pairs that GENUINELY contradict —
+/// high topic overlap, low advice-text overlap, AND an explicit antonym conflict —
+/// and route each hit through the INVALIDATE path, marking the OLDER lesson
+/// invalid. Returns how many lessons were invalidated. Bounded O(n²);
+/// deterministic; pure-local; fail-open.
+///
+/// The antonym + min-token gates are the false-positive fix: low text overlap
+/// alone caught lessons that merely AGREE in different words. Now a pair must also
+/// show opposing verbs (add↔remove, always↔never, use↔avoid, …) and both sides
+/// must carry enough advice tokens to be judged at all — so "agree but worded
+/// differently" and "both short / boilerplate" pairs are NOOPs, not invalidations.
 pub fn scan_contradictions(project_root: &Path) -> usize {
     let raw = read_all_raw_lessons(project_root);
     let pool: Vec<&Lesson> = raw
@@ -1875,6 +1984,11 @@ pub fn scan_contradictions(project_root: &Path) -> usize {
         return 0;
     }
 
+    // Pre-tokenise once per lesson (each pair re-uses both token sets across the
+    // Jaccard + antonym gates) so the O(n²) scan does O(n) tokenisation.
+    let tokens: Vec<std::collections::HashSet<String>> =
+        pool.iter().map(|l| advice_tokens(l)).collect();
+
     let mut to_invalidate: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
     for i in 0..pool.len() {
@@ -1885,8 +1999,19 @@ pub fn scan_contradictions(project_root: &Path) -> usize {
             if lesson_similarity(a, b) < CONTRA_TOPIC_OVERLAP {
                 continue;
             }
-            // … but the advice text barely overlaps → likely contradictory.
-            if body_token_jaccard(a, b) > CONTRA_TEXT_SIM_MAX {
+            // … both sides carry enough advice to judge (skip thin/boilerplate) …
+            if tokens[i].len() < CONTRA_MIN_ADVICE_TOKENS
+                || tokens[j].len() < CONTRA_MIN_ADVICE_TOKENS
+            {
+                continue;
+            }
+            // … the advice text barely overlaps …
+            if jaccard_of(&tokens[i], &tokens[j]) > CONTRA_TEXT_SIM_MAX {
+                continue;
+            }
+            // … AND they carry explicitly OPPOSING verbs (the disagreement proof).
+            // Without this, "agree but worded differently" was mis-invalidated.
+            if !antonym_conflict(&tokens[i], &tokens[j]) {
                 continue;
             }
             // Mark the OLDER one stale (keep the fresher advice). Tie → keep `a`.
@@ -1900,18 +2025,21 @@ pub fn scan_contradictions(project_root: &Path) -> usize {
     apply_invalidations(project_root, &to_invalidate)
 }
 
-/// Jaccard similarity of two lessons' fix+root_cause+body token sets in `[0,1]`.
-/// Tokenised the same way the trigger query is (alnum words, len ≥ 3, plus CJK
-/// bigrams) so CJK advice is comparable too. Empty-on-both → `1.0` (identical
-/// emptiness is not a contradiction).
-fn body_token_jaccard(a: &Lesson, b: &Lesson) -> f64 {
-    let ta = advice_tokens(a);
-    let tb = advice_tokens(b);
+/// Jaccard of two pre-tokenised advice sets in `[0,1]` — the SECOND half of the
+/// contradiction test. The sets are tokenised the same way the trigger query is
+/// (alnum words len ≥ 3 + CJK bigrams) so CJK advice is comparable too.
+/// Empty-on-both → `1.0` (identical emptiness is not a contradiction). Pure; the
+/// scan pre-tokenises once per lesson and reuses the sets across this gate and the
+/// antonym gate.
+fn jaccard_of(
+    ta: &std::collections::HashSet<String>,
+    tb: &std::collections::HashSet<String>,
+) -> f64 {
     if ta.is_empty() && tb.is_empty() {
         return 1.0;
     }
-    let inter = ta.intersection(&tb).count();
-    let union = ta.union(&tb).count().max(1);
+    let inter = ta.intersection(tb).count();
+    let union = ta.union(tb).count().max(1);
     inter as f64 / union as f64
 }
 
@@ -4755,6 +4883,126 @@ mod tests {
         assert!(read_raw_lessons(tmp.path(), BELIEFS_FILE).is_empty());
     }
 
+    #[test]
+    fn evidence_key_disambiguates_same_title_different_content() {
+        // P2-7: two lessons sharing `domain` + (template-generated) `title` but with
+        // DIFFERENT advice must get DIFFERENT evidence keys, so a belief covering one
+        // can never wrongly demote / downgrade the other.
+        let base = mk_db_lesson(
+            "Belief: index (2 lessons)",
+            "create a covering index on the lookup columns",
+            "missing index slowed the report",
+            "2026-06-01T00:00:00Z",
+        );
+        let mut other = base.clone();
+        other.fix = "drop the redundant index to speed writes".into();
+        other.root_cause = "over-indexing bloated writes".into();
+        assert_ne!(
+            evidence_key(&base),
+            evidence_key(&other),
+            "same domain+title but different advice → different keys"
+        );
+        // A true recurrence (identical advice, refreshed timestamp) → SAME key, so
+        // the recurrence-matching intent is preserved.
+        let mut recurrence = base.clone();
+        recurrence.first_seen = "2026-09-09T00:00:00Z".into();
+        assert_eq!(
+            evidence_key(&base),
+            evidence_key(&recurrence),
+            "a recurrence of the same advice still resolves to the same key"
+        );
+    }
+
+    #[test]
+    fn fold_beliefs_merges_all_overlapping_beliefs_no_duplicate() {
+        // P2-7: when a later, larger cluster's evidence spans TWO previously-minted
+        // beliefs, the re-fold must MERGE them into ONE (the union) — never leave a
+        // stale duplicate. Construct two disjoint sub-clusters that each mint their
+        // own belief, then add a bridging lesson so they unify into one cluster.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Helper: a lesson whose keywords decide clustering. Two pairs that DON'T
+        // cross-cluster initially (disjoint keyword sets, same domain gives only a
+        // +1 bonus — below the fold threshold of 3 without shared keywords).
+        let mk = |title: &str, kw: &[&str], fix: &str, when: &str| Lesson {
+            kind: LessonKind::Failure,
+            domain: "frontend".into(),
+            title: title.into(),
+            body: String::new(),
+            fix: fix.into(),
+            root_cause: format!("root for {title}"),
+            keywords: kw.iter().map(|k| (*k).to_string()).collect(),
+            source_requirement: "r".into(),
+            first_seen: when.into(),
+            signature: String::new(),
+            occurrences: 1,
+            context: Vec::new(),
+            efficacy: None,
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        };
+
+        // Cluster X: two lessons sharing keywords {color, token}.
+        // Cluster Y: two lessons sharing keywords {layout, grid}.
+        let x1 = mk(
+            "x1",
+            &["color", "token"],
+            "use color tokens A",
+            "2026-06-01T00:00:00Z",
+        );
+        let x2 = mk(
+            "x2",
+            &["color", "token"],
+            "use color tokens B",
+            "2026-06-02T00:00:00Z",
+        );
+        let y1 = mk(
+            "y1",
+            &["layout", "grid"],
+            "use a grid layout A",
+            "2026-06-03T00:00:00Z",
+        );
+        let y2 = mk(
+            "y2",
+            &["layout", "grid"],
+            "use a grid layout B",
+            "2026-06-04T00:00:00Z",
+        );
+        write_raw_lessons(root, "quality-failures.jsonl", &[x1, x2, y1, y2]);
+
+        // First fold → two separate beliefs (X and Y don't share enough keywords).
+        assert_eq!(fold_beliefs(root), 2, "two disjoint clusters → two beliefs");
+        assert_eq!(read_raw_lessons(root, BELIEFS_FILE).len(), 2);
+
+        // Now add a BRIDGE lesson sharing keywords with BOTH clusters, so the next
+        // fold unifies x* + y* + bridge into ONE cluster whose evidence overlaps
+        // BOTH existing beliefs.
+        let mut rows = read_raw_lessons(root, "quality-failures.jsonl");
+        rows.push(mk(
+            "bridge",
+            &["color", "token", "layout", "grid"],
+            "tie color tokens to the grid layout",
+            "2026-06-05T00:00:00Z",
+        ));
+        write_raw_lessons(root, "quality-failures.jsonl", &rows);
+
+        fold_beliefs(root);
+        let beliefs = read_raw_lessons(root, BELIEFS_FILE);
+        assert_eq!(
+            beliefs.len(),
+            1,
+            "the bridging cluster MERGES the two beliefs into one (no duplicate): {:?}",
+            beliefs.iter().map(|b| &b.title).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            beliefs[0].evidence_count, 5,
+            "the merged belief folds all five lessons"
+        );
+    }
+
     // ---- ③ non-pitfall / belief trust reflux (P1-C) --------------------
 
     /// A surfaced NON-pitfall lesson's identity is snapshotted at recall time and
@@ -4903,6 +5151,147 @@ mod tests {
         assert!(read_raw_lessons(tmp.path(), "quality-failures.jsonl")
             .iter()
             .all(|l| !l.invalidated));
+    }
+
+    /// Build two same-topic lessons whose advice text barely overlaps but does NOT
+    /// disagree — they AGREE, just worded differently. Pre-fix the low Jaccard alone
+    /// invalidated the older one (a false positive); the antonym gate must spare it.
+    fn mk_db_lesson(title: &str, fix: &str, root: &str, when: &str) -> Lesson {
+        Lesson {
+            kind: LessonKind::Failure,
+            domain: "database".into(),
+            title: title.into(),
+            body: String::new(),
+            fix: fix.into(),
+            root_cause: root.into(),
+            keywords: vec![
+                "database".into(),
+                "index".into(),
+                "query".into(),
+                "postgres".into(),
+            ],
+            source_requirement: "r".into(),
+            first_seen: when.into(),
+            signature: String::new(),
+            occurrences: 1,
+            context: Vec::new(),
+            efficacy: None,
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn scan_contradictions_spares_agreeing_but_differently_worded_advice() {
+        // P2-6: same topic, LOW text overlap, but the two advices AGREE (both say
+        // "create a composite index") — they merely use different vocabulary. No
+        // antonym conflict → the heuristic must NOOP (no false invalidation).
+        let tmp = TempDir::new().unwrap();
+        let older = mk_db_lesson(
+            "indexing A",
+            "create a composite covering index spanning the lookup columns",
+            "sequential scans dominated the slow report query plan",
+            "2026-06-01T00:00:00Z",
+        );
+        let newer = mk_db_lesson(
+            "indexing B",
+            "build a multicolumn btree so the planner reaches rows directly",
+            "full table reads bottlenecked dashboard latency badly here",
+            "2026-06-20T00:00:00Z",
+        );
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &[older, newer]);
+
+        let n = scan_contradictions(tmp.path());
+        assert_eq!(
+            n, 0,
+            "agreeing-but-differently-worded advice must NOT be invalidated"
+        );
+        assert!(read_raw_lessons(tmp.path(), "quality-failures.jsonl")
+            .iter()
+            .all(|l| !l.invalidated));
+    }
+
+    #[test]
+    fn scan_contradictions_still_catches_real_opposing_advice() {
+        // The true-positive must survive the tightening: opposing verbs (add ↔ drop,
+        // always ↔ avoid) present → still invalidate the OLDER one.
+        let tmp = TempDir::new().unwrap();
+        let older = mk_db_lesson(
+            "indexing add",
+            "always add a btree index on every filtered column for speed",
+            "missing indexes slowed reads across the board significantly",
+            "2026-06-01T00:00:00Z",
+        );
+        let newer = mk_db_lesson(
+            "indexing drop",
+            "avoid over indexing and drop redundant indexes to keep writes fast",
+            "too many indexes bloated writes and storage badly here",
+            "2026-06-20T00:00:00Z",
+        );
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &[older, newer]);
+
+        let n = scan_contradictions(tmp.path());
+        assert_eq!(
+            n, 1,
+            "genuine opposing advice still invalidates the older one"
+        );
+        let rows = read_raw_lessons(tmp.path(), "quality-failures.jsonl");
+        assert!(
+            rows.iter()
+                .find(|l| l.title == "indexing add")
+                .unwrap()
+                .invalidated
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|l| l.title == "indexing drop")
+                .unwrap()
+                .invalidated
+        );
+    }
+
+    #[test]
+    fn scan_contradictions_noops_on_thin_boilerplate_pairs() {
+        // P2-6: both advices are very short / boilerplate-dominated → too few tokens
+        // to judge → NOOP, even if they share the topic and overlap is low.
+        let tmp = TempDir::new().unwrap();
+        let older = mk_db_lesson("thin A", "fix it", "broke", "2026-06-01T00:00:00Z");
+        let newer = mk_db_lesson("thin B", "redo it", "failed", "2026-06-20T00:00:00Z");
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &[older, newer]);
+        assert_eq!(
+            scan_contradictions(tmp.path()),
+            0,
+            "thin boilerplate advice must not be judged a contradiction"
+        );
+    }
+
+    #[test]
+    fn antonym_conflict_detects_opposing_verbs() {
+        let a: std::collections::HashSet<String> = ["always", "add", "index"]
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        let b: std::collections::HashSet<String> = ["avoid", "drop", "index"]
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        assert!(antonym_conflict(&a, &b), "add ↔ drop is an opposing pair");
+        // Agreement (no opposing pole) → no conflict.
+        let c: std::collections::HashSet<String> = ["create", "composite", "index"]
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        let d: std::collections::HashSet<String> = ["build", "multicolumn", "index"]
+            .iter()
+            .map(|s| (*s).into())
+            .collect();
+        assert!(
+            !antonym_conflict(&c, &d),
+            "agreeing advice carries no antonym"
+        );
     }
 
     // ---- ③ trust score (asymmetric + folded into decay) ----------------
