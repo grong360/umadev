@@ -566,10 +566,10 @@
 "doctor.overlay_title" = " 自我檢測 —— 按 Esc 關閉 "
 
 # --- 持續長會話執行路徑(CLI 輸出、TUI 區塊提示、階段 + 團隊評審提示) ---
-"continuous.session_active" = "持續會話已啟用({})。"
+"continuous.session_active" = "持續會話已啟用({})—— 預設的長會話路徑。"
 "continuous.session_unavailable" = "  [continuous] 會話不可用({});回退到單次逐階段路徑。"
 "continuous.auto_gate_resumed" = "[auto] 關卡 {} 已自動通過 —— 繼續推進。"
-"continuous.tui_session_unavailable" = "持續會話不可用({})—— 清除 UMADEV_CONTINUOUS 可改用逐階段路徑。"
+"continuous.tui_session_unavailable" = "持續會話不可用({})—— 設 UMADEV_CONTINUOUS=0 可改用逐階段路徑。"
 "continuous.block_aborted_busy" = "本輪已中止:本會話已有一個 run 佔用工作區(底座 {})。稍候片刻讓上一輪收尾後重試,或先 /status 查看目前進度。"
 "continuous.block_aborted_locked" = "本輪已中止:另一個 run 正佔用該工作區(底座 {})。\n{}"
 "continuous.block_aborted_io" = "本輪已中止:{} — {}"

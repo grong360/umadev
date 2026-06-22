@@ -566,10 +566,10 @@
 "doctor.overlay_title" = " doctor — press Esc to close "
 
 # --- Continuous long-session run path (CLI prints, TUI block notes, phase + team review notes) ---
-"continuous.session_active" = "Continuous session active ({})."
+"continuous.session_active" = "Continuous session active ({}) — the default long-session path."
 "continuous.session_unavailable" = "  [continuous] session unavailable ({}); falling back to the single-shot per-phase path."
 "continuous.auto_gate_resumed" = "[auto] gate {} auto-approved — resuming."
-"continuous.tui_session_unavailable" = "continuous session unavailable ({}) — clear UMADEV_CONTINUOUS to use the per-phase path."
+"continuous.tui_session_unavailable" = "continuous session unavailable ({}) — set UMADEV_CONTINUOUS=0 to use the per-phase path."
 "continuous.block_aborted_busy" = "This round was aborted: this session already has a run holding the workspace (base {}). Wait a moment for the previous round to finish and retry, or /status to see current progress."
 "continuous.block_aborted_locked" = "This round was aborted: another run is holding this workspace (base {}).\n{}"
 "continuous.block_aborted_io" = "This round was aborted: {} — {}"

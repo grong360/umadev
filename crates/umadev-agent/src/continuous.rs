@@ -61,19 +61,40 @@ use crate::trust::{requires_confirmation, TrustMode};
 /// N advisory base calls per round) so the wall-clock stays bounded.
 const MAX_REWORK_ROUNDS: usize = 2;
 
-/// Read the gradual-rollout switch for the continuous-session path.
+/// Whether a host-CLI run should drive the continuous long-session path.
 ///
-/// The single-shot path is the DEFAULT; this path is opt-in via
-/// `UMADEV_CONTINUOUS=1` so it can be A/B-tested and reverted without a code
-/// change. Read once at the app boundary (CLI / TUI), the same way
+/// The continuous path is now the DEFAULT (the architecture has formally closed
+/// on it): when the brain is a logged-in host CLI, a run drives ONE long-lived
+/// session for the whole pipeline. The single-shot per-phase path is retained as
+/// a FAIL-OPEN fallback, reachable by an explicit OPT-OUT so a run can be
+/// reverted in the field without a code change:
+///
+/// - `UMADEV_CONTINUOUS=0` / `false` / `off`  → single-shot (explicit disable)
+/// - `UMADEV_LEGACY_RUN=1` / `true` / `on`     → single-shot (legacy alias)
+/// - anything else (incl. unset)               → continuous (the default)
+///
+/// `UMADEV_CONTINUOUS` set to an explicit ON value (`1` / `true` / `on`) is still
+/// honoured as a force-on for symmetry, but it is no longer REQUIRED. Read once
+/// at the app boundary (CLI / TUI), the same way
 /// [`crate::runner::strict_coverage_from_env`] is, so a run sees a stable
 /// snapshot rather than a live process-global env read mid-run.
+///
+/// Fail-open by contract: this only SELECTS the path. If the continuous session
+/// can't actually start, the app boundary falls back to the single-shot driver
+/// (and a non-host / offline backend never reaches the continuous branch at all),
+/// so the run never dies just because the long-session brain was unreachable.
 #[must_use]
 pub fn continuous_enabled_from_env() -> bool {
-    matches!(
+    // Explicit opt-out wins (either the off-switch on the continuous var, or the
+    // legacy-run alias). Everything else — including unset — defaults to ON.
+    let opted_out = matches!(
         std::env::var("UMADEV_CONTINUOUS").as_deref(),
+        Ok("0" | "false" | "off")
+    ) || matches!(
+        std::env::var("UMADEV_LEGACY_RUN").as_deref(),
         Ok("1" | "true" | "on")
-    )
+    );
+    !opted_out
 }
 
 /// How a single continuous run finished.
@@ -2082,5 +2103,64 @@ mod tests {
         let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(*forks.lock().unwrap(), 0, "lean task opens no review forks");
+    }
+
+    /// The path selector now DEFAULTS to the continuous long-session path, and is
+    /// reachable back to single-shot only via an explicit opt-out. One serial test
+    /// covers every branch (the process env is shared, so it saves + restores both
+    /// vars and never leaves global state mutated). No other test in this crate
+    /// reads these vars, so this can't race a sibling.
+    #[test]
+    fn continuous_is_default_with_explicit_opt_out() {
+        let saved_c = std::env::var("UMADEV_CONTINUOUS").ok();
+        let saved_l = std::env::var("UMADEV_LEGACY_RUN").ok();
+
+        // Unset → DEFAULT ON (the architecture has closed on continuous).
+        std::env::remove_var("UMADEV_CONTINUOUS");
+        std::env::remove_var("UMADEV_LEGACY_RUN");
+        assert!(
+            continuous_enabled_from_env(),
+            "continuous must be the DEFAULT when nothing is set"
+        );
+
+        // Explicit opt-out via the off-switch on the continuous var → single-shot.
+        for off in ["0", "false", "off"] {
+            std::env::set_var("UMADEV_CONTINUOUS", off);
+            assert!(
+                !continuous_enabled_from_env(),
+                "UMADEV_CONTINUOUS={off} must opt OUT to single-shot"
+            );
+        }
+
+        // Explicit opt-out via the legacy-run alias → single-shot, even when the
+        // continuous var is left unset / on (opt-out wins).
+        std::env::remove_var("UMADEV_CONTINUOUS");
+        for on in ["1", "true", "on"] {
+            std::env::set_var("UMADEV_LEGACY_RUN", on);
+            assert!(
+                !continuous_enabled_from_env(),
+                "UMADEV_LEGACY_RUN={on} must opt OUT to single-shot"
+            );
+        }
+        std::env::remove_var("UMADEV_LEGACY_RUN");
+
+        // Explicit force-on still honoured (symmetry, no longer required).
+        for on in ["1", "true", "on"] {
+            std::env::set_var("UMADEV_CONTINUOUS", on);
+            assert!(
+                continuous_enabled_from_env(),
+                "UMADEV_CONTINUOUS={on} must keep continuous ON"
+            );
+        }
+
+        // Restore the global env exactly as we found it.
+        match saved_c {
+            Some(v) => std::env::set_var("UMADEV_CONTINUOUS", v),
+            None => std::env::remove_var("UMADEV_CONTINUOUS"),
+        }
+        match saved_l {
+            Some(v) => std::env::set_var("UMADEV_LEGACY_RUN", v),
+            None => std::env::remove_var("UMADEV_LEGACY_RUN"),
+        }
     }
 }

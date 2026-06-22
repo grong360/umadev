@@ -183,11 +183,13 @@ enum Command {
         /// destructive shell) are always confirmed, even in `auto`.
         #[arg(long, default_value = "guarded")]
         mode: String,
-        /// Drive the run over ONE continuous base session (the long-session
-        /// model — see `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`) instead of a
-        /// fresh per-phase base process. Opt-in + gradual-rollout: also enabled
-        /// by `UMADEV_CONTINUOUS=1`. Fail-open: if the continuous session can't
-        /// start, the run falls back to the existing single-shot path.
+        /// Force the continuous long-session path (one base session for the whole
+        /// run — see `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`). This is now the
+        /// DEFAULT for a host-CLI run, so the flag is rarely needed; it only
+        /// FORCES continuous on. To go back to the legacy per-phase single-shot
+        /// path, opt OUT with `UMADEV_CONTINUOUS=0` (or `UMADEV_LEGACY_RUN=1`).
+        /// Fail-open either way: if the continuous session can't start, the run
+        /// falls back to the single-shot path.
         #[arg(long)]
         continuous: bool,
     },
@@ -2022,10 +2024,13 @@ struct RunArgs {
     /// Trust / autonomy tier string (`plan` / `guarded` / `auto`); parsed into
     /// [`umadev_agent::TrustMode`] at the boundary, fail-open to `guarded`.
     mode: String,
-    /// Opt-in to the continuous long-session run path (one base session for the
-    /// whole run). OR'd with [`umadev_agent::continuous_enabled_from_env`] at
-    /// the boundary; fail-open back to the single-shot path if the session
-    /// can't start. `quick` never sets this.
+    /// Force the continuous long-session run path (one base session for the whole
+    /// run). The continuous path is now the DEFAULT for a host-CLI run via
+    /// [`umadev_agent::continuous_enabled_from_env`]; this flag only OR's in a
+    /// force-on (so `--continuous` still works, but is rarely needed). Opt OUT
+    /// back to single-shot with `UMADEV_CONTINUOUS=0` / `UMADEV_LEGACY_RUN=1`.
+    /// Fail-open back to single-shot if the session can't start. `quick` never
+    /// sets this (the lean track is already single-shot).
     continuous: bool,
 }
 
@@ -2301,14 +2306,19 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
             backend.id()
         );
 
-        // ── Continuous long-session path (opt-in, gradual rollout) ──────────
+        // ── Continuous long-session path (the DEFAULT for a host-CLI run) ────
         //
-        // When the user passed `--continuous` (or set `UMADEV_CONTINUOUS=1`),
-        // drive the WHOLE run over ONE live base session instead of a fresh
-        // per-phase base process. The two paths COEXIST and the switch picks
-        // between them. **Fail-open:** if the continuous session can't start, we
-        // fall through to the single-shot driver path below — the run never dies
-        // just because the long-session brain was unreachable.
+        // The architecture has formally closed on the continuous path: a host-CLI
+        // run drives the WHOLE pipeline over ONE live base session (context flows
+        // research → docs → code without re-priming) instead of a fresh per-phase
+        // base process. `continuous_enabled_from_env` is now default-ON and only an
+        // explicit opt-out (`UMADEV_CONTINUOUS=0` / `UMADEV_LEGACY_RUN=1`) selects
+        // the legacy single-shot path; `--continuous` still force-ON's it. The two
+        // paths COEXIST so the field is reversible without a code change.
+        // **Fail-open:** if the continuous session can't start, we fall through to
+        // the single-shot driver path below — the run never dies just because the
+        // long-session brain was unreachable. (Offline / non-host runs never reach
+        // this branch — it's inside `if let Some(backend)`.)
         let continuous = args.continuous || umadev_agent::continuous_enabled_from_env();
         if continuous {
             match umadev_host::session_for(

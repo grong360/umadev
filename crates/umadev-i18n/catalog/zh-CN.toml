@@ -566,10 +566,10 @@
 "doctor.overlay_title" = " 自检 —— 按 Esc 关闭 "
 
 # --- 持续长会话运行路径(CLI 打印、TUI 区块提示、阶段 + 团队评审提示) ---
-"continuous.session_active" = "持续会话已启用({})。"
+"continuous.session_active" = "持续会话已启用({})—— 默认的长会话路径。"
 "continuous.session_unavailable" = "  [continuous] 会话不可用({});回退到单次逐阶段路径。"
 "continuous.auto_gate_resumed" = "[auto] 门 {} 已自动通过 —— 继续推进。"
-"continuous.tui_session_unavailable" = "持续会话不可用({})—— 清除 UMADEV_CONTINUOUS 可改用逐阶段路径。"
+"continuous.tui_session_unavailable" = "持续会话不可用({})—— 设 UMADEV_CONTINUOUS=0 可改用逐阶段路径。"
 "continuous.block_aborted_busy" = "本轮已中止:本会话已有一个 run 占用工作区(底座 {})。稍候片刻让上一轮收尾后重试,或先 /status 查看当前进度。"
 "continuous.block_aborted_locked" = "本轮已中止:另一个 run 正占用该工作区(底座 {})。\n{}"
 "continuous.block_aborted_io" = "本轮已中止:{} — {}"

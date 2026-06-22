@@ -470,12 +470,15 @@ fn spawn_block(
 /// event loop. Empty (always `None`) unless the continuous path is enabled.
 type SessionHolder = Arc<tokio::sync::Mutex<Option<Box<dyn umadev_runtime::BaseSession>>>>;
 
-/// Read the gradual-rollout switch deciding whether the TUI's `run` intent flows
-/// through the **continuous long-session path** (one persistent director session)
-/// or the legacy per-phase single-shot path. Opt-in via `UMADEV_CONTINUOUS=1`
-/// (mirrors [`umadev_agent::continuous_enabled_from_env`]); the two paths coexist
-/// so this can be A/B-tested and reverted with no code change. Read at the spawn
-/// boundary so a run sees a stable snapshot.
+/// Decide whether the TUI's `run` intent flows through the **continuous
+/// long-session path** (one persistent director session) or the legacy per-phase
+/// single-shot path. The continuous path is now the DEFAULT (mirrors
+/// [`umadev_agent::continuous_enabled_from_env`]); an explicit opt-out
+/// (`UMADEV_CONTINUOUS=0` / `UMADEV_LEGACY_RUN=1`) selects the single-shot path.
+/// The two paths coexist so this is reversible in the field with no code change.
+/// Read at the spawn boundary so a run sees a stable snapshot. (At the call site
+/// this is further gated on the brain actually being a host CLI — an offline /
+/// non-host brain always stays on the single-shot path.)
 fn tui_continuous_enabled() -> bool {
     umadev_agent::continuous_enabled_from_env()
 }
@@ -517,8 +520,9 @@ fn continuous_autonomous(mode: umadev_agent::TrustMode) -> bool {
 /// **Fail-open:** if the session can't open (or a `Continue` arrives with no
 /// parked session and a fresh one can't open either), the block emits an
 /// `ABORT_SENTINEL` note (the same honest terminal-abort the single-shot path
-/// uses) and returns — the caller can retry, or the user falls back by clearing
-/// `UMADEV_CONTINUOUS`. It NEVER panics or wedges.
+/// uses) and returns — the caller can retry, or the user falls back to the
+/// single-shot path by opting out (`UMADEV_CONTINUOUS=0` / `UMADEV_LEGACY_RUN=1`).
+/// It NEVER panics or wedges.
 fn spawn_continuous_block(
     options: RunOptions,
     sink: Arc<ChannelSink>,
@@ -3141,14 +3145,37 @@ mod tests {
         assert!(!continuous_autonomous(umadev_agent::TrustMode::Plan));
     }
 
-    /// The rollout switch is OFF by default (the single-shot path stays the
-    /// default) — a missing/`0` env var keeps the legacy path.
+    /// The continuous path is now the DEFAULT (the architecture has closed on it):
+    /// with nothing set, the TUI selects continuous; an explicit opt-out
+    /// (`UMADEV_CONTINUOUS=0` / `UMADEV_LEGACY_RUN=1`) selects the legacy
+    /// single-shot path. Serial: saves + restores both vars (the process env is
+    /// shared) so it never leaves global state mutated.
     #[test]
-    fn tui_continuous_disabled_without_env() {
-        // The process env is shared, so only assert the DEFAULT-off contract
-        // when the var is not set to an on-value (don't mutate global env here).
-        if std::env::var("UMADEV_CONTINUOUS").as_deref() != Ok("1") {
-            assert!(!tui_continuous_enabled());
+    fn tui_continuous_default_on_with_opt_out() {
+        let saved_c = std::env::var("UMADEV_CONTINUOUS").ok();
+        let saved_l = std::env::var("UMADEV_LEGACY_RUN").ok();
+
+        // Unset → DEFAULT ON.
+        std::env::remove_var("UMADEV_CONTINUOUS");
+        std::env::remove_var("UMADEV_LEGACY_RUN");
+        assert!(tui_continuous_enabled(), "continuous is the default");
+
+        // Explicit opt-out → single-shot.
+        std::env::set_var("UMADEV_CONTINUOUS", "0");
+        assert!(!tui_continuous_enabled(), "UMADEV_CONTINUOUS=0 opts out");
+        std::env::set_var("UMADEV_CONTINUOUS", "1");
+        std::env::set_var("UMADEV_LEGACY_RUN", "1");
+        assert!(!tui_continuous_enabled(), "UMADEV_LEGACY_RUN=1 opts out");
+
+        // Restore.
+        std::env::remove_var("UMADEV_LEGACY_RUN");
+        match saved_c {
+            Some(v) => std::env::set_var("UMADEV_CONTINUOUS", v),
+            None => std::env::remove_var("UMADEV_CONTINUOUS"),
+        }
+        match saved_l {
+            Some(v) => std::env::set_var("UMADEV_LEGACY_RUN", v),
+            None => std::env::remove_var("UMADEV_LEGACY_RUN"),
         }
     }
 
