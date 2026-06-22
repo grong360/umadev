@@ -434,10 +434,14 @@ pub struct App {
     /// `apply_engine_event` returns and fires `Action::Continue`.
     pub pending_auto_continue: Option<Gate>,
 
-    /// A message the user typed WHILE the pipeline was mid-phase. We can't
-    /// inject it into the running base subprocess, so (like Claude Code queuing
-    /// a turn) we hold it until the next gap — a gate / phase boundary.
-    pub queued_steer: Option<String>,
+    /// Messages the user typed WHILE the pipeline was mid-phase. We can't
+    /// inject them into the running base subprocess, so (like Claude Code queuing
+    /// a turn) we hold them until the next gap — a gate / phase boundary. FIFO:
+    /// each extra steer the user types while a phase runs is appended, and all of
+    /// them are folded into the next gate's revision in order. A single `Option`
+    /// here used to silently OVERWRITE an earlier un-fired steer (and the
+    /// `queued N` chip stayed stuck at 1), losing input.
+    pub queued_steer: VecDeque<String>,
 
     /// Set by the gate handler when a [`queued_steer`] message is ready to fire
     /// at the just-opened gate. The event loop consumes it and re-runs the
@@ -559,7 +563,7 @@ impl App {
             run_started_at: None,
             phase_started_at: None,
             pending_auto_continue: None,
-            queued_steer: None,
+            queued_steer: VecDeque::new(),
             pending_steer: None,
             queued_chat: std::collections::VecDeque::new(),
             stream_tool_batch: None,
@@ -1270,7 +1274,11 @@ impl App {
                 // in as a revision (overriding both auto-approve and the manual
                 // pause). `active_gate` is already set above, so the loop knows
                 // which block produced this gate.
-                if let Some(text) = self.queued_steer.take() {
+                if !self.queued_steer.is_empty() {
+                    // Fold EVERY queued steer (FIFO) into one revision — a single
+                    // `Option` used to overwrite all but the last, silently
+                    // dropping the earlier turns.
+                    let text = self.queued_steer.drain(..).collect::<Vec<_>>().join("\n");
                     self.pending_steer = Some(text);
                     self.push(
                         ChatRole::UmaDev,
@@ -1329,7 +1337,8 @@ impl App {
                     // A message queued during a late phase (after both gates)
                     // never hit a gap — surface it rather than silently drop it,
                     // so the user knows to resend now that the run is done.
-                    if let Some(text) = self.queued_steer.take() {
+                    if !self.queued_steer.is_empty() {
+                        let text = self.queued_steer.drain(..).collect::<Vec<_>>().join("\n");
                         self.push(
                             ChatRole::System,
                             umadev_i18n::tf(self.lang, "run.queued_unsent", &[&text]),
@@ -1819,6 +1828,14 @@ impl App {
                 if self.is_pipeline_active() {
                     return Action::Cancel;
                 }
+                // An agentic execution turn (routed, not a pipeline run) is
+                // streaming in a real base subprocess. Esc must INTERRUPT it (not
+                // quit the app) — same as Ctrl-C's `agentic_in_flight` branch, so
+                // the subprocess is actually aborted via `Action::Cancel` rather
+                // than left running behind a dropped TUI.
+                if self.agentic_in_flight {
+                    return Action::Cancel;
+                }
                 // Idle → require a SECOND Esc to actually quit, so a stray
                 // keypress (or the very Esc that just interrupted a run) can't
                 // drop the whole app by accident.
@@ -2158,7 +2175,7 @@ impl App {
             // Pipeline is mid-phase (no gate open). We can't inject into the
             // running base subprocess, so QUEUE the message and fire it at the
             // next gap — gate / phase boundary — like Claude Code queuing a turn.
-            self.queued_steer = Some(text);
+            self.queued_steer.push_back(text);
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.queued"));
             Action::None
         }
@@ -2505,7 +2522,7 @@ impl App {
     /// the one-off System note scrolls away.
     #[must_use]
     pub fn queued_count(&self) -> usize {
-        self.queued_chat.len() + usize::from(self.queued_steer.is_some())
+        self.queued_chat.len() + self.queued_steer.len()
     }
 
     /// A bounded clone of the conversation memory to hand to a routed turn.
@@ -2569,9 +2586,9 @@ impl App {
         self.finished = false;
         self.run_started = false;
         self.active_gate = None;
-        // Drop any not-yet-fired queued steer so it can't bleed into a later
+        // Drop any not-yet-fired queued steers so they can't bleed into a later
         // run and fire at the wrong gate.
-        self.queued_steer = None;
+        self.queued_steer.clear();
         self.pending_steer = None;
     }
 
@@ -6445,15 +6462,79 @@ mod tests {
         }
         let action = a.apply_key(KeyCode::Enter);
         assert_eq!(action, Action::None);
-        assert_eq!(a.queued_steer.as_deref(), Some("make it dark mode"));
+        assert_eq!(
+            a.queued_steer
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["make it dark mode"]
+        );
         // At the next gate (the gap), the queued message is promoted to a
         // pending steer — fired as a revision — instead of auto-approving.
         a.apply_engine(EngineEvent::GateOpened {
             gate: Gate::DocsConfirm,
         });
-        assert!(a.queued_steer.is_none());
+        assert!(a.queued_steer.is_empty());
         assert_eq!(a.pending_steer.as_deref(), Some("make it dark mode"));
         assert!(a.pending_auto_continue.is_none());
+    }
+
+    #[test]
+    fn multiple_mid_phase_steers_queue_without_loss_and_count_correctly() {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "build".into(),
+        });
+        assert!(a.is_pipeline_active() && a.active_gate.is_none());
+        // Three separate mid-phase turns. The old `Option<String>` overwrote all
+        // but the last; a `VecDeque` keeps every one, in order.
+        for turn in ["first steer", "second steer", "third steer"] {
+            for c in turn.chars() {
+                let _ = a.apply_key(KeyCode::Char(c));
+            }
+            let action = a.apply_key(KeyCode::Enter);
+            assert_eq!(action, Action::None);
+        }
+        assert_eq!(
+            a.queued_steer
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["first steer", "second steer", "third steer"],
+            "every steer is retained in FIFO order — none overwritten"
+        );
+        // The `queued N` chip reflects all three, not a stuck 1.
+        assert_eq!(a.queued_count(), 3, "count is the real queue depth");
+        // At the next gate, ALL of them fold into one pending revision (in order).
+        a.apply_engine(EngineEvent::GateOpened {
+            gate: Gate::DocsConfirm,
+        });
+        assert!(a.queued_steer.is_empty(), "queue drained at the gate");
+        assert_eq!(
+            a.pending_steer.as_deref(),
+            Some("first steer\nsecond steer\nthird steer")
+        );
+        assert_eq!(a.queued_count(), 0);
+    }
+
+    #[test]
+    fn esc_during_agentic_turn_interrupts_not_quits() {
+        let mut a = fresh_app(Some("offline"));
+        // An agentic chat turn is streaming in a base subprocess — note this is
+        // NOT a pipeline run (`run_started` stays false), so the only thing that
+        // can interrupt it is the `agentic_in_flight` branch.
+        a.agentic_in_flight = true;
+        assert!(!a.is_pipeline_active());
+        // Esc INTERRUPTS the agentic subprocess (parity with Ctrl-C) and does NOT
+        // arm quit-confirm or drop the app.
+        let action = a.apply_key(KeyCode::Esc);
+        assert_eq!(action, Action::Cancel);
+        assert!(!a.should_quit);
+        assert!(
+            !a.pending_quit_confirm,
+            "Esc on an agentic turn interrupts, it does not arm quit-confirm"
+        );
     }
 
     // ---- resume hint on chat init ----
@@ -8077,10 +8158,10 @@ mod tests {
         a.queued_chat.push_back("a".into());
         a.queued_chat.push_back("b".into());
         assert_eq!(a.queued_count(), 2, "chat queue counts");
-        a.queued_steer = Some("steer".into());
+        a.queued_steer.push_back("steer".into());
         assert_eq!(a.queued_count(), 3, "a pending steer adds to the count");
         a.queued_chat.clear();
-        a.queued_steer = None;
+        a.queued_steer.clear();
         assert_eq!(a.queued_count(), 0, "clears back to zero");
     }
 }

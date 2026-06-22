@@ -364,6 +364,21 @@ fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Build the user-facing note for a failed `runner.start()`.
+///
+/// `WouldBlock` is NOT a hard error: it means THIS session already holds the
+/// run lock (the previous run is still finishing up its drop). Re-launching the
+/// run a beat later succeeds, so we surface a retriable hint instead of the
+/// generic `pipeline.start_failed` shout — the lock guard from the just-aborted
+/// run just hasn't been dropped yet.
+fn start_failed_note(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        umadev_i18n::tl("run.busy_reopen").to_string()
+    } else {
+        umadev_i18n::tlf("pipeline.start_failed", &[&e.to_string()])
+    }
+}
+
 fn spawn_block(
     options: RunOptions,
     spec: BrainSpec,
@@ -390,20 +405,14 @@ fn spawn_block(
         let outcome = match block {
             Block::Clarify => {
                 if let Err(e) = runner.start() {
-                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                        "pipeline.start_failed",
-                        &[&e.to_string()],
-                    )));
+                    sink.emit(EngineEvent::Note(start_failed_note(&e)));
                     return;
                 }
                 runner.run_clarify(use_runtime).await
             }
             Block::Initial => {
                 if let Err(e) = runner.start() {
-                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                        "pipeline.start_failed",
-                        &[&e.to_string()],
-                    )));
+                    sink.emit(EngineEvent::Note(start_failed_note(&e)));
                     return;
                 }
                 runner.run_initial_block(use_runtime, None).await
@@ -411,10 +420,7 @@ fn spawn_block(
             Block::Continue(gate) => runner.continue_from_gate(gate).await,
             Block::Light => {
                 if let Err(e) = runner.start() {
-                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                        "pipeline.start_failed",
-                        &[&e.to_string()],
-                    )));
+                    sink.emit(EngineEvent::Note(start_failed_note(&e)));
                     return;
                 }
                 runner.run_light(use_runtime).await
@@ -1267,10 +1273,8 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         // they fire at the first gate (instead of being dropped by
                         // the run reset). `prepare_worker_routed_run` already
                         // cleared the prior steer, so this is a clean handoff.
-                        let parked: Vec<String> =
-                            std::iter::from_fn(|| app.take_next_queued_chat()).collect();
-                        if !parked.is_empty() {
-                            app.queued_steer = Some(parked.join("\n"));
+                        while let Some(parked) = app.take_next_queued_chat() {
+                            app.queued_steer.push_back(parked);
                         }
                         let run_opts = RunOptions {
                             project_root: opts.project_root.clone(),
@@ -1395,6 +1399,12 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 // GateOpened) so they can't resurrect run state
                                 // after the reset below.
                                 while engine_rx.try_recv().is_ok() {}
+                                // Same for a route decision the aborted agentic
+                                // turn already emitted: a late `AgenticDone` /
+                                // `Failed` waiting in `route_rx` would otherwise
+                                // be picked up next tick and append a stale reply
+                                // AFTER the cancel reset.
+                                while route_rx.try_recv().is_ok() {}
                                 app.cancel_run();
                             }
                             Action::StartRun(req) => {
@@ -2206,5 +2216,29 @@ mod tests {
         o.slug.clear();
         o.project_root = PathBuf::from("/tmp/my-project");
         assert_eq!(o.effective_slug(), "my-project");
+    }
+
+    #[test]
+    fn start_failed_note_treats_would_block_as_retriable() {
+        // `WouldBlock` = this session's previous run still holds the lock (its
+        // guard hasn't dropped yet). Surface the retriable "a pipeline is
+        // running" hint, NOT the generic start-failed shout.
+        let e = std::io::Error::new(std::io::ErrorKind::WouldBlock, "self holds lock");
+        let note = start_failed_note(&e);
+        assert_eq!(note, umadev_i18n::tl("run.busy_reopen"));
+        assert_ne!(
+            note,
+            umadev_i18n::tlf("pipeline.start_failed", &["self holds lock"]),
+            "WouldBlock must not fall through to the hard-error note"
+        );
+    }
+
+    #[test]
+    fn start_failed_note_passes_through_real_errors() {
+        // A genuine start failure (not the same-session lock race) keeps the
+        // generic note with the underlying error text.
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "boom");
+        let note = start_failed_note(&e);
+        assert_eq!(note, umadev_i18n::tlf("pipeline.start_failed", &["boom"]));
     }
 }
