@@ -28,8 +28,8 @@ use umadev_runtime::{
 };
 
 use crate::{
-    default_workspace, merge_prompt, run_subprocess, HostDriver, ProbeResult, PromptChannel,
-    SubprocessCall,
+    default_workspace, merge_prompt, run_subprocess, run_subprocess_streaming, HostDriver,
+    ProbeResult, PromptChannel, SubprocessCall,
 };
 
 /// Drives the `opencode` CLI as a subprocess.
@@ -176,9 +176,10 @@ impl Runtime for OpenCodeDriver {
     }
 
     fn capabilities(&self) -> umadev_runtime::BrainCapabilities {
-        // OpenCode has no `/goal` mode, no streaming override (blocking
-        // complete), no usage on stdout, and no PreToolUse hook — the most
-        // conservative of the three CLIs.
+        // OpenCode has no `/goal` mode, no structured stream-json (its
+        // `complete_streaming` override forwards plain-text lines, but there's
+        // no machine-readable event schema), no usage on stdout, and no
+        // PreToolUse hook — the most conservative of the three CLIs.
         umadev_runtime::BrainCapabilities::default()
     }
 
@@ -205,6 +206,142 @@ impl Runtime for OpenCodeDriver {
             usage: Usage::default(),
         })
     }
+
+    /// Streaming completion via `opencode run`, forwarding stdout **line by
+    /// line** so the TUI shows live progress instead of a frozen spinner.
+    ///
+    /// `opencode run` writes a plain-text answer (NOT structured JSONL like
+    /// `claude --output-format stream-json` / `codex exec --json`), so there is
+    /// no machine-readable tool-call schema to parse — and `--format json` is
+    /// deliberately NOT used here (it would turn the plain-text stdout this
+    /// driver parses into raw JSON and break answer extraction; see the
+    /// `call_args` TODO). What this DOES win is the thing that mattered most:
+    /// before this override, `OpenCodeDriver` fell back to the trait-default
+    /// `complete_streaming` — a blocking `complete` that emits **nothing** until
+    /// the whole phase ends, leaving the entire research phase with zero
+    /// intermediate events and a 25s+ blank screen. Forwarding each line as a
+    /// [`StreamEvent::Text`] delta as it arrives — even without a structured
+    /// stream — is strictly better than buffer-then-dump: the user sees the
+    /// answer materialize in real time and the runner's stream-activity tracker
+    /// stops heartbeating "still working" over a base that IS producing output.
+    ///
+    /// A line that looks like a tool-call marker (`opencode` prints lines such
+    /// as `|  Read  path` for tool steps in some configurations) is forwarded as
+    /// a [`StreamEvent::ToolUse`] so the activity reads richer when present;
+    /// everything else is plain text. Fail-open: on ANY streaming error we fall
+    /// back to the non-streaming [`complete`](Self::complete) so a format change
+    /// or an environment without line-buffered stdout never breaks the phase.
+    /// Timeout / empty-reply / error semantics are inherited unchanged from the
+    /// shared subprocess layer and the `complete` fallback.
+    async fn complete_streaming(
+        &self,
+        req: CompletionRequest,
+        on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
+    ) -> Result<CompletionResponse, RuntimeError> {
+        let prompt = merge_prompt(&req);
+        let ws = self.workspace.clone().unwrap_or_else(default_workspace);
+        let args = self.call_args(&req.model);
+        let model = req.model.clone();
+        let program = self.program.clone();
+        let timeout = self.timeout;
+
+        let result = run_subprocess_streaming(
+            SubprocessCall {
+                program: &program,
+                args: &args,
+                prompt: &prompt,
+                channel: PromptChannel::Arg,
+                workspace: &ws,
+                timeout,
+                env: &[],
+            },
+            &|line: &str| {
+                if let Some(ev) = parse_opencode_stream_line(line) {
+                    on_event(ev);
+                }
+            },
+        )
+        .await;
+
+        match result {
+            Ok(out) => Ok(CompletionResponse {
+                text: out.stdout,
+                id: "opencode-cli".to_string(),
+                model,
+                usage: Usage::default(),
+            }),
+            Err(e) => {
+                // Fail-open: drop to the non-streaming path so a streaming-only
+                // failure (no line-buffered stdout, format drift) never empties
+                // the phase. `complete` re-runs the same `opencode run`.
+                tracing::warn!(error = %e, "opencode streaming failed, falling back to non-streaming");
+                drop(args);
+                drop(prompt);
+                self.complete(req).await
+            }
+        }
+    }
+}
+
+/// Turn one line of plain-text `opencode run` stdout into a [`StreamEvent`].
+///
+/// `opencode run` is NOT structured JSONL, so this is a best-effort plain-text
+/// forwarder, not a parser: every non-blank line becomes a [`StreamEvent::Text`]
+/// delta (with its newline restored so the typewriter view reads naturally),
+/// EXCEPT lines that match a recognisable tool-step marker, which become a
+/// [`StreamEvent::ToolUse`] so the activity reads richer when opencode prints
+/// them. A blank line yields `None` (no empty events). This is deliberately
+/// conservative — anything not confidently a tool step is treated as text, so a
+/// format change degrades to "plain text streaming", never to a wrong tag.
+fn parse_opencode_stream_line(line: &str) -> Option<umadev_runtime::StreamEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Best-effort tool-step recognition. `opencode` decorates tool steps with a
+    // leading box-drawing/pipe gutter in some terminals (e.g. "|  Read  src/x"
+    // or "│ Bash npm test"); when we can confidently pull a known tool name out
+    // of such a gutter line, surface it as ToolUse. Otherwise it's just text.
+    if let Some(ev) = recognize_tool_step(trimmed) {
+        return Some(ev);
+    }
+    // Plain text: restore the trailing newline so consecutive lines render as
+    // separate lines in the typewriter view instead of being glued together.
+    Some(umadev_runtime::StreamEvent::Text {
+        delta: format!("{line}\n"),
+    })
+}
+
+/// Recognise a known tool name in a gutter-decorated `opencode` step line,
+/// returning a [`StreamEvent::ToolUse`] or `None`. Conservative: only fires when
+/// the line starts with a box-drawing/pipe gutter AND the first token after it
+/// is a known tool id — so ordinary prose that merely contains the word "Read"
+/// is never mis-tagged.
+fn recognize_tool_step(trimmed: &str) -> Option<umadev_runtime::StreamEvent> {
+    // Strip a leading gutter of pipe / box-drawing chars + spaces.
+    let after_gutter = trimmed.trim_start_matches(|c: char| {
+        c == '|' || c == '│' || c == '├' || c == '└' || c == '─' || c == '*' || c.is_whitespace()
+    });
+    if std::ptr::eq(after_gutter, trimmed) {
+        // No gutter was stripped → this is ordinary text, not a tool step.
+        return None;
+    }
+    let mut parts = after_gutter.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or("");
+    let name = match head {
+        "Read" => "Read",
+        "Write" => "Write",
+        "Edit" => "Edit",
+        "Bash" | "Shell" | "Run" => "Bash",
+        "Grep" | "Search" | "Glob" => "Grep",
+        "Web" | "WebFetch" | "WebSearch" | "Fetch" => "WebFetch",
+        _ => return None,
+    };
+    let detail: String = parts.next().unwrap_or("").trim().chars().take(80).collect();
+    Some(umadev_runtime::StreamEvent::ToolUse {
+        name: name.to_string(),
+        detail,
+    })
 }
 
 #[async_trait]
@@ -346,6 +483,99 @@ mod tests {
         let probe = d.probe().await;
         assert!(matches!(probe, ProbeResult::NotInstalled { .. }));
         assert!(!probe.is_ready());
+    }
+
+    #[test]
+    fn parse_line_forwards_plain_text_with_newline() {
+        // A plain answer line becomes a Text delta (newline restored so lines
+        // don't glue together in the typewriter view).
+        let ev = parse_opencode_stream_line("Here is the analysis of the repo.")
+            .expect("non-empty text line should emit an event");
+        match ev {
+            umadev_runtime::StreamEvent::Text { delta } => {
+                assert_eq!(delta, "Here is the analysis of the repo.\n");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+        // A blank line yields no event (no empty spam).
+        assert!(parse_opencode_stream_line("").is_none());
+        assert!(parse_opencode_stream_line("   ").is_none());
+    }
+
+    #[test]
+    fn parse_line_recognizes_gutter_tool_step() {
+        // A gutter-decorated tool step → ToolUse; ordinary prose containing a
+        // tool word is NOT mis-tagged.
+        let ev = parse_opencode_stream_line("│  Read  src/app.tsx")
+            .expect("gutter tool line should emit an event");
+        match ev {
+            umadev_runtime::StreamEvent::ToolUse { name, detail } => {
+                assert_eq!(name, "Read");
+                assert_eq!(detail, "src/app.tsx");
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+        // Prose that merely mentions "Read" (no gutter) stays plain text.
+        match parse_opencode_stream_line("I will Read the file next").unwrap() {
+            umadev_runtime::StreamEvent::Text { .. } => {}
+            other => panic!("plain prose must stay Text, got {other:?}"),
+        }
+    }
+
+    // The fake is a `#!/bin/sh` script Windows cannot exec; the per-line
+    // forwarding logic is also covered by the `parse_opencode_stream_line` unit
+    // tests above, which are platform-independent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_emits_one_event_per_line_not_a_single_dump() {
+        // The whole point of the opencode streaming override: a multi-line
+        // answer must arrive as SEVERAL incremental events (one per line), not
+        // one buffer-then-dump event. Drive a fake binary that prints 3 lines.
+        use std::sync::{Arc, Mutex};
+        use umadev_runtime::StreamEvent;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-opencode");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null 2>&1\nprintf 'line one\\nline two\\nline three\\n'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let d = OpenCodeDriver::with_program(script.to_str().unwrap());
+        let req = CompletionRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![umadev_runtime::Message {
+                role: "user".into(),
+                content: "go".into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+        };
+        let events: Arc<Mutex<Vec<StreamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let on_event = move |ev: StreamEvent| {
+            sink.lock().unwrap().push(ev);
+        };
+        let resp = d.complete_streaming(req, &on_event).await.unwrap();
+        let got = events.lock().unwrap();
+        let text_events = got
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::Text { .. }))
+            .count();
+        assert!(
+            text_events >= 3,
+            "expected >=3 incremental Text events (one per line), got {text_events}: {got:?}"
+        );
+        // The final assembled answer still carries all three lines.
+        assert!(resp.text.contains("line one"));
+        assert!(resp.text.contains("line three"));
+        assert_eq!(resp.id, "opencode-cli");
     }
 
     #[tokio::test]

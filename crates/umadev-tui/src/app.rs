@@ -439,6 +439,19 @@ pub struct App {
     /// to the last Host message (typewriter effect) instead of pushing a new
     /// line. Set false by any non-text event (tool use, result, etc.).
     pub stream_text_active: bool,
+
+    /// Wall-clock of the LAST sign of life from the base — any worker stream
+    /// event, host output line, or progress note. Drives the honest "stall"
+    /// signal: when a phase is running but nothing has arrived for >3s (and no
+    /// tool call is mid-flight), the status spinner is painted red so the user
+    /// sees a truthful "about to stall" cue instead of a fake-smooth spinner.
+    /// Refreshed to `now` on every such event; `None` when nothing is running.
+    pub last_output_at: Option<std::time::Instant>,
+    /// `true` while a worker tool call is in flight (a `ToolUse` arrived but its
+    /// `ToolResult` hasn't yet). A long tool call (a 40s `npm install`) is NOT a
+    /// stall — the base IS working — so the red signal is suppressed while this
+    /// is set even past the 3s threshold.
+    pub tool_in_progress: bool,
 }
 
 impl App {
@@ -525,6 +538,8 @@ impl App {
             pending_steer: None,
             stream_tool_batch: None,
             stream_text_active: false,
+            last_output_at: None,
+            tool_in_progress: false,
         };
         app.load_history();
         if app.mode == AppMode::Chat {
@@ -666,7 +681,9 @@ impl App {
             .iter()
             .map(|r| match r.status {
                 PhaseStatus::Done => '●',
-                PhaseStatus::Running => '◐',
+                // The running circle ROTATES (◐◓◑◒) so the bar itself proves
+                // motion — not a static ◐ that reads as frozen.
+                PhaseStatus::Running => self.running_circle(),
                 PhaseStatus::Pending => '○',
             })
             .collect();
@@ -1175,6 +1192,9 @@ impl App {
             EngineEvent::PhaseStarted { phase } => {
                 self.set_phase(phase, PhaseStatus::Running);
                 self.phase_started_at = Some(std::time::Instant::now());
+                // Fresh phase → fresh stall clock; nothing has stalled yet.
+                self.last_output_at = Some(std::time::Instant::now());
+                self.tool_in_progress = false;
                 // Auto-snapshot the workspace BEFORE this phase's base work, so
                 // a whole phase can be rewound with /rewind. Offloaded to a
                 // blocking task so a slow `git add -A` on a big repo never
@@ -1422,6 +1442,8 @@ impl App {
                 );
             }
             EngineEvent::HostOutput { phase: _, line } => {
+                // A host-output line is a sign of life → reset the stall clock.
+                self.mark_output();
                 // Cap each line so a 1000-char paragraph doesn't blow the layout.
                 let cap = 300;
                 let trimmed: String = if line.chars().count() > cap {
@@ -1449,6 +1471,10 @@ impl App {
                 // an error/fallback) — stop the "thinking…" status.
                 self.thinking = false;
                 self.thinking_started = None;
+                // A progress note is a sign of life (artifact written, a phase
+                // heartbeat, governance) → reset the stall clock so the red cue
+                // only fires when the pipeline is TRULY silent.
+                self.mark_output();
                 self.push(ChatRole::System, note);
             }
             EngineEvent::SubTaskStarted {
@@ -1473,7 +1499,9 @@ impl App {
             }
             EngineEvent::WorkerStream { event } => {
                 // Real-time streaming display — the user sees the worker's
-                // live activity instead of a blank spinner.
+                // live activity instead of a blank spinner. ANY stream event is
+                // a sign of life → reset the stall clock.
+                self.mark_output();
                 match event {
                     umadev_runtime::StreamEvent::Text { delta } => {
                         self.stream_tool_batch = None;
@@ -1512,6 +1540,10 @@ impl App {
                     }
                     umadev_runtime::StreamEvent::ToolUse { name, detail } => {
                         self.stream_text_active = false; // text stream interrupted
+                                                         // A tool call is now in flight — a long one (npm install)
+                                                         // is WORK, not a stall, so suppress the red signal until
+                                                         // its result returns.
+                        self.tool_in_progress = true;
                         let icon = match name.as_str() {
                             "Read" | "NotebookEdit" => "[read]",
                             "Write" | "Edit" => "[write]",
@@ -1553,6 +1585,9 @@ impl App {
                     }
                     umadev_runtime::StreamEvent::ToolResult { ok, summary } => {
                         self.stream_text_active = false;
+                        // The in-flight tool call returned → no longer "working
+                        // on a tool"; the stall clock applies normally again.
+                        self.tool_in_progress = false;
                         let mark = if ok { "[ok]" } else { "[fail]" };
                         let preview: String = summary.chars().take(100).collect();
                         if !preview.trim().is_empty() {
@@ -1993,6 +2028,10 @@ impl App {
             self.record_user_turn(&text);
             self.thinking = true; // animated "thinking…" until the base replies
             self.thinking_started = Some(std::time::Instant::now());
+            // Fresh chat turn → fresh stall clock (don't inherit a stale time
+            // from an earlier phase and flash red immediately).
+            self.last_output_at = None;
+            self.tool_in_progress = false;
             self.refresh_status();
             Action::Route(text)
         } else if !self.run_started {
@@ -2005,6 +2044,9 @@ impl App {
             self.record_user_turn(&text);
             self.thinking = true; // animated "thinking…" until the base replies
             self.thinking_started = Some(std::time::Instant::now());
+            // Fresh chat turn → fresh stall clock (see above).
+            self.last_output_at = None;
+            self.tool_in_progress = false;
             self.refresh_status();
             Action::Route(text)
         } else {
@@ -4748,6 +4790,56 @@ impl App {
         FRAMES[(self.tick as usize) % FRAMES.len()]
     }
 
+    /// Animated glyph for the IN-PROGRESS phase circle in the progress bar.
+    ///
+    /// The bar previously drew a STATIC `◐` for the running phase, so the only
+    /// motion on screen was the tiny bottom-bar spinner — when that was off the
+    /// edge of attention the whole UI read as frozen. Rotating the running
+    /// circle itself (`◐◓◑◒`) makes the bar prove it's alive on its own. The
+    /// 80ms tick is faster than we want for the quarter-circle rotation (it
+    /// would blur), so we step one frame per ~120ms by dividing the tick.
+    #[must_use]
+    pub fn running_circle(&self) -> char {
+        const FRAMES: [char; 4] = ['◐', '◓', '◑', '◒'];
+        // tick is ~80ms; /2 → ~160ms per frame (close to the ~120ms target,
+        // and an integer divisor of the tick so the cadence stays steady).
+        FRAMES[((self.tick as usize) / 2) % FRAMES.len()]
+    }
+
+    /// `true` when a phase is running but the base has gone quiet past the
+    /// stall threshold — no worker output for >3s AND no tool call mid-flight.
+    /// This is the HONEST "about to hang" signal: the UI paints the status red
+    /// so the user sees a truthful cue instead of a fake-smooth spinner. Returns
+    /// `false` whenever nothing is running, a tool call is in progress (a long
+    /// `npm install` is work, not a stall), or output arrived within 3s.
+    #[must_use]
+    pub fn is_stalled(&self) -> bool {
+        const STALL: std::time::Duration = std::time::Duration::from_secs(3);
+        // Stall only makes sense while something is ACTIVELY running: a phase is
+        // in flight, or a chat turn is "thinking". At a gate (paused for the
+        // user) `phase_started_at` is cleared, so we never falsely go red there.
+        let active = self.phase_started_at.is_some() || self.thinking;
+        if !active || self.tool_in_progress {
+            return false;
+        }
+        match self.last_output_at {
+            Some(t) => t.elapsed() >= STALL,
+            // Nothing has arrived yet this turn: only call it a stall once the
+            // active block has been running > 3s (a just-started phase isn't
+            // stalled, it's spinning up).
+            None => self
+                .phase_started_at
+                .or(self.thinking_started)
+                .is_some_and(|t| t.elapsed() >= STALL),
+        }
+    }
+
+    /// Record a sign of life from the base — call on every worker stream event /
+    /// host output line / progress note so [`Self::is_stalled`] resets.
+    fn mark_output(&mut self) {
+        self.last_output_at = Some(std::time::Instant::now());
+    }
+
     /// Seconds since the current "thinking" turn began — for the live elapsed
     /// readout in the waiting indicator. `0` when not waiting.
     #[must_use]
@@ -7077,6 +7169,122 @@ mod tests {
             a.tick();
         }
         assert_eq!(a.spinner(), first);
+    }
+
+    #[test]
+    fn running_circle_animates_through_its_frames() {
+        // The in-progress phase circle must ROTATE (◐◓◑◒) as the tick advances,
+        // not sit static — that rotation is what proves the bar is alive even
+        // when the bottom-bar spinner is off-attention. One frame per 2 ticks.
+        let mut a = fresh_app(Some("offline"));
+        assert_eq!(a.running_circle(), '◐', "frame 0 at tick 0");
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(a.running_circle());
+            a.tick();
+            a.tick(); // advance one full circle frame (~160ms)
+        }
+        // All four quarter-circle glyphs must appear as it rotates.
+        for g in ['◐', '◓', '◑', '◒'] {
+            assert!(seen.contains(&g), "running circle must show {g}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn running_phase_circle_in_status_bar_rotates() {
+        // The progress bar (in app.status) shows the rotating circle for the
+        // running phase, not a frozen ◐.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PhaseStarted {
+            phase: Phase::Research,
+        });
+        // tick=0 → ◐ (frame 0).
+        assert!(a.status.contains('◐'), "tick 0 shows ◐: {}", a.status);
+        // Advance two ticks (one circle frame) → the running glyph becomes ◓.
+        a.tick();
+        a.tick();
+        assert!(
+            a.status.contains('◓'),
+            "after 2 ticks the running circle rotates to ◓: {}",
+            a.status
+        );
+    }
+
+    #[test]
+    fn stall_after_three_seconds_then_clears_on_output() {
+        // Honest stall signal: a running phase with no output for >3s reads as
+        // stalled (status painted red by the UI); any fresh output clears it.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PhaseStarted {
+            phase: Phase::Research,
+        });
+        // Just started → not stalled (spin-up grace).
+        assert!(!a.is_stalled(), "a just-started phase is not stalled");
+        // Backdate the last-output clock past the 3s threshold.
+        a.last_output_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(4));
+        assert!(a.is_stalled(), "no output for >3s must read as stalled");
+        // A worker stream event is a sign of life → stall clears immediately.
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::Text {
+                delta: "back to work".into(),
+            },
+        });
+        assert!(!a.is_stalled(), "fresh output must clear the stall signal");
+    }
+
+    #[test]
+    fn tool_call_in_flight_is_not_a_stall() {
+        // A long tool call (e.g. a 40s npm install) is WORK, not a stall — the
+        // red signal must stay suppressed while a ToolUse has no ToolResult yet,
+        // even past the 3s threshold; the ToolResult re-arms the stall clock.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PhaseStarted {
+            phase: Phase::Backend,
+        });
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Bash".into(),
+                detail: "npm install".into(),
+            },
+        });
+        assert!(a.tool_in_progress, "ToolUse marks a tool in flight");
+        // Even with a stale clock, an in-flight tool is not a stall.
+        a.last_output_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
+        assert!(
+            !a.is_stalled(),
+            "an in-flight tool call must NOT read as stalled"
+        );
+        // The result returns → tool no longer in flight; the stall clock applies.
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolResult {
+                ok: true,
+                summary: "added 200 packages".into(),
+            },
+        });
+        assert!(!a.tool_in_progress, "ToolResult clears the in-flight flag");
+        // (The result itself just marked output, so still not stalled now.)
+        assert!(!a.is_stalled());
+    }
+
+    #[test]
+    fn not_stalled_at_a_gate_or_when_idle() {
+        // At a gate (paused for the user) phase_started_at is cleared, so the
+        // status must never falsely flash red while waiting on a human.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PhaseStarted { phase: Phase::Docs });
+        a.last_output_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
+        a.apply_engine(EngineEvent::GateOpened {
+            gate: umadev_agent::gates::Gate::DocsConfirm,
+        });
+        assert!(
+            !a.is_stalled(),
+            "a gate pause (no running phase) is not a stall"
+        );
+        // A brand-new app with nothing running is never stalled either.
+        let idle = fresh_app(Some("offline"));
+        assert!(!idle.is_stalled());
     }
 
     // ---- WorkerStream rendering tests ----

@@ -752,9 +752,17 @@ fn render_title_row(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Style::default().fg(theme::TEXT_MUTED()),
     );
+    // Honest stall signal: when a phase is running but the base has gone quiet
+    // past the threshold, paint the status RED — a truthful "about to hang" cue
+    // beats a fake-smooth spinner. Normal accent color the rest of the time.
+    let phase_color = if app.is_stalled() {
+        theme::ERROR()
+    } else {
+        theme::ACCENT()
+    };
     let phase = Span::styled(
         format!(" {} ", app.status),
-        Style::default().fg(theme::ACCENT()),
+        Style::default().fg(phase_color),
     );
     let line = Line::from(vec![
         title,
@@ -1383,9 +1391,15 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
     for _ in 0..pad {
         right_spans.push(Span::raw(" "));
     }
+    // Stall → red (honest "about to hang"); otherwise the normal info color.
+    let info_color = if app.is_stalled() {
+        theme::ERROR()
+    } else {
+        theme::INFO()
+    };
     right_spans.push(Span::styled(
         format!("{phase_info} "),
-        Style::default().fg(theme::INFO()),
+        Style::default().fg(info_color),
     ));
     let mut all = left.spans;
     all.extend(right_spans);

@@ -321,6 +321,62 @@ impl<R: Runtime> AgentRunner<R> {
         self.events.emit(event);
     }
 
+    /// Drive a long-blocking future while keeping the UI **alive**: emit a
+    /// `[wait] 正在<label>…` Note up front, then a periodic "仍在进行(已 mm:ss)"
+    /// heartbeat — first beat at ~3s, then every ~7s — until the future
+    /// resolves. Returns the future's output unchanged.
+    ///
+    /// This is the P0 "alive-feel" fix for the operations that do NOT stream
+    /// through `try_generate_on` (knowledge/vector build, the docs/quality
+    /// critic teams, design/code review). Before this, those ran in total
+    /// silence for tens of seconds and the screen read as frozen even though the
+    /// base / embedder / scanner was working. Fully fail-open: the heartbeat
+    /// only EMITS Notes (a no-op on the null sink), never affects the wrapped
+    /// result, and adds no failure path — a panic in the future still
+    /// propagates, the timing channel is pure cosmetics.
+    async fn with_heartbeat<F>(&self, label: &str, fut: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        self.with_heartbeat_opts(label, true, fut).await
+    }
+
+    /// [`Self::with_heartbeat`] but the leading `[wait]` Note is suppressed when
+    /// `announce` is false — used to wrap operations that ALREADY emit their own
+    /// "starting" Note (the critic teams' `[team]` line, the design/code review
+    /// banners) so the heartbeat adds ONLY the periodic "still working" beats
+    /// without a duplicate header.
+    async fn with_heartbeat_opts<F>(&self, label: &str, announce: bool, fut: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        if announce {
+            self.emit(EngineEvent::Note(format!("[wait] 正在{label}…")));
+        }
+        let started = std::time::Instant::now();
+        tokio::pin!(fut);
+        // First reassurance at ~3s (inside the window where a silent screen
+        // starts to read as a hang), then every ~7s after. `interval_at`'s
+        // immediate first tick fires at `start`, so set `start = now + 3s`.
+        let mut beat = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(7),
+        );
+        loop {
+            tokio::select! {
+                out = &mut fut => return out,
+                _ = beat.tick() => {
+                    let s = started.elapsed().as_secs();
+                    self.emit(EngineEvent::Note(format!(
+                        "… {label} 仍在进行(已 {}:{:02})— 底座在后台干活,请稍候",
+                        s / 60,
+                        s % 60
+                    )));
+                }
+            }
+        }
+    }
+
     /// Announce a phase start AND drop a file-level rewind checkpoint for it.
     ///
     /// The TUI builds per-phase checkpoints in its `PhaseStarted` event handler,
@@ -1163,7 +1219,13 @@ impl<R: Runtime> AgentRunner<R> {
             // cross-review opinions, records every verdict to the team ledger,
             // and folds their union of blocking issues into the docs revision
             // path ONCE (round-1, advisory) — never as loop control.
-            let blocking = self.run_docs_critic_team(&slug).await;
+            let blocking = self
+                .with_heartbeat_opts(
+                    "角色团队交叉评审文档",
+                    false,
+                    self.run_docs_critic_team(&slug),
+                )
+                .await;
             if !blocking.is_empty() {
                 self.revise_docs_for_critic_blocking(&slug, &blocking).await;
             }
@@ -1221,9 +1283,17 @@ impl<R: Runtime> AgentRunner<R> {
         if knowledge_dir.is_dir() {
             let index =
                 umadev_knowledge::load_or_build_index(&self.options.project_root, &knowledge_dir);
-            let _ =
-                umadev_knowledge::build_vector_store_if_enabled(&self.options.project_root, &index)
-                    .await;
+            // Batch embedding is a long network round-trip per corpus chunk —
+            // keep the UI alive while it runs instead of a silent stall.
+            let _ = self
+                .with_heartbeat(
+                    "构建知识向量库(嵌入语料、写缓存)",
+                    umadev_knowledge::build_vector_store_if_enabled(
+                        &self.options.project_root,
+                        &index,
+                    ),
+                )
+                .await;
         }
         // Embed the requirement query itself.
         umadev_knowledge::vector::embed_query(&self.options.requirement).await
@@ -1845,8 +1915,16 @@ impl<R: Runtime> AgentRunner<R> {
             let call_started = std::time::Instant::now();
             let fut = runtime.complete_streaming(req, &on_event);
             tokio::pin!(fut);
-            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(25));
-            heartbeat.tick().await; // consume the immediate first tick
+            // "Alive" cadence: the FIRST reassurance lands at ~3s (so a
+            // non-streaming base — opencode's plain-text fallback, the external
+            // HTTP runtime — proves it's working within the window where a
+            // frozen-looking screen reads as a hang), then every ~6s after. The
+            // immediate first tick of `interval_at` fires at `start`, so we set
+            // `start = now + 3s` and consume nothing up front.
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(6),
+            );
             let outcome = loop {
                 tokio::select! {
                     r = &mut fut => break r,
@@ -1980,6 +2058,13 @@ impl<R: Runtime> AgentRunner<R> {
     /// a condensed string suitable for injecting into a prompt's system field.
     fn load_expert_knowledge(&self, expert_dirs: &[&str]) -> String {
         let base = self.options.project_root.join("knowledge/experts");
+        // Only announce when there is real expert material to load — otherwise
+        // this is a no-op and a [wait] note would be pure noise.
+        if base.is_dir() {
+            self.emit(EngineEvent::Note(
+                "[wait] 正在加载专家工程知识(分层/分包/服务层规范)…".to_string(),
+            ));
+        }
         let mut out = String::new();
         let mut read_dir = |dir_path: &std::path::Path, label: &str| {
             if !dir_path.is_dir() {
@@ -2207,6 +2292,11 @@ impl<R: Runtime> AgentRunner<R> {
     /// caller injects only the incremental directive. Deterministic (BM25, no
     /// network) and fail-open.
     fn brownfield_code_snippets(&self) -> Option<String> {
+        // Loading the project-source BM25 index can take a beat on a large
+        // brownfield repo — announce it so the wait doesn't read as a stall.
+        self.emit(EngineEvent::Note(
+            "[wait] 正在加载并检索项目源码索引(为底座注入真实代码上下文)…".to_string(),
+        ));
         let index = crate::adopt::load_project_source_index(&self.options.project_root)?;
         // A handful of the strongest hits — enough to anchor the base in the
         // real codebase without bloating the prompt (auto-context bloat
@@ -3094,7 +3184,13 @@ impl<R: Runtime> AgentRunner<R> {
     /// issues for a fix (one bounded round). Deterministic governance already
     /// ran as the hard-rule floor; this adds the judgment a detector can't make.
     async fn run_design_review(&self, slug: &str) {
-        let Some(verdict) = self.judge_design(slug).await else {
+        let Some(verdict) = self
+            .with_heartbeat(
+                "评审 UI 设计(对照设计法/反 AI-slop)",
+                self.judge_design(slug),
+            )
+            .await
+        else {
             return; // no brain / nothing built → skip (deterministic floor stands)
         };
         // Team hook-up (zero behavior change): ALSO record the senior-designer's
@@ -3602,7 +3698,11 @@ impl<R: Runtime> AgentRunner<R> {
             self.maybe_verify_and_fix(Phase::Backend).await;
             // Senior code review (the team role we added): adversarial pre-merge
             // review of the now-complete full stack, with a review->fix loop.
-            self.code_review_and_fix().await;
+            self.with_heartbeat(
+                "做交付前的资深代码评审(找真实缺陷)",
+                self.code_review_and_fix(),
+            )
+            .await;
 
             // Post-phase governance catch-up (real-file scan for brains without a
             // real-time hook), then task-level acceptance — the director checks
@@ -3646,7 +3746,11 @@ impl<R: Runtime> AgentRunner<R> {
         // it never sinks the deterministic gate or controls the loop (invariant 2).
         if use_runtime {
             let advisory = self
-                .run_quality_critic_team(&self.options.effective_slug())
+                .with_heartbeat_opts(
+                    "质量阶段角色团队交叉评审(QA + 安全)",
+                    false,
+                    self.run_quality_critic_team(&self.options.effective_slug()),
+                )
                 .await;
             if !advisory.is_empty() {
                 let list = advisory
@@ -5384,6 +5488,89 @@ error TS2304: Cannot find name 'Foo'
             .iter()
             .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("Plan mode (read-only)")));
         assert!(!plan_note, "guarded mode must not announce a plan stop");
+    }
+
+    #[tokio::test]
+    async fn with_heartbeat_emits_upfront_wait_then_periodic_beats() {
+        // The P0 "alive-feel" wrapper must: (1) emit a `[wait] 正在<label>…`
+        // Note up front, and (2) emit periodic "仍在进行" beats while a long
+        // operation runs — so a multi-second blocking op never reads as frozen.
+        // The first beat fires at ~3s, so a ~3.4s wrapped op captures the header
+        // + the first beat (a real but short sleep keeps the test self-contained
+        // without the tokio `test-util` virtual-clock feature).
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_millis(3400)).await;
+            42_u32
+        };
+        let out = runner.with_heartbeat("做一件耗时的事", slow).await;
+        assert_eq!(out, 42, "the wrapped future's output must pass through");
+
+        let notes: Vec<String> = sink
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        // (1) an upfront [wait] header carrying the label.
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.starts_with("[wait]") && n.contains("做一件耗时的事")),
+            "must emit an upfront [wait] note: {notes:?}"
+        );
+        // (2) at least one periodic "仍在进行" beat (the ~3s first beat fired).
+        let beats = notes.iter().filter(|n| n.contains("仍在进行")).count();
+        assert!(
+            beats >= 1,
+            "must emit a periodic heartbeat beat during a long op, got {beats}: {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_heartbeat_quiet_suppresses_upfront_note() {
+        // The `announce=false` variant (used where the wrapped op emits its own
+        // banner, e.g. the critic teams) must NOT emit the leading [wait] header.
+        // A fast op (resolves before the 3s first beat) isolates the header
+        // behaviour without waiting on a real beat.
+        use crate::events::{EngineEvent, RecordingSink};
+        use std::sync::Arc;
+        let tmp = TempDir::new().unwrap();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntime, opts(tmp.path())).with_event_sink(Arc::new(sink.clone()));
+        runner
+            .with_heartbeat_opts("安静的事", false, async { 7_u32 })
+            .await;
+        let any_wait = sink
+            .events()
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Note(n) if n.starts_with("[wait]")));
+        assert!(
+            !any_wait,
+            "quiet variant must NOT emit an upfront [wait] note"
+        );
+
+        // And the announce=true path on the same fast op DOES emit the header.
+        let sink2 = RecordingSink::new();
+        let runner2 = AgentRunner::new(FakeRuntime, opts(tmp.path()))
+            .with_event_sink(Arc::new(sink2.clone()));
+        runner2.with_heartbeat("吵闹的事", async { 7_u32 }).await;
+        assert!(
+            sink2
+                .events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n.starts_with("[wait]") && n.contains("吵闹的事"))),
+            "announce=true must emit the upfront [wait] header"
+        );
     }
 
     #[tokio::test]
