@@ -673,6 +673,29 @@ pub fn agentic_engineering_rules() -> &'static str {
      project's real build / test / lint and report only what actually passes."
 }
 
+/// The director's TEAM-ORCHESTRATION capability preamble — Wave 2 of
+/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §4. Layers the team-tools capability
+/// block ([`crate::director::director_tools_capability`]) on top of the always-on
+/// team identity, so the director KNOWS it can delegate / cross-review /
+/// objectively check / pause for the user — and, crucially, that it decides WHEN
+/// to use each, like a real senior director, rather than walking a fixed phase
+/// chain.
+///
+/// This is the prompt-surface half of Wave 2 (the executable half is the
+/// `crate::director` tool API). It is a pure composition of existing wording — the
+/// short director identity plus the levers — so the capability description lives in
+/// exactly one place (`director.rs`) and the prompt assembly lives here with the
+/// other agent prompts. Surfaced for a director / work-class build turn; pure
+/// small-talk skips it (the levers are irrelevant to a greeting).
+#[must_use]
+pub fn director_with_team_tools() -> String {
+    format!(
+        "{}\n\n{}",
+        agentic_team_identity(),
+        crate::director::director_tools_capability()
+    )
+}
+
 /// Frame a raw `/run` requirement as a **full commercial product build** for the
 /// director — Wave 1 of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5.
 ///
@@ -948,6 +971,24 @@ mod tests {
         );
         // Always-on identity is short — it must not read like the heavy preamble.
         assert!(p.len() < SPEC_PREAMBLE.len(), "identity must stay short");
+    }
+
+    #[test]
+    fn director_with_team_tools_layers_levers_on_the_identity() {
+        // Wave 2: the director prompt carries BOTH the team identity AND the
+        // orchestration levers (delegate / review / verify / checkpoint), framed
+        // as the director's own judgement — not a fixed phase chain.
+        let p = director_with_team_tools();
+        let lower = p.to_lowercase();
+        // The always-on identity survives.
+        assert!(lower.contains("umadev") && lower.contains("director"));
+        // All four levers are advertised.
+        assert!(lower.contains("delegate") || lower.contains("summon"));
+        assert!(lower.contains("review"));
+        assert!(lower.contains("verify"));
+        assert!(lower.contains("checkpoint") || lower.contains("pause"));
+        // Framed as the director's choice, not a forced sequence.
+        assert!(lower.contains("judgement") || lower.contains("decide the plan"));
     }
 
     #[test]

@@ -43,6 +43,7 @@ pub mod continuous;
 pub mod coverage;
 pub mod critics;
 pub mod deploy;
+pub mod director;
 pub mod error_kb;
 pub mod events;
 pub mod experts;
@@ -70,7 +71,7 @@ pub use adopt::{
 };
 pub use continuous::{
     continuous_enabled_from_env, legacy_pipeline_from_env, run_block as run_continuous_block,
-    RunOutcome,
+    ReviewKind, RunOutcome,
 };
 pub use critics::{
     append_team_ledger, docs_team_for_kind, preview_team_for_kind, quality_team_for_kind,
@@ -80,6 +81,11 @@ pub use critics::{
 pub use deploy::{
     deploy_proof_rel_path, detect_deploy_target, run_deploy, write_deploy_proof, DeployProof,
     DeployStatus, DeployTarget,
+};
+pub use director::{
+    checkpoint as director_checkpoint, director_tools_capability, review as director_review,
+    summon as director_summon, verify as director_verify, CheckpointDecision, ReviewResult,
+    SummonMode, SummonResult, VerifyKind, VerifyResult,
 };
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{classify_reply, Gate, GateOutcome};

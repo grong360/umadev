@@ -1138,11 +1138,25 @@ fn agentic_system_prompt(
     diff_stat: Option<&str>,
     work_class: bool,
     knowledge_digest: &str,
+    director_build: bool,
 ) -> String {
     // (1) TEAM IDENTITY — always on (even small talk). Establishes WHO the brain
     // is: UmaDev's senior delivery team / director with full agency, not a generic
     // assistant. Reused from the agent crate so the wording lives in one place.
-    let mut p = String::from(umadev_agent::experts::agentic_team_identity());
+    //
+    // Wave 2 (`docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §4): for an explicit `/run`
+    // director-build turn, swap the bare identity for the identity PLUS the
+    // team-orchestration levers (delegate / cross-review / verify / checkpoint), so
+    // the director knows it can summon seats, convene a review, objectively check
+    // reality, and pause for the user — and that it decides WHEN to use each, like a
+    // real senior director, not a fixed phase chain. A normal free-text turn keeps
+    // the lighter bare identity (the levers are a full-build concern). The wording
+    // lives in the agent crate (`director::director_tools_capability`).
+    let mut p = if director_build {
+        umadev_agent::experts::director_with_team_tools()
+    } else {
+        String::from(umadev_agent::experts::agentic_team_identity())
+    };
     p.push_str("\n\n");
     p.push_str(
         "You are running inside the project's working \
@@ -1260,6 +1274,7 @@ async fn drive_agentic_stream(
         diff_stat.as_deref(),
         work_class,
         &knowledge_digest,
+        director_build,
     );
 
     // The execution request: the user's raw task, tools UNLOCKED, no max_tokens
@@ -2611,7 +2626,7 @@ mod tests {
         // the chat-route tool ban — and embed the live git status plus a
         // no-recitation contract.
         let status = concat!(" M crates/umadev-tui/src/lib.rs\n", "?? new.rs\n");
-        let p = agentic_system_prompt(Some(status), Some("1 file changed"), true, "");
+        let p = agentic_system_prompt(Some(status), Some("1 file changed"), true, "", false);
         // Tools stay unlocked (the whole point of the agentic path).
         assert!(p.contains("FULL tool access"));
         assert!(p.to_lowercase().contains("edit files"));
@@ -2630,7 +2645,7 @@ mod tests {
         // up front, the prompt hands that judgement to the base — reply to small
         // talk without tools, do the work when it needs tools. This is what makes
         // a greeting not waste tool calls and a real task actually get done.
-        let p = agentic_system_prompt(None, None, false, "");
+        let p = agentic_system_prompt(None, None, false, "", false);
         let lower = p.to_lowercase();
         assert!(lower.contains("decide for yourself"));
         // It must cover BOTH arms: just reply to conversation, and do the work.
@@ -2644,8 +2659,8 @@ mod tests {
         // The default agentic path is no longer a bare base CLI: even small talk
         // opens with UmaDev's senior delivery-team / director identity, so the base
         // works AS the team, not a generic assistant. Identity is always-on.
-        let chat = agentic_system_prompt(None, None, false, "");
-        let work = agentic_system_prompt(None, None, true, "");
+        let chat = agentic_system_prompt(None, None, false, "", false);
+        let work = agentic_system_prompt(None, None, true, "", false);
         for p in [&chat, &work] {
             let lower = p.to_lowercase();
             assert!(lower.contains("umadev"), "identity names the product");
@@ -2657,11 +2672,37 @@ mod tests {
     }
 
     #[test]
+    fn director_build_prompt_carries_the_team_orchestration_levers() {
+        // Wave 2: an explicit `/run` director-build turn carries the team-tools
+        // capability — the director knows it can delegate / cross-review / verify /
+        // checkpoint, framed as its own judgement (not a fixed phase chain). A
+        // normal free-text turn (director_build = false) does NOT carry the levers.
+        let build = agentic_system_prompt(None, None, true, "", true);
+        let lower = build.to_lowercase();
+        // The identity is still there.
+        assert!(lower.contains("umadev") && lower.contains("director"));
+        // All four levers are advertised on a director-build turn.
+        assert!(lower.contains("delegate") || lower.contains("summon"));
+        assert!(lower.contains("cross-review") || lower.contains("review team"));
+        assert!(lower.contains("verify") || lower.contains("objectively check"));
+        assert!(lower.contains("checkpoint") || lower.contains("pause for the user"));
+        // Framed as the director's choice, not a forced sequence.
+        assert!(lower.contains("judgement") || lower.contains("not a fixed checklist"));
+
+        // A normal free-text turn omits the levers (they're a full-build concern).
+        let plain = agentic_system_prompt(None, None, true, "", false);
+        assert!(
+            !plain.to_lowercase().contains("team-orchestration levers"),
+            "a non-director turn must not carry the orchestration levers"
+        );
+    }
+
+    #[test]
     fn agentic_prompt_injects_team_craft_only_for_work_class() {
         // A work-class turn carries the team's engineering craft (anti-AI-slop:
         // no emoji icons, design tokens, the AI-default look it avoids). Small talk
         // does NOT — a greeting must stay light, no rules dumped on it.
-        let work = agentic_system_prompt(None, None, true, "");
+        let work = agentic_system_prompt(None, None, true, "", false);
         let work_lower = work.to_lowercase();
         assert!(
             work_lower.contains("emoji"),
@@ -2672,7 +2713,7 @@ mod tests {
             "work-class carries token discipline"
         );
 
-        let chat = agentic_system_prompt(None, None, false, "");
+        let chat = agentic_system_prompt(None, None, false, "", false);
         let chat_lower = chat.to_lowercase();
         assert!(
             !chat_lower.contains("emoji") && !chat_lower.contains("design token"),
@@ -2687,18 +2728,18 @@ mod tests {
         // never carries it even if a digest is somehow passed.
         let digest = "\n\nYOUR TEAM'S EXPERIENCE ON THIS:\n\n- `layering.md` — Layers: keep \
                       controllers thin.\n";
-        let work = agentic_system_prompt(None, None, true, digest);
+        let work = agentic_system_prompt(None, None, true, digest, false);
         assert!(
             work.contains("layering.md"),
             "work-class folds in the digest"
         );
 
         // Empty digest -> no knowledge section, but the turn still builds.
-        let work_empty = agentic_system_prompt(None, None, true, "");
+        let work_empty = agentic_system_prompt(None, None, true, "", false);
         assert!(!work_empty.contains("YOUR TEAM'S EXPERIENCE"));
 
         // Chat-class never carries knowledge, even if one is handed in.
-        let chat = agentic_system_prompt(None, None, false, digest);
+        let chat = agentic_system_prompt(None, None, false, digest, false);
         assert!(!chat.contains("layering.md"), "small talk omits knowledge");
     }
 

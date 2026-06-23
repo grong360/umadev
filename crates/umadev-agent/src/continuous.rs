@@ -945,7 +945,7 @@ fn governance_rework_directive(violations: &[String]) -> String {
 /// These are the HARD signal the critics receive as CONTEXT so their semantic
 /// pass builds on real findings instead of an empty floor (the review P0-2 fix).
 /// Pure + fail-open: every contributor swallows its own errors → empty floor.
-fn quality_floor(options: &RunOptions) -> (String, String) {
+pub(crate) fn quality_floor(options: &RunOptions) -> (String, String) {
     let slug = options.effective_slug();
     let root = &options.project_root;
 
@@ -1340,7 +1340,7 @@ fn lean_directive(
 
 /// Which review node is running — selects the team + the blackboard surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReviewKind {
+pub enum ReviewKind {
     /// The docs gate: PM / architect / UIUX review the three core documents.
     Docs,
     /// The preview gate: UIUX / frontend review the delivered frontend.
@@ -1430,7 +1430,7 @@ async fn review_and_rework(
 }
 
 /// The team for a review node, scaled to the task via the planner's tiering.
-fn team_for(kind: ReviewKind, requirement: &str) -> Vec<Box<dyn RoleCritic>> {
+pub(crate) fn team_for(kind: ReviewKind, requirement: &str) -> Vec<Box<dyn RoleCritic>> {
     let tier = crate::planner::classify(requirement);
     match kind {
         ReviewKind::Docs => crate::critics::docs_team_for_kind(tier),
@@ -1444,7 +1444,7 @@ fn team_for(kind: ReviewKind, requirement: &str) -> Vec<Box<dyn RoleCritic>> {
 /// seat. Each verdict is recorded to the team ledger. Fully fail-open: a base
 /// that can't fork, an offline brain, or a parse failure yields empty accepting
 /// verdicts → no blocking.
-async fn run_review_team(
+pub(crate) async fn run_review_team(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
@@ -1518,7 +1518,7 @@ async fn run_review_team(
 /// timeout converts that hang into a [`SessionError::Start`], which `review_one`
 /// already treats as a fail-open ACCEPT (the seat consults nothing). Fail-open by
 /// contract: a wedged fork degrades one seat to advisory-accept, never blocks.
-async fn fork_with_timeout(
+pub(crate) async fn fork_with_timeout(
     session: &mut dyn BaseSession,
 ) -> Result<Box<dyn BaseSession>, SessionError> {
     match tokio::time::timeout(fork_establish_timeout(), session.fork()).await {
@@ -1549,7 +1549,7 @@ async fn review_one(
 /// the SAME governance + audit + approval path a normal phase turn uses. Returns
 /// `true` when the turn finished (clean or truncated-but-accepted), `false` on a
 /// failed turn / a dead session (fail-open: the caller stops reworking).
-async fn drive_rework_turn(
+pub(crate) async fn drive_rework_turn(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
@@ -1624,7 +1624,7 @@ fn rework_directive(kind: ReviewKind, blocking: &[String]) -> String {
 /// The on-disk blackboard surface for a review node — the docs / code the main
 /// session wrote, read fresh so a rework round reviews the UPDATED files. Owns
 /// its strings so the borrowed [`CriticArtifacts`] can point into it.
-struct Blackboard {
+pub(crate) struct Blackboard {
     prd: String,
     architecture: String,
     uiux: String,
@@ -1637,7 +1637,7 @@ impl Blackboard {
     /// Read the surface a review node needs. Docs → the three `output/*.md`;
     /// preview / quality → the architecture/UIUX context + a digest of the real
     /// source files. All reads are fail-open (a missing file → empty string).
-    fn read(options: &RunOptions, kind: ReviewKind) -> Self {
+    pub(crate) fn read(options: &RunOptions, kind: ReviewKind) -> Self {
         let slug = options.effective_slug();
         let root = &options.project_root;
         let doc = |name: &str| {
@@ -1672,7 +1672,7 @@ impl Blackboard {
     }
 
     /// Borrow the blackboard as the critic-facing [`CriticArtifacts`].
-    fn artifacts<'a>(&'a self, requirement: &'a str) -> CriticArtifacts<'a> {
+    pub(crate) fn artifacts<'a>(&'a self, requirement: &'a str) -> CriticArtifacts<'a> {
         CriticArtifacts {
             requirement,
             prd: &self.prd,
@@ -1716,21 +1716,21 @@ fn source_digest(options: &RunOptions) -> String {
 /// `BaseSession::fork()`. The fork is owned for the seat's lifetime; a fork that
 /// failed to open (or an offline brain) makes `judge` fail-open to the empty
 /// (accepting) verdict — an absent critic can NEVER block (invariant 1).
-struct ForkConsult {
+pub(crate) struct ForkConsult {
     /// The read-only fork, or the error that prevented opening one. `Mutex` so
     /// the `&self` `judge` can drive the `&mut` session.
     fork: tokio::sync::Mutex<Result<Box<dyn BaseSession>, SessionError>>,
 }
 
 impl ForkConsult {
-    fn new(fork: Result<Box<dyn BaseSession>, SessionError>) -> Self {
+    pub(crate) fn new(fork: Result<Box<dyn BaseSession>, SessionError>) -> Self {
         Self {
             fork: tokio::sync::Mutex::new(fork),
         }
     }
 
     /// Best-effort close the underlying fork session.
-    async fn end(&self) {
+    pub(crate) async fn end(&self) {
         if let Ok(s) = self.fork.lock().await.as_mut() {
             let _ = s.end().await;
         }
