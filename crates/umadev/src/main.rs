@@ -2525,13 +2525,11 @@ async fn drive_director_run(
     // orchestrates with its team however it judges fit (no fixed phase checklist).
     let directive = umadev_agent::experts::director_build_directive(&options.requirement);
 
-    // Wave 1: `/run` is an EXPLICIT build — route it (Tier-0 is enough; the intent
-    // is already known to be a build, so we skip the Tier-1 fork latency and pass
-    // `None`) so the director emits a visible intent card AND synthesizes the owned
-    // plan/checklist. The route classifies the kind + sizes the team; the plan loop
-    // makes the director legible instead of a silent mega-turn. Fail-open: routing
-    // is deterministic and never blocks.
-    let route = umadev_agent::router::route(None, options, &options.requirement).await;
+    // Wave 1: `/run` is an EXPLICIT build — `router::for_run` forces the `Build`
+    // class (never second-guesses a clear build into a quick-edit) while still
+    // sizing kind/depth/team from the text, so the director emits a visible intent
+    // card AND synthesizes the owned plan/checklist. Deterministic, no fork latency.
+    let route = umadev_agent::router::for_run(&options.requirement);
 
     // USB model (no marker protocol): drive the goal through the director build
     // loop — the firmware (team identity + craft) is injected, the base's body

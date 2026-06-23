@@ -237,6 +237,35 @@ impl RoutePlan {
 /// brain, a fork that won't open, a timed-out / unparseable consult — yields the
 /// pure Tier-0 deterministic [`RoutePlan`]. This function never returns an error and
 /// never blocks the host.
+/// The route for an EXPLICIT build entry (`/run`, `Action::StartRun`, the CLI
+/// `run` verb). The user invoked the build command, so the **class is known to be
+/// `Build`** — we do NOT re-derive intent and risk second-guessing a clear build
+/// into a `QuickEdit`/`Chat`. Tier-0 still sizes the *kind / depth / team* from the
+/// text (a single page is a `Fast` build; a full product is `Standard`/`Deep`), but
+/// the class is forced to `Build` so the director always synthesizes and shows a
+/// plan. Deterministic — no fork, no latency.
+#[must_use]
+pub fn for_run(requirement: &str) -> RoutePlan {
+    let mut r = tier0(requirement);
+    // Force the known class; re-size the team for a Build of this kind/depth if
+    // Tier-0 had sized a non-build (e.g. it read the text as Chat/Explain).
+    if r.class != RouteClass::Build {
+        r.class = RouteClass::Build;
+        // A bare/odd requirement under an explicit run still builds — never below
+        // Fast, and ensure a real build team rather than a chat one.
+        if matches!(r.depth, Depth::Fast) && r.team.is_empty() {
+            // keep Fast (proportional) but give it a build team
+        }
+        r.team = tier0_team(r.kind, RouteClass::Build, r.depth);
+        r.est_budget = Budget::for_route(RouteClass::Build, r.depth);
+    }
+    r
+}
+
+/// Route a turn: run the deterministic Tier-0 floor, then (when a `session` is
+/// given) refine with a fail-open Tier-1 brain consult on a read-only fork. The
+/// brain may escalate but never drops below the safe floor. Returns the Tier-0
+/// result on `None` / any consult failure.
 pub async fn route(
     session: Option<&mut dyn BaseSession>,
     options: &RunOptions,
@@ -290,6 +319,46 @@ fn tier0(requirement: &str) -> RoutePlan {
     }
 }
 
+/// Whether the text asks to CREATE a new thing (a build) vs EDIT an existing one.
+/// Deterministic verb heuristic; the brain (Tier-1) refines it. Used to split an
+/// ambiguous `Light` kind between a small Build and a QuickEdit.
+fn is_create_request(requirement: &str) -> bool {
+    let q = requirement.to_lowercase();
+    const CREATE: &[&str] = &[
+        "做一个",
+        "做个",
+        "做一款",
+        "建一个",
+        "搭一个",
+        "搭个",
+        "写一个",
+        "写个",
+        "新建",
+        "开发一个",
+        "开发个",
+        "生成一个",
+        "实现一个",
+        "来一个",
+        "整一个",
+        "create",
+        "build",
+        "make a",
+        "make me",
+        "scaffold",
+        "generate a",
+        "implement a",
+        "build me",
+        "set up a",
+        "new app",
+        "new project",
+        "new page",
+    ];
+    // A bare "做/建/写 + a noun-ish thing" also counts, but keep the floor cautious:
+    // require one of the explicit create phrases. An edit ("改/修改/调整/rename/把…改成")
+    // has none of these → QuickEdit.
+    CREATE.iter().any(|v| q.contains(v))
+}
+
 /// Map the planner's [`TaskKind`] + a work-class signal to the conservative
 /// (class, depth) floor. Deterministic and intentionally cautious: it never routes
 /// to a heavier class than the keywords justify (the brain may escalate later).
@@ -314,8 +383,19 @@ fn floor_class_depth(kind: TaskKind, is_work: bool, requirement: &str) -> (Route
         TaskKind::Refactor => (RouteClass::QuickEdit, Depth::Standard),
         // Docs/research only → an Explain-class read+write (no run-lock heaviness).
         TaskKind::DocsOnly => (RouteClass::Explain, Depth::Fast),
-        // A trivially-small build → QuickEdit (fast single-writer).
-        TaskKind::Light => (RouteClass::QuickEdit, Depth::Fast),
+        // A `Light` kind is ambiguous between a small BUILD ("做一个简单的待办单页"
+        // — create a new thing) and a small EDIT ("改个文案" — tweak existing code).
+        // Disambiguate by intent verb: a create request is a fast Build (gets the
+        // build path + a short visible plan); otherwise it's a QuickEdit (a fast
+        // single-writer edit, no plan). Both are Fast — proportional, no heavy
+        // process. (Tier-1's brain refines this when it's available.)
+        TaskKind::Light => {
+            if is_create_request(requirement) {
+                (RouteClass::Build, Depth::Fast)
+            } else {
+                (RouteClass::QuickEdit, Depth::Fast)
+            }
+        }
     }
 }
 
@@ -794,6 +874,43 @@ mod tests {
     async fn tier0_bugfix_is_debug() {
         let p = route(None, &opts(), "登录一直报错,帮我修一下").await;
         assert_eq!(p.class, RouteClass::Debug);
+    }
+
+    #[tokio::test]
+    async fn small_create_request_is_a_build_not_a_quick_edit() {
+        // "做一个待办单页" CREATES a new thing -> a (fast) Build that gets a visible
+        // plan, NOT a QuickEdit. This is what the /run smoke mis-routed before.
+        let p = route(
+            None,
+            &opts(),
+            "做一个待办清单单页应用,纯前端,添加/完成/删除",
+        )
+        .await;
+        assert_eq!(
+            p.class,
+            RouteClass::Build,
+            "a create request must be a Build"
+        );
+    }
+
+    #[test]
+    fn for_run_always_forces_build_even_for_a_terse_goal() {
+        // The explicit /run command KNOWS the intent is a build — it must never
+        // second-guess a clear/terse build into a quick-edit, so a plan always shows.
+        // (A Fast single-page build legitimately convenes no critic team — only the
+        // class is the invariant here.)
+        for goal in ["做一个待办应用", "改个东西", "x", "a tiny thing"] {
+            let p = for_run(goal);
+            assert_eq!(p.class, RouteClass::Build, "/run forces Build for: {goal}");
+        }
+    }
+
+    #[test]
+    fn is_create_request_splits_create_from_edit() {
+        assert!(is_create_request("做一个待办应用"));
+        assert!(is_create_request("build me a landing page"));
+        assert!(!is_create_request("改个文案,把标题改成 Welcome"));
+        assert!(!is_create_request("rename this variable"));
     }
 
     #[tokio::test]
