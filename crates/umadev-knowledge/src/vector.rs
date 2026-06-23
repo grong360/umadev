@@ -250,6 +250,32 @@ impl VectorStore {
         scored
     }
 
+    /// Like [`VectorStore::search`] but returns the collision-safe `chunk_idx`
+    /// for each hit as `(chunk_idx, score)` ranked by descending cosine
+    /// similarity (P0-2).
+    ///
+    /// `(path, section)` is NOT a unique chunk key — `Overview`/`Document`
+    /// synthetic sections and the `knowledge/` vs `learned/` path overlap make
+    /// collisions the norm — so the BM25↔vector fuser must NOT remap vector hits
+    /// through it (a collision there silently dropped a legitimate, differently
+    /// indexed chunk). Each `StoredVector` already carries the `chunk_idx` it was
+    /// built at; this exposes it directly so the fuser keys on the SAME positional
+    /// address space as BM25, with no lossy `(path, section)` round-trip.
+    #[must_use]
+    pub fn search_with_idx(&self, query_vec: &[f32], top_k: usize) -> Vec<(u32, f32)> {
+        if self.vectors.is_empty() || query_vec.len() != self.dim || top_k == 0 {
+            return Vec::new();
+        }
+        let mut scored: Vec<(u32, f32)> = self
+            .vectors
+            .iter()
+            .map(|v| (v.chunk_idx, cosine(&v.vec, query_vec)))
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(top_k);
+        scored
+    }
+
     /// Expose the stored entries as `(chunk_idx, path, section, body_hash,
     /// vec)` tuples, for the index builder to diff against current chunks
     /// during incremental re-embedding. This is the cache-reuse accessor.
@@ -664,6 +690,43 @@ mod tests {
         assert_eq!(hits[1].0, "c");
         assert_eq!(hits[2].0, "b");
         assert!((hits[0].2 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn search_with_idx_returns_chunk_idx_in_similarity_order() {
+        // P0-2: the collision-safe accessor returns each hit's `chunk_idx` (NOT
+        // the lossy (path, section)), in the SAME similarity order as `search`.
+        // Two entries deliberately share (path, section) but have distinct
+        // chunk_idx — both must be returned distinctly.
+        let store = VectorStore {
+            model: "test".into(),
+            dim: 3,
+            vectors: vec![
+                StoredVector {
+                    path: "security/x.md".into(),
+                    section: "Document".into(),
+                    vec: vec![1.0, 0.0, 0.0],
+                    body_hash: 0,
+                    chunk_idx: 5,
+                },
+                StoredVector {
+                    // SAME (path, section) as above — a collision the old remap
+                    // would have dropped; here it keeps its own chunk_idx.
+                    path: "security/x.md".into(),
+                    section: "Document".into(),
+                    vec: vec![0.9, 0.1, 0.0],
+                    body_hash: 0,
+                    chunk_idx: 9,
+                },
+            ],
+        };
+        let hits = store.search_with_idx(&[1.0, 0.0, 0.0], 3);
+        assert_eq!(hits.len(), 2, "both colliding-section entries returned");
+        assert_eq!(
+            hits[0].0, 5,
+            "the identical vector ranks first by chunk_idx"
+        );
+        assert_eq!(hits[1].0, 9, "the colliding sibling is kept, not dropped");
     }
 
     #[test]

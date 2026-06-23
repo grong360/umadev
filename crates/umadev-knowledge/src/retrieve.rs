@@ -183,6 +183,34 @@ pub fn phase_subdirs(phase: Phase) -> &'static [&'static str] {
     }
 }
 
+/// The ordered list of source directories that make up the retrieval corpus:
+/// the curated `knowledge/` tree first, then the project-local
+/// `.umadev/learned/` and the global `~/.umadev/learned/` sediment dirs (each
+/// only when it exists). This is the EXACT dir list — and therefore the EXACT
+/// chunk ordering — that [`retrieve`] builds its BM25 index over.
+///
+/// Exposed (P0 semantic-layer fix) so the vector store is built over the SAME
+/// multi-dir index retrieval reads: only then does the store's per-chunk
+/// `chunk_idx` align with the index the fuser uses, so the BM25↔vector fusion
+/// can key on `chunk_idx` (collision-safe) rather than the ambiguous
+/// `(path, section)` pair. `knowledge_dir` is the curated root (usually
+/// `phases::knowledge_root(project_root)`).
+#[must_use]
+pub fn corpus_dirs(project_root: &Path, knowledge_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![knowledge_dir.to_path_buf()];
+    let project_learned = project_root.join(".umadev/learned");
+    if project_learned.is_dir() {
+        dirs.push(project_learned);
+    }
+    if let Some(home) = home_dir() {
+        let global_learned = home.join(".umadev/learned");
+        if global_learned.is_dir() {
+            dirs.push(global_learned);
+        }
+    }
+    dirs
+}
+
 /// Run a retrieval query against the project's knowledge base.
 ///
 /// Builds (or loads the cached) BM25 index, optionally queries the vector
@@ -266,19 +294,7 @@ pub fn retrieve_with_vector_and_expansion(
     }
 
     // Build / load the BM25 index over knowledge/ + any learned dirs.
-    // Learned dirs (.umadev/learned/ and ~/.umadev/learned/) hold
-    // auto-sedimented experience from prior runs.
-    let mut dirs = vec![knowledge_dir.to_path_buf()];
-    let project_learned = project_root.join(".umadev/learned");
-    if project_learned.is_dir() {
-        dirs.push(project_learned);
-    }
-    if let Some(home) = home_dir() {
-        let global_learned = home.join(".umadev/learned");
-        if global_learned.is_dir() {
-            dirs.push(global_learned);
-        }
-    }
+    let dirs = corpus_dirs(project_root, knowledge_dir);
     let index = load_or_build_index_multi(project_root, &dirs);
     if index.chunks.is_empty() {
         return Vec::new();
@@ -326,10 +342,12 @@ pub fn retrieve_with_vector_and_expansion(
     let ranked = if use_vector {
         let query_vec = query_vec.unwrap_or(&[]);
         let store = vector::VectorStore::load(project_root);
+        // P0-2: collision-safe — fuse on the store's `chunk_idx`, not the lossy
+        // `(path, section)` remap that silently dropped legitimate colliding hits.
         let vec_hits = if store.is_empty() {
             Vec::new()
         } else {
-            store.search(query_vec, config.top_k * 3)
+            store.search_with_idx(query_vec, config.top_k * 3)
         };
         if vec_hits.is_empty() {
             bm25_hits
@@ -707,35 +725,30 @@ fn rrf_fuse_bm25(
 /// `1/(k + rank)`. `k=60` is the standard RRF constant (Elasticsearch,
 /// original Cormack et al. paper).
 ///
-/// BM25 hits are addressed by chunk index; vector hits by `(path, section)`.
-/// We build a `(path, section) → chunk_idx` map from the index to unify the
-/// two address spaces, then fuse. A chunk appearing in both lists gets a
-/// higher fused score (the whole point of hybrid retrieval). Returns chunk
-/// indices ranked by fused score, truncated to `top_k`.
+/// Both lists now address chunks by the SAME positional `chunk_idx`: BM25
+/// natively, and vector hits via [`VectorStore::search_with_idx`] (the store's
+/// per-chunk `chunk_idx` is built over the same multi-dir index retrieval reads).
+/// A chunk appearing in both lists gets a higher fused score (the whole point of
+/// hybrid retrieval). Returns chunk indices ranked by fused score, truncated to
+/// `top_k`.
+///
+/// P0-2: the previous implementation re-mapped vector hits through a `(path,
+/// section) → chunk_idx` table and DROPPED any colliding key — but `(path,
+/// section)` collisions are the NORM (synthetic `Overview`/`Document` sections;
+/// the `knowledge/` vs `learned/` path overlap), so legitimate, distinctly
+/// indexed vector hits were silently lost (a retrieval leak). Keying directly on
+/// the collision-safe `chunk_idx` ends that — a vector hit can never overwrite or
+/// be dropped on behalf of a different chunk that merely shares a section name.
+/// A stale `chunk_idx` (source chunk removed since the store was built) is simply
+/// ignored when it falls outside the current index — fail-open, never a panic.
 fn rrf_fuse(
     index: &Bm25Index,
     bm25: &[(usize, f64)],
-    vector_hits: &[(&str, &str, f32)],
+    vector_hits: &[(u32, f32)],
     k: u32,
     top_k: usize,
 ) -> Vec<(usize, f64)> {
-    // Map (path\0section) → chunk_idx so vector hits can be normalised to
-    // the same address space as BM25 hits.
-    // When the merged corpus (knowledge/ + learned dirs) contains two chunks
-    // with the SAME (path, section) — e.g. knowledge/security/x.md and
-    // .umadev/learned/security/x.md both strip to security/x.md — a vector hit
-    // can't be unambiguously mapped back. Track those collisions and skip the
-    // vector boost for them rather than boost the WRONG chunk (BM25, which keys
-    // on the real chunk_idx, still ranks them correctly).
-    let mut key_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (i, chunk) in index.chunks.iter().enumerate() {
-        let key = format!("{}\0{}", chunk.meta.path, chunk.meta.section);
-        if key_to_idx.insert(key.clone(), i).is_some() {
-            ambiguous.insert(key);
-        }
-    }
-
+    let n_chunks = index.chunks.len();
     let mut scores: HashMap<usize, f64> = HashMap::new();
     let kf = f64::from(k);
 
@@ -744,16 +757,16 @@ fn rrf_fuse(
         *scores.entry(*chunk_idx).or_insert(0.0) += 1.0 / (kf + rank as f64 + 1.0);
     }
 
-    // Vector contribution: rank 0 is the top hit. Only count hits that map
-    // to a known chunk (drops stale vectors whose source chunk was removed).
-    for (rank, (path, section, _)) in vector_hits.iter().enumerate() {
-        let key = format!("{path}\0{section}");
-        if ambiguous.contains(&key) {
-            continue; // colliding key — don't risk boosting the wrong chunk
+    // Vector contribution: rank 0 is the top hit. Key DIRECTLY on chunk_idx (no
+    // lossy `(path, section)` remap). Drop only a genuinely STALE index — one
+    // that points past the current chunk set (its source chunk was removed since
+    // the store was built) — never a valid hit that merely collides on section.
+    for (rank, (chunk_idx, _)) in vector_hits.iter().enumerate() {
+        let idx = *chunk_idx as usize;
+        if idx >= n_chunks {
+            continue; // stale vector — source chunk no longer in the index
         }
-        if let Some(&chunk_idx) = key_to_idx.get(&key) {
-            *scores.entry(chunk_idx).or_insert(0.0) += 1.0 / (kf + rank as f64 + 1.0);
-        }
+        *scores.entry(idx).or_insert(0.0) += 1.0 / (kf + rank as f64 + 1.0);
     }
 
     let mut fused: Vec<(usize, f64)> = scores.into_iter().collect();
@@ -959,7 +972,6 @@ mod tests {
 
     #[test]
     fn rrf_fuse_merges_and_promotes_overlap() {
-        // Build a small index so vector (path,section) hits can map back.
         let chunks = crate::chunker::chunk_text(
             "security/login.md",
             "# Login\n\n## OAuth\n\noauth pkce\n\n## Risks\ntoken theft",
@@ -967,11 +979,8 @@ mod tests {
         let index = Bm25Index::from_chunks(chunks);
         // BM25 ranks chunk 0 (OAuth) first, chunk 1 (Risks) second.
         let bm25: Vec<(usize, f64)> = vec![(0, 5.0), (1, 1.0)];
-        // Vector also ranks chunk 0's (path, section) first.
-        let vec_hits: Vec<(&str, &str, f32)> = vec![
-            ("security/login.md", "OAuth", 0.98),
-            ("security/login.md", "Risks", 0.70),
-        ];
+        // Vector (keyed on chunk_idx) also ranks chunk 0 first.
+        let vec_hits: Vec<(u32, f32)> = vec![(0, 0.98), (1, 0.70)];
         let fused = rrf_fuse(&index, &bm25, &vec_hits, 60, 5);
         // Chunk 0 appears at rank 0 in both lists → highest fused score.
         assert_eq!(fused[0].0, 0);
@@ -979,16 +988,43 @@ mod tests {
     }
 
     #[test]
-    fn rrf_fuse_drops_unknown_vector_hits() {
+    fn rrf_fuse_drops_stale_vector_idx() {
         let chunks = crate::chunker::chunk_text("a.md", "# A\n\n## S\n\nbody");
-        let index = Bm25Index::from_chunks(chunks);
+        let index = Bm25Index::from_chunks(chunks); // 1 chunk → valid idx is 0
         let bm25: Vec<(usize, f64)> = vec![(0, 3.0)];
-        // A vector hit whose (path, section) doesn't exist in the index.
-        let vec_hits: Vec<(&str, &str, f32)> = vec![("gone.md", "X", 0.9)];
+        // A vector hit pointing past the current chunk set (its source chunk was
+        // removed since the store was built) is ignored — fail-open, no panic.
+        let vec_hits: Vec<(u32, f32)> = vec![(99, 0.9)];
         let fused = rrf_fuse(&index, &bm25, &vec_hits, 60, 5);
-        // Only the known BM25 chunk survives.
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].0, 0);
+    }
+
+    #[test]
+    fn rrf_fuse_keeps_colliding_section_chunks_distinct() {
+        // P0-2 regression: two DIFFERENT chunks that share the same (path,
+        // section) — the norm for synthetic `Document`/`Overview` sections and the
+        // knowledge/ vs learned/ path overlap — must BOTH be fusable. The old
+        // (path, section) remap dropped one of them; keying on chunk_idx keeps
+        // them distinct. Build an index whose chunks 0 and 1 share (path, section).
+        let mut a = crate::chunker::chunk_text("security/x.md", "# X\n\nbody-a")[0].clone();
+        let mut b = a.clone();
+        // Force identical (path, section) on two distinct chunks.
+        a.meta.section = "Document".to_string();
+        b.meta.section = "Document".to_string();
+        a.body = "alpha".to_string();
+        b.body = "beta".to_string();
+        let index = Bm25Index::from_chunks(vec![a, b]);
+        // BM25 surfaced only chunk 0; the VECTOR channel surfaced chunk 1 (the
+        // colliding sibling). Both must contribute — chunk 1 must NOT be dropped.
+        let bm25: Vec<(usize, f64)> = vec![(0, 4.0)];
+        let vec_hits: Vec<(u32, f32)> = vec![(1, 0.95)];
+        let fused = rrf_fuse(&index, &bm25, &vec_hits, 60, 5);
+        let ids: Vec<usize> = fused.iter().map(|(i, _)| *i).collect();
+        assert!(
+            ids.contains(&0) && ids.contains(&1),
+            "both colliding-section chunks must survive fusion: {ids:?}"
+        );
     }
 
     #[test]
@@ -1134,11 +1170,7 @@ mod tests {
         );
         let index = Bm25Index::from_chunks(chunks);
         let bm25: Vec<(usize, f64)> = vec![(0, 3.0), (1, 2.0), (2, 1.0)];
-        let vec_hits: Vec<(&str, &str, f32)> = vec![
-            ("a.md", "One", 0.9),
-            ("a.md", "Two", 0.7),
-            ("a.md", "Three", 0.5),
-        ];
+        let vec_hits: Vec<(u32, f32)> = vec![(0, 0.9), (1, 0.7), (2, 0.5)];
         let fused = rrf_fuse(&index, &bm25, &vec_hits, 60, 2);
         assert_eq!(fused.len(), 2);
     }

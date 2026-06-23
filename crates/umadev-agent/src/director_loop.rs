@@ -124,13 +124,81 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 /// unparseable value falls back to the default (fail-open: a bad env never
 /// disables the watchdog, which would re-introduce the permanent hang). Read once
 /// per turn at the app boundary, not per wait, so a mid-turn env flip can't race.
-fn idle_timeout() -> Duration {
+///
+/// `pub(crate)` so every main-session event pump (this loop, plus
+/// [`crate::continuous`]'s `drive_phase` / `drive_rework_turn`) reads the SAME
+/// window from ONE place — the consistency the P1-11 fix depends on.
+pub(crate) fn idle_timeout() -> Duration {
     let secs = std::env::var("UMADEV_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// A short, fixed ceiling on the best-effort `interrupt()` issued when the idle
+/// watchdog fires. A base that has wedged its event stream can also wedge the
+/// interrupt path (the same dead pipe), so the interrupt is ITSELF bounded —
+/// otherwise the watchdog would just move the permanent hang from `next_event`
+/// to `interrupt`. 5s is ample for a live child to acknowledge a signal; a dead
+/// one simply times out and the pump settles regardless.
+const INTERRUPT_TIMEOUT_SECS: u64 = 5;
+
+/// The result of ONE idle-guarded `next_event()` wait — the shared primitive
+/// every main-session event pump uses so the "stops emitting but never exits"
+/// hang can NEVER wedge a pump (the P0-3 / P1-11 zero-stall fix).
+pub(crate) enum IdleEvent {
+    /// The base emitted an event (the idle timer is reset by the caller looping).
+    Event(SessionEvent),
+    /// `next_event()` returned `None` — the session ended (process dead / EOF).
+    /// The pump treats this as a failed turn (fail-open, no panic).
+    SessionEnded,
+    /// No event arrived within the idle window — the base is hung. The watchdog
+    /// has already issued a best-effort (bounded) `interrupt()`; the pump settles
+    /// the turn as a failure so `thinking` clears rather than blocking forever.
+    IdleTimedOut,
+}
+
+/// Wait for the next session event under the idle watchdog — the ONE place the
+/// "base hung holding the pipe open" failure is converted into a settle instead
+/// of a permanent block. Used by EVERY main-session event pump (this loop's
+/// `drive_one_turn`, and [`crate::continuous`]'s `drive_phase` /
+/// `drive_rework_turn`) so the protection can't be "fixed in A, forgotten in B".
+///
+/// Bounds the wait by `idle`; ANY event resets it (the caller loops, calling this
+/// again with the full window), so a legitimately-long streaming compile/test
+/// turn survives as long as it emits SOMETHING. Pure silence past the window
+/// issues a best-effort `interrupt()` — itself bounded by [`INTERRUPT_TIMEOUT_SECS`]
+/// so a wedged interrupt path can't re-introduce the hang — then returns
+/// [`IdleEvent::IdleTimedOut`]. Fail-open by contract: a bad/dead session always
+/// resolves to a settle, never a wedge.
+pub(crate) async fn next_event_idle(session: &mut dyn BaseSession, idle: Duration) -> IdleEvent {
+    match tokio::time::timeout(idle, session.next_event()).await {
+        Ok(Some(ev)) => IdleEvent::Event(ev),
+        Ok(None) => IdleEvent::SessionEnded,
+        Err(_) => {
+            // No event within the idle window → the base is hung. Best-effort
+            // interrupt to release the child, but bound the interrupt itself so a
+            // dead pipe can't wedge it (the watchdog must always make progress).
+            let _ = tokio::time::timeout(
+                Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
+                session.interrupt(),
+            )
+            .await;
+            IdleEvent::IdleTimedOut
+        }
+    }
+}
+
+/// The machine-true reason string for an idle-watchdog settle — shared so every
+/// pump reports the hang identically (and the TUI / tests match on `"idle"`).
+pub(crate) fn idle_reason(idle: Duration) -> String {
+    format!(
+        "base went idle — no output for {}s (possible hang); settled. \
+         Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
+        idle.as_secs()
+    )
 }
 
 /// How the director loop settled. Mirrors the caller's existing director outcome but
@@ -265,31 +333,26 @@ async fn drive_one_turn(
     }
     let mut text = String::new();
     loop {
-        // Idle watchdog (P1-2): a base that HANGS (stops emitting stdout but never
-        // exits) would leave `next_event()` blocked forever — no `TurnDone`, no
-        // settle, `thinking` stuck. So bound each wait by `idle`; ANY event resets
-        // it (a legitimately-long streaming compile/test turn stays alive as long
-        // as it emits output), but pure silence past the window settles the turn as
-        // a Failed outcome — fail-open, never a permanent wedge. The session driver
-        // is a pure relay by design (no internal timeout), so the watchdog lives
-        // here, the one place both the CLI and TUI director paths flow through.
-        let ev = match tokio::time::timeout(idle, session.next_event()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => {
+        // Idle watchdog (P0-3 / P1-11): a base that HANGS (stops emitting stdout
+        // but never exits) would leave `next_event()` blocked forever — no
+        // `TurnDone`, no settle, `thinking` stuck. The shared [`next_event_idle`]
+        // bounds each wait by `idle` (ANY event resets it, so a long streaming
+        // compile/test turn survives as long as it emits SOMETHING) and converts
+        // pure silence into a settle. The SAME primitive guards every main-session
+        // pump (here + `continuous::drive_phase` / `drive_rework_turn`), so the
+        // protection can't be "fixed in one, forgotten in another".
+        let ev = match next_event_idle(session, idle).await {
+            IdleEvent::Event(ev) => ev,
+            IdleEvent::SessionEnded => {
                 // `None` = the session ended (process dead / EOF). Per the
                 // BaseSession contract, treat as a failed turn — fail-open, no panic.
                 return Err("base session ended mid-turn".to_string());
             }
-            Err(_) => {
+            IdleEvent::IdleTimedOut => {
                 // No event within the idle window → the base is hung. Settle as a
                 // Failed outcome so the loop ends and `thinking` clears, rather than
-                // blocking forever. Best-effort interrupt to release the child.
-                let _ = session.interrupt().await;
-                return Err(format!(
-                    "base went idle — no output for {}s (possible hang); settled. \
-                     Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
-                    idle.as_secs()
-                ));
+                // blocking forever (the interrupt was already issued, bounded).
+                return Err(idle_reason(idle));
             }
         };
         match ev {

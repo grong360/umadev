@@ -1917,10 +1917,26 @@ impl<R: Runtime> AgentRunner<R> {
         // Build (or incrementally update) the vector store for the corpus.
         // This is the no-longer-stubbed batch embedding: chunks are embedded
         // in batches of 100 and cached at .umadev/kb-index/vectors.bin.
-        let knowledge_dir = self.options.project_root.join("knowledge");
+        //
+        // P0 (semantic layer was DEAD in production): this MUST build over the
+        // SAME corpus retrieval reads — `phases::knowledge_root` (the project's
+        // own `knowledge/` when it has content, else the bundled corpus pointed
+        // to by `UMADEV_KNOWLEDGE_DIR` that the npm launcher sets). The old
+        // `project_root/knowledge` hardcode meant that on an npm install the
+        // build site saw an EMPTY dir while retrieval read the bundled corpus —
+        // so the vector store was NEVER built and hybrid silently degraded to
+        // pure BM25 even with an embedding key configured. Building at
+        // `knowledge_root()` makes the semantic layer actually take effect.
+        let knowledge_dir = crate::phases::knowledge_root(&self.options.project_root);
         if knowledge_dir.is_dir() {
+            // Build the vector store over the SAME multi-dir index retrieval uses
+            // (knowledge/ + the learned sediment dirs), so the store's per-chunk
+            // `chunk_idx` aligns with the index the fuser keys on. Using the
+            // single-dir index here would store chunk indices that don't match the
+            // retrieve-time multi-dir index, defeating the collision-safe fusion.
+            let dirs = umadev_knowledge::corpus_dirs(&self.options.project_root, &knowledge_dir);
             let index =
-                umadev_knowledge::load_or_build_index(&self.options.project_root, &knowledge_dir);
+                umadev_knowledge::load_or_build_index_multi(&self.options.project_root, &dirs);
             // Batch embedding is a long network round-trip per corpus chunk —
             // keep the UI alive while it runs instead of a silent stall.
             let _ = self

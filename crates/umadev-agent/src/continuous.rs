@@ -214,6 +214,11 @@ pub async fn run_block(
     let plan = crate::planner::plan(&options.requirement);
     let produces_code = plan.includes(Phase::Frontend) || plan.includes(Phase::Backend);
 
+    // Read the idle watchdog window ONCE at the boundary (not per-wait), so a
+    // mid-run env flip can't race the in-flight phase pumps. Threaded into every
+    // `drive_phase` so each main-session phase pump is idle-guarded (P1-11).
+    let idle = crate::director_loop::idle_timeout();
+
     // Persist the project's governance context BEFORE any phase writes a file, so
     // the out-of-process PreToolUse hook (which reads `.umadev/governance-context.
     // json`) governs by it from the very first write — otherwise a clean static
@@ -307,6 +312,7 @@ pub async fn run_block(
             phase,
             std::mem::take(&mut first_directive),
             plan.kind,
+            idle,
         )
         .await;
         // `first_directive` is consumed by `std::mem::take` only when this is
@@ -421,6 +427,9 @@ async fn drive_phase(
     phase: Phase,
     first_directive: bool,
     kind: crate::planner::TaskKind,
+    // Idle watchdog window (P1-11), passed in so the env is read ONCE at the
+    // `run_block` boundary and the test can drive a tiny deterministic window.
+    idle: std::time::Duration,
 ) -> PhaseResult {
     let directive = phase_directive(options, phase, first_directive, kind);
     if let Err(e) = session.send_turn(directive).await {
@@ -428,13 +437,26 @@ async fn drive_phase(
     }
 
     let policy = umadev_governance::Policy::load(&options.project_root);
-
+    // Idle watchdog (P1-11): this is a naked-pump path the original P1-2 fix
+    // MISSED — a base that hangs mid-phase (stops emitting, never exits) would
+    // wedge the WHOLE phase forever on `next_event().await`. Reuse the SAME
+    // shared idle primitive + window the director loop uses so every
+    // main-session pump has identical zero-stall protection.
     loop {
-        let Some(ev) = session.next_event().await else {
-            // `None` = the underlying session ended (process dead / EOF). Per
-            // the BaseSession contract, treat as a failed turn — fail-open, no
-            // panic.
-            return PhaseResult::Failed("session ended mid-turn".to_string());
+        let ev = match crate::director_loop::next_event_idle(session, idle).await {
+            crate::director_loop::IdleEvent::Event(ev) => ev,
+            crate::director_loop::IdleEvent::SessionEnded => {
+                // `None` = the underlying session ended (process dead / EOF). Per
+                // the BaseSession contract, treat as a failed turn — fail-open, no
+                // panic.
+                return PhaseResult::Failed("session ended mid-turn".to_string());
+            }
+            crate::director_loop::IdleEvent::IdleTimedOut => {
+                // The base hung mid-phase — settle as a failed turn (the interrupt
+                // was already issued, bounded) so the run ends honestly instead of
+                // freezing the phase forever.
+                return PhaseResult::Failed(crate::director_loop::idle_reason(idle));
+            }
         };
         match ev {
             SessionEvent::TextDelta(text) => {
@@ -1574,13 +1596,46 @@ pub(crate) async fn drive_rework_turn(
     events: &Arc<dyn EventSink>,
     directive: String,
 ) -> bool {
+    // Read the idle window ONCE at the boundary (not per-wait), so a mid-turn env
+    // flip can't race; the deterministic core takes it as a param (the test drives
+    // it with a tiny window, no process-env mutation to race).
+    drive_rework_turn_with_idle(
+        session,
+        options,
+        events,
+        directive,
+        crate::director_loop::idle_timeout(),
+    )
+    .await
+}
+
+/// [`drive_rework_turn`] with an explicit idle window — the env read is hoisted
+/// to the wrapper so this core is deterministic for the idle-watchdog test.
+async fn drive_rework_turn_with_idle(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+    idle: std::time::Duration,
+) -> bool {
     if session.send_turn(directive).await.is_err() {
         return false;
     }
     let policy = umadev_governance::Policy::load(&options.project_root);
+    // Idle watchdog (P1-11): this rework pump (reused by `governance_catchup` /
+    // `review_and_rework` / the director's `summon`) was a naked
+    // `next_event().await` — a base that hangs mid-rework would freeze every
+    // review node forever. Guard it with the SAME shared idle primitive as the
+    // director loop + `drive_phase`, so no main-session pump can wedge.
     loop {
-        let Some(ev) = session.next_event().await else {
-            return false; // session ended mid-rework → fail-open stop
+        let ev = match crate::director_loop::next_event_idle(session, idle).await {
+            crate::director_loop::IdleEvent::Event(ev) => ev,
+            // Session ended mid-rework, OR the base hung past the idle window
+            // (interrupt already issued, bounded) → fail-open stop reworking.
+            // A rework turn is advisory, so a settle here simply leaves the
+            // findings for the next gate rather than wedging the run.
+            crate::director_loop::IdleEvent::SessionEnded
+            | crate::director_loop::IdleEvent::IdleTimedOut => return false,
         };
         match ev {
             SessionEvent::TextDelta(text) => {
@@ -1942,6 +1997,13 @@ mod tests {
         /// whose fork handshake wedges (never returns `initialize`). The
         /// `fork_with_timeout` wrapper must bound it and fail-open to ACCEPT.
         fork_hangs: bool,
+        /// When true, `next_event` AWAITS FOREVER after `send_turn` (the base
+        /// holds the pipe open but emits nothing, never exits) — the P1-11 hang
+        /// the idle watchdog on every MAIN-session pump must settle.
+        next_event_hangs: bool,
+        /// Count of `interrupt()` calls — a test asserts the idle watchdog issued
+        /// its best-effort interrupt before settling.
+        interrupts: Arc<Mutex<usize>>,
     }
 
     impl FakeBaseSession {
@@ -1955,12 +2017,25 @@ mod tests {
                 fork_script: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 forks_opened: Arc::new(Mutex::new(0)),
                 fork_hangs: false,
+                next_event_hangs: false,
+                interrupts: Arc::new(Mutex::new(0)),
             }
         }
         fn dying() -> Self {
             let mut s = Self::new(vec![]);
             s.die = true;
             s
+        }
+        /// A session that accepts `send_turn` but then HANGS forever on
+        /// `next_event` — the "base holds the pipe open, emits nothing, never
+        /// exits" mid-turn hang the idle watchdog must settle.
+        fn hanging() -> Self {
+            let mut s = Self::new(vec![]);
+            s.next_event_hangs = true;
+            s
+        }
+        fn interrupts_handle(&self) -> Arc<Mutex<usize>> {
+            Arc::clone(&self.interrupts)
         }
         /// A session whose every `fork()` hangs forever (a wedged fork handshake).
         fn fork_wedged() -> Self {
@@ -2018,6 +2093,13 @@ mod tests {
 
         async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
             self.sent.lock().unwrap().push(directive);
+            // A hanging session emits NOTHING after send_turn (empty batch) so the
+            // next `next_event` parks forever — modelling the base that holds the
+            // pipe open without output. The idle watchdog must settle it.
+            if self.next_event_hangs {
+                self.current.clear();
+                return Ok(());
+            }
             // Load the next scripted turn (or an immediate clean TurnDone if the
             // script ran out, so the driver never hangs).
             let batch = if self.turns.is_empty() {
@@ -2034,6 +2116,12 @@ mod tests {
             if self.die {
                 return None;
             }
+            // A base that hangs holding the pipe open (`send_turn` left `current`
+            // empty): park forever once there is nothing buffered. Never resolves →
+            // the idle watchdog must settle it.
+            if self.next_event_hangs && self.current.is_empty() {
+                std::future::pending::<()>().await;
+            }
             self.current.pop_front()
         }
         async fn respond(
@@ -2048,6 +2136,7 @@ mod tests {
             Ok(())
         }
         async fn interrupt(&mut self) -> Result<(), SessionError> {
+            *self.interrupts.lock().unwrap() += 1;
             Ok(())
         }
         async fn end(&mut self) -> Result<(), SessionError> {
@@ -3362,5 +3451,76 @@ mod tests {
         let docs_bb = Blackboard::read(&options, ReviewKind::Docs);
         let docs_arts = docs_bb.artifacts(&options.requirement);
         assert!(docs_arts.qa_floor.is_empty() && docs_arts.security_floor.is_empty());
+    }
+
+    // ── Idle watchdog on EVERY main-session pump (P0-3 / P1-11) ─────────────
+
+    #[tokio::test]
+    async fn drive_phase_idle_watchdog_settles_a_hung_base() {
+        // P1-11: a base that hangs mid-phase (accepts send_turn, then never emits
+        // and never exits) must NOT wedge the phase forever — the shared idle
+        // watchdog settles it as a Failed turn. Drive `drive_phase` with a tiny
+        // window (no env mutation to race) and assert it returns promptly.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::hanging();
+        let interrupts = session.interrupts_handle();
+
+        let result = drive_phase(
+            &mut session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            std::time::Duration::from_millis(80),
+        )
+        .await;
+
+        match result {
+            PhaseResult::Failed(reason) => assert!(
+                reason.contains("idle"),
+                "a hung base settles as an idle Failed: {reason}"
+            ),
+            PhaseResult::Done => panic!("a hung phase must settle as Failed, not Done"),
+        }
+        assert_eq!(
+            *interrupts.lock().unwrap(),
+            1,
+            "the watchdog issued its best-effort interrupt before settling"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_rework_turn_idle_watchdog_settles_a_hung_base() {
+        // P1-11: the rework pump (governance_catchup / review_and_rework / the
+        // director's summon all flow through here) must also be idle-guarded — a
+        // base that hangs mid-rework can't freeze the review node. A hung session
+        // settles the rework as `false` (fail-open stop) within the tiny window.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::hanging();
+        let interrupts = session.interrupts_handle();
+
+        let ok = drive_rework_turn_with_idle(
+            &mut session,
+            &options,
+            &events,
+            "fix these".to_string(),
+            std::time::Duration::from_millis(80),
+        )
+        .await;
+
+        assert!(
+            !ok,
+            "a hung rework turn settles as a fail-open stop (false)"
+        );
+        assert_eq!(
+            *interrupts.lock().unwrap(),
+            1,
+            "the watchdog issued its best-effort interrupt before settling"
+        );
     }
 }

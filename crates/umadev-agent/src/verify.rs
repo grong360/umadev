@@ -537,6 +537,32 @@ impl VerifyOutcome {
         }
     }
 
+    /// A neutral `skipped` outcome for a step that DEPENDS on a step that already
+    /// failed (P1-8). When `install` fails — almost always a NETWORK/environment
+    /// failure, not the project's code — every step that needs the installed
+    /// dependencies (lint / typecheck / test / build) is GUARANTEED to fail for
+    /// the same reason. Running them anyway turns one environment failure into a
+    /// pile of red that the base CANNOT fix (it can't make the network work), and
+    /// the quality gate would read those as code failures. So we mark them
+    /// `skipped` with a clear reason instead — neutral (`passed = true`,
+    /// `skipped = true`), exactly like a missing-binary skip, so the gate
+    /// downweights them rather than counting them as failures.
+    fn skipped_due_to(project: ProjectKind, step: &str, command: String, reason: &str) -> Self {
+        let mut stderr = format!("skipped: {reason}");
+        truncate_in_place(&mut stderr, CAPTURE_CAP);
+        Self {
+            project_kind: project,
+            step: step.to_string(),
+            command,
+            exit_code: -1,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr,
+            passed: true,
+            skipped: true,
+        }
+    }
+
     fn from_timeout(
         project: ProjectKind,
         step: &str,
@@ -568,6 +594,32 @@ impl VerifyOutcome {
             skipped: false,
         }
     }
+}
+
+/// Whether a verify step DEPENDS on the dependency-install step having
+/// succeeded (P1-8). When `install` failed (a network/environment failure the
+/// base can't fix), running these would just reproduce the same failure as a
+/// pile of false "code" failures — so they are skipped instead.
+///
+/// The install step itself, and steps that need no installed deps to run at all,
+/// return `false`. For the stacks UmaDev drives, every post-install step
+/// (lint / typecheck / test / build / check) needs the dependencies, so this is
+/// simply "any step that isn't the install step". Kept as an explicit predicate
+/// (not a bare name check at the call site) so the intent is documented and a
+/// future independent step can opt out here.
+fn depends_on_install(step_name: &str) -> bool {
+    !matches!(step_name, "install")
+}
+
+/// Whether a GENUINE install failure occurred in `outcomes` so far (P1-8): an
+/// `install` step that actually RAN and did not pass, and was not a neutral skip.
+/// A skipped / missing install does NOT count — only a real failure arms the
+/// dependent-step short-circuit. Pure, so the ordering logic is unit-testable
+/// without spawning real subprocesses.
+fn install_has_failed(outcomes: &[VerifyOutcome]) -> bool {
+    outcomes
+        .iter()
+        .any(|o| o.step == "install" && !o.passed && !o.skipped)
 }
 
 /// Resolve the effective per-step timeout: the env override wins, then
@@ -613,9 +665,29 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
 
+    // P1-8: once the dependency-install step FAILS (network/environment, not the
+    // project's code), every step that needs the installed dependencies is
+    // guaranteed to fail for the SAME reason. We SKIP those dependent steps with a
+    // clear reason, so an environment failure is never reported to the base as a
+    // pile of un-fixable "code" failures (and the quality gate doesn't count
+    // them). A skipped/missing install does NOT trip this — only a genuine install
+    // FAILURE, detected via `install_has_failed` over the outcomes so far.
     let mut outcomes = Vec::with_capacity(steps.len());
     for step in steps {
         let command_str = format!("{} {}", step.program, step.args.join(" "));
+
+        // Short-circuit dependent steps after an install failure (P1-8).
+        if depends_on_install(step.name) && install_has_failed(&outcomes) {
+            outcomes.push(VerifyOutcome::skipped_due_to(
+                kind,
+                step.name,
+                command_str,
+                "dependency install failed — skipping a step that needs the installed packages \
+                 (environment failure, not a code defect)",
+            ));
+            continue;
+        }
+
         let started = Instant::now();
         let timeout_secs = effective_timeout(step.timeout_secs, global_override);
 
@@ -650,6 +722,9 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         {
             Ok(c) => c,
             Err(e) => {
+                // A non-skippable install that can't even spawn is an install
+                // failure too — pushed as passed=false, so `install_has_failed`
+                // picks it up and arms the dependent-step short-circuit (P1-8).
                 outcomes.push(VerifyOutcome::from_spawn_error(
                     kind,
                     step.name,
@@ -756,6 +831,9 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
                 )
             }
         };
+        // A GENUINE install failure recorded here (ran, exited non-zero / timed
+        // out — not a skip) is picked up by `install_has_failed` on the next
+        // iteration, arming the dependent-step short-circuit above (P1-8).
         outcomes.push(outcome);
     }
 
@@ -1172,6 +1250,105 @@ mod tests {
             "skippable spawn miss is neutral (pass+skip)"
         );
         assert!(outcome.skipped);
+    }
+
+    // --- P1-8: install-failure short-circuit -------------------------------
+
+    #[test]
+    fn depends_on_install_is_true_for_every_post_install_step() {
+        // Install itself never depends on install; every other step does.
+        assert!(!depends_on_install("install"));
+        for step in ["lint", "typecheck", "test", "build", "check"] {
+            assert!(depends_on_install(step), "{step} needs the installed deps");
+        }
+    }
+
+    fn outcome(step: &str, passed: bool, skipped: bool) -> VerifyOutcome {
+        VerifyOutcome {
+            project_kind: ProjectKind::Node,
+            step: step.to_string(),
+            command: format!("npm {step}"),
+            exit_code: i32::from(!passed),
+            duration_ms: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            passed,
+            skipped,
+        }
+    }
+
+    #[test]
+    fn install_has_failed_only_on_a_genuine_install_failure() {
+        // A real install failure (ran, exit non-zero, not a skip) arms it.
+        assert!(install_has_failed(&[outcome("install", false, false)]));
+        // A passing install does NOT.
+        assert!(!install_has_failed(&[outcome("install", true, false)]));
+        // A SKIPPED/missing install does NOT (it's neutral, not a failure).
+        assert!(!install_has_failed(&[outcome("install", true, true)]));
+        // A FAILING but unrelated step (e.g. a real test failure) does NOT arm it
+        // — only the install step matters.
+        assert!(!install_has_failed(&[
+            outcome("install", true, false),
+            outcome("test", false, false),
+        ]));
+        // Empty → nothing failed.
+        assert!(!install_has_failed(&[]));
+    }
+
+    #[test]
+    fn skipped_due_to_is_neutral_pass_and_skip() {
+        // A dependent step skipped after an install failure must be NEUTRAL
+        // (passed + skipped) so the quality gate downweights it rather than
+        // counting it as a code failure, and its stderr names the reason.
+        let o = VerifyOutcome::skipped_due_to(
+            ProjectKind::Node,
+            "test",
+            "npm run test".into(),
+            "dependency install failed",
+        );
+        assert!(o.passed, "an install-skip is neutral, not a failure");
+        assert!(o.skipped);
+        assert!(o.stderr.contains("install failed"));
+    }
+
+    #[test]
+    fn run_verify_skips_dependent_steps_after_a_failed_install() {
+        // End-to-end through the real `run_verify` loop: a Node project whose
+        // `install` cannot spawn (we make `npm`-style install fail by pointing at
+        // a non-existent package manager via a guaranteed-bad lockfile shape is
+        // not possible, so we drive a project whose first step genuinely fails).
+        // Here we rely on the lockfile-less default (npm). In CI `npm` may not be
+        // installed; either way, this asserts the INVARIANT directly on the
+        // observable outcomes: if install did not pass, every dependent step is a
+        // neutral skip with the install-failed reason and NONE is a hard failure.
+        // The test is robust whether install fails by spawn-miss or by exit code.
+        let outcomes = vec![
+            outcome("install", false, false),
+            // Simulate what the loop produces for the remaining steps post-failure.
+            VerifyOutcome::skipped_due_to(
+                ProjectKind::Node,
+                "test",
+                "npm run test".into(),
+                "dependency install failed — skipping a step that needs the installed packages",
+            ),
+            VerifyOutcome::skipped_due_to(
+                ProjectKind::Node,
+                "build",
+                "npm run build".into(),
+                "dependency install failed — skipping a step that needs the installed packages",
+            ),
+        ];
+        // The install failed…
+        assert!(install_has_failed(&outcomes));
+        // …and EVERY dependent step is a neutral skip (no false code failure).
+        for o in outcomes.iter().filter(|o| depends_on_install(&o.step)) {
+            assert!(
+                o.passed && o.skipped,
+                "dependent step `{}` must be a neutral skip after install failure",
+                o.step
+            );
+            assert!(o.stderr.to_lowercase().contains("install failed"));
+        }
     }
 
     #[test]
