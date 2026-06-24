@@ -142,6 +142,16 @@ evidence-grounded**:
 4. **Adapt / escalate** with a typed blocker disposition per finding — `Investigate | FixAdjacent | NoteAndContinue | Escalate`. Only `Escalate` consumes the bounded gap/stall counter; `NoteAndContinue` records to `lessons` without burning a rework round. On a *recurring* identical finding (stuck-detector over the event log: same error/directive fingerprint N times), **change strategy** (reflect, narrow to the failing file, split the step) or exit cleanly as `BLOCKED{reason, evidence}` — never spin.
 5. **Decide when to involve the user:** clarify only at L1 (intent) and at the two confirm gates; otherwise drive autonomously within the trust tier. Irreversible/out-of-scope actions always hit the floor.
 
+> **Implementation status (honest).** Steps 1–2 ship in full (`drive_plan_steps` →
+> `director::summon` per ready step, deterministic-floor acceptance per step). Step 3
+> ships the **concrete, evidence-bearing** rework directive (raw failing-test/stderr
+> folded back) + **recalled `lessons`**; the per-finding *class tag* + `error_kb`
+> *playbook lookup* are a refinement still on the bench. Step 4 ships a **bounded
+> gap/stall counter** that exits cleanly as `BLOCKED{reason, evidence}` rather than
+> spinning — the **typed `BlockerDisposition`** and the **fingerprint-based
+> stuck-detector** are the L3 target, not yet the shipped mechanism. Treat the typed
+> disposition / playbook lookup as roadmap, not a current guarantee.
+
 **Context survival across a long build:** a **compaction module** clears consumed
 tool outputs first, then (if still over budget) summarizes into a fixed template
 (*Primary Intent · Files & Code · Errors & Fixes · Pending Tasks · Current Work · Next

@@ -177,6 +177,7 @@
 "chitchat.who" = "我是 UmaDev — AI 编码的项目总监 Agent。\n\n我驱动你已登录的 claude code / codex / opencode,按 9 阶段商业交付流程\n把一句话需求变成完整产品(文档+前端+后端+部署)。\n\n直接输入需求即可开始,例如:\n  做一个带用户注册的论坛"
 "chitchat.fallback" = "收到!如果你想做一个产品,直接描述需求即可启动流水线。\n\n例如:\n  做一个带邮箱登录的 SaaS 落地页\n  做一个 TODO 应用\n\n或输入 /help 看全部命令。"
 "chat.claims_unverified" = "[warn] 以上为对话内容,本轮未改动任何文件。任何\"已修改/已实现\"的说法请用实际文件 / `git status` 核对。"
+"chat.director_build_with_history" = "## 此前对话\n{}\n\n---\n\n{}"
 
 # Delivery completion banner
 "delivery.latest_zip" = "\n  最新: {} ({} KiB)"

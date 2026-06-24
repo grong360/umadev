@@ -177,6 +177,7 @@
 "chitchat.who" = "I'm UmaDev — the project-director Agent for AI coding.\n\nI drive your logged-in claude code / codex / opencode through a 9-phase commercial delivery flow\nto turn a one-line idea into a complete product (docs + frontend + backend + deploy).\n\nJust type a requirement to start, for example:\n  A forum with user registration"
 "chitchat.fallback" = "Got it! If you want to build a product, just describe the requirement to start the pipeline.\n\nFor example:\n  A SaaS landing page with email login\n  A to-do app\n\nOr type /help for all commands."
 "chat.claims_unverified" = "[warn] The reply above is chat only — no files were changed this turn. Verify any claimed edits against the actual files / `git status`."
+"chat.director_build_with_history" = "## Conversation so far\n{}\n\n---\n\n{}"
 
 # Delivery completion banner
 "delivery.latest_zip" = "\n  latest: {} ({} KiB)"

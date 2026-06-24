@@ -240,8 +240,18 @@ fn path_touches_vcs(s: &str) -> bool {
         || s.contains("git clean")
         || s.contains("git rebase")
         || s.contains("git filter-branch")
-        || s.contains("git push --force")
         || s.contains("git checkout --")
+        // History / working-tree / branch destruction the floor missed (push /
+        // pull / fetch / clone already escalate as NETWORK). A merge mutates the
+        // user's branch (isolation guarantees UmaDev never auto-merges), `git rm`
+        // deletes tracked files, `branch -D/-d` drops a branch, and `stash
+        // drop/clear` loses stashed work. `git merge ` carries a trailing space so
+        // the read-only `git merge-base` is NOT caught.
+        || s.contains("git merge ")
+        || s.contains("git rm ")
+        || s.contains("git branch -d")
+        || s.contains("git stash drop")
+        || s.contains("git stash clear")
 }
 
 /// The decision: given a candidate **mid-turn tool call**, must it be escalated
@@ -733,6 +743,37 @@ mod tests {
         assert_eq!(
             reversibility_class("rm -rf /tmp/x", ""),
             Reversibility::Destructive
+        );
+    }
+
+    #[test]
+    fn local_history_and_branch_destruction_escalates_as_vcs() {
+        // Branch-isolation defense-in-depth: a merge into the user's branch, a
+        // tracked-file delete, a branch drop, or a stash drop are all irreversible
+        // and must escalate on EVERY trust tier (VCS class). `git merge-base` is a
+        // read and must NOT escalate.
+        for cmd in [
+            "git merge feature",
+            "git rm src/a.ts",
+            "git branch -D umadev/old",
+            "git branch -d umadev/old",
+            "git stash drop",
+            "git stash clear",
+        ] {
+            assert_eq!(
+                reversibility_class(cmd, ""),
+                Reversibility::VersionControl,
+                "{cmd} must escalate as VCS"
+            );
+            assert!(
+                requires_confirmation(TrustMode::Auto, cmd, ""),
+                "{cmd} must confirm even in Auto"
+            );
+        }
+        // A read-only inspection must stay reversible (no false escalation).
+        assert_eq!(
+            reversibility_class("git merge-base main feature", ""),
+            Reversibility::Reversible
         );
     }
 

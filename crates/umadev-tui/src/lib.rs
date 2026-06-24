@@ -51,7 +51,7 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use umadev_agent::{AgentRunner, ChannelSink, EngineEvent, EventSink, Gate, RunOptions};
+use umadev_agent::{AgentRunner, ChannelSink, EngineEvent, EventSink, Gate, RoutePlan, RunOptions};
 use umadev_host::driver_for;
 use umadev_runtime::{CompletionRequest, Message, OfflineRuntime, Runtime, RuntimeKind};
 
@@ -625,11 +625,26 @@ fn spawn_continuous_block(
 /// run emits the honest `ABORT_SENTINEL` note and a terminal `Failed`; a session
 /// that dies mid-loop is a `Failed` outcome. It NEVER panics or wedges, and a base
 /// whose first build passes QC clean settles immediately (no fix pass).
+///
+/// **Chat-originated build (`conversation` non-empty):** when a plain chat message
+/// auto-promotes into a director build (Blocker #2 — a "build me X" said in chat
+/// must get the same plan / step scheduling / finalize / acceptance the `/run` and
+/// CLI paths get, NOT the single-turn `drive_agentic_stream`), the caller passes
+/// UmaDev's OWN bounded conversation transcript. It is front-loaded onto the first
+/// directive so the director's brain sees the prior dialogue (Wave 5 / G11 memory),
+/// exactly the way `drive_agentic_stream` threads it for a light chat turn — the
+/// base's `--resume` is belt-and-suspenders, this transcript is the load-bearing
+/// memory across a restart / switched base. An explicit `/run` passes an empty
+/// transcript (no prior chat to inherit) and is unchanged. The session hand-back to
+/// chat is driven by the caller's `app.director_run_in_flight` + the terminal
+/// `RouteDecision::AgenticDone`, identical for both origins.
 fn spawn_director_loop(
     options: RunOptions,
     sink: Arc<ChannelSink>,
     route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
     autonomous: bool,
+    conversation: Vec<Message>,
+    route_override: Option<RoutePlan>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let backend = options.backend.clone();
@@ -672,7 +687,14 @@ fn spawn_director_loop(
         // so claude can take it NATIVELY as a system prompt via `session_for`'s
         // `--append-system-prompt`. Fail-open: an empty firmware just leaves the base
         // un-primed beyond the directive, exactly as before.
-        let route = umadev_agent::router::for_run(&options.requirement);
+        //
+        // Route source: an explicit `/run` passes `None` → `for_run` FORCES a Build
+        // (a bare goal still builds). A chat-originated build (Blocker #2) passes the
+        // route it was ALREADY classified with — the honest Tier-0 route the intent
+        // card showed — so the build drives with that exact route, never a re-forced
+        // one. Either way the route is deterministic; no session needed.
+        let route =
+            route_override.unwrap_or_else(|| umadev_agent::router::for_run(&options.requirement));
         let firmware = umadev_agent::compose_firmware(&root, &route, &options.requirement).await;
         let firmware = (!firmware.trim().is_empty()).then_some(firmware);
 
@@ -709,14 +731,35 @@ fn spawn_director_loop(
         // onto the first directive (the universal fail-open path) — never restating
         // it on claude. Fail-open: no firmware → the goal directive is unchanged.
         let goal = umadev_agent::experts::director_build_directive(&options.requirement);
+        // Chat-originated build (Blocker #2): front-load UmaDev's OWN bounded
+        // conversation transcript so the director's brain inherits the prior dialogue
+        // — the SAME Wave 5 / G11 memory `drive_agentic_stream` threads for a light
+        // chat turn, so a build promoted out of a conversation keeps that context
+        // instead of starting cold. Empty for an explicit `/run` (no prior chat) →
+        // the directive is unchanged. See `director_directive_with_history`.
+        let goal = director_directive_with_history(&conversation, &options.requirement, goal);
         let directive = match firmware.as_deref() {
             Some(fw) if backend != "claude-code" => format!("{fw}\n\n---\n\n{goal}"),
             _ => goal,
         };
         let sink_dyn: Arc<dyn EventSink> = sink.clone();
-        let outcome =
-            umadev_agent::drive_director_loop(session.as_mut(), &options, &sink_dyn, directive)
-                .await;
+        // Drive the loop ROUTED (Blocker #1 fix): pass the route computed at the top
+        // of this task so the director loop emits the visible intent card, synthesises
+        // + posts the owned plan (`PlanPosted`), drives the plan step-by-step
+        // (`PlanStepStatus`), runs per-step acceptance on the deterministic floor, and
+        // finalizes — exactly as the CLI `umadev run` path does. The unrouted entry
+        // (route=None) skipped `synthesize_and_post_plan` and step scheduling, which is
+        // why the flagship plan/schedule/finalize/acceptance machinery was DEAD on the
+        // TUI `/run`. Fail-open: an unparseable/empty plan inside the routed entry just
+        // degrades to the single-turn loop, so this never loses a build.
+        let outcome = umadev_agent::drive_director_loop_routed(
+            session.as_mut(),
+            &options,
+            &sink_dyn,
+            directive,
+            Some(&route),
+        )
+        .await;
         // Always end the session (release the process / server).
         let _ = session.end().await;
 
@@ -1391,6 +1434,37 @@ fn bounded_transcript(conversation: &[Message], task: &str, budget: usize) -> Ve
     kept_rev
 }
 
+/// Front-load UmaDev's bounded conversation transcript onto a director-build
+/// directive (Blocker #2 — a chat-originated build must inherit the conversation,
+/// the same Wave 5 / G11 memory `drive_agentic_stream` threads for a light turn).
+/// The bounded prior dialogue is rendered `role: content` oldest → newest and
+/// prepended to `goal` via the trilingual `chat.director_build_with_history`
+/// template. **Fail-open / unchanged for `/run`:** an empty `conversation` (or one
+/// that is only the current task) yields the original `goal` byte-for-byte, so the
+/// explicit-run directive is exactly as before. Pure + deterministic so the memory
+/// fusion is unit-tested without opening a base session.
+fn director_directive_with_history(
+    conversation: &[Message],
+    requirement: &str,
+    goal: String,
+) -> String {
+    let prior = bounded_transcript(conversation, requirement, TRANSCRIPT_TOKEN_BUDGET);
+    if prior.is_empty() {
+        return goal;
+    }
+    let mut transcript = String::new();
+    for m in &prior {
+        transcript.push_str(&m.role);
+        transcript.push_str(": ");
+        transcript.push_str(&m.content);
+        transcript.push_str("\n\n");
+    }
+    umadev_i18n::tlf(
+        "chat.director_build_with_history",
+        &[transcript.trim_end(), &goal],
+    )
+}
+
 /// Build the tools-unlocked execution request and drive the base's streaming
 /// tool loop, forwarding every event to the live render pipeline and sending the
 /// terminal [`RouteDecision`] when the stream ends. Split out of [`spawn_agentic`]
@@ -1668,17 +1742,31 @@ fn fire_agentic_routed(
     handle
 }
 
-/// Route ONE free-text turn at the default chat entry and surface the decision.
+/// The outcome of routing one free-text chat turn: the honest deterministic
+/// [`RoutePlan`] plus whether it auto-promotes to a **deliberate director build**.
+struct ChatRoute {
+    /// The honestly-classified route (NOT force-built like `/run`'s `for_run`) —
+    /// carried so a chat-originated build drives the director loop with the SAME
+    /// route the intent card showed, never a re-forced one.
+    route: RoutePlan,
+    /// `true` when the turn is a Build-class, deliberate-depth turn → the director
+    /// build path (plan + step scheduling + finalize), not the light streaming turn.
+    director_build: bool,
+}
+
+/// Route ONE free-text turn at the default chat entry and classify it.
 ///
 /// Runs the deterministic Tier-0 router ([`umadev_agent::router::route`] with no
 /// session — the floor + fallback that never blocks; a brain-assisted Tier-1
 /// consult would need a forkable `BaseSession`, which the lightweight agentic
 /// path does not hold, so the entry stays on the fast deterministic floor).
-/// Emits an [`EngineEvent::IntentDecided`] so the **intent pre-commitment card**
-/// appears immediately, records `last_intent_class`, and returns whether this
-/// turn should take the **deliberate director-build** path. **Fail-open:** any
-/// surprise resolves to "not a director build" — the existing agentic behaviour.
-async fn route_turn(app: &mut App, project_root: &std::path::Path, task: &str) -> bool {
+/// Returns the honest [`RoutePlan`] and whether this turn takes the **deliberate
+/// director-build** path. The caller owns emitting the intent card EXACTLY ONCE:
+/// the light path emits it directly, the director-build path lets the routed
+/// director loop emit it (so a build promoted from chat shows ONE card, never
+/// two). **Fail-open:** any surprise resolves to "not a director build" — the
+/// existing light agentic behaviour.
+async fn route_turn(app: &mut App, project_root: &std::path::Path, task: &str) -> ChatRoute {
     let options = RunOptions {
         project_root: project_root.to_path_buf(),
         requirement: task.to_string(),
@@ -1692,12 +1780,14 @@ async fn route_turn(app: &mut App, project_root: &std::path::Path, task: &str) -
     };
     // Tier-0 (session = None): deterministic, zero-latency, never errors.
     let route = umadev_agent::router::route(None, &options, task).await;
-    // Surface the decision as the intent card (replaces the silent old default).
-    app.apply_engine(EngineEvent::intent_decided(&route));
     // A Build-class, deliberate-depth turn is the director-build path: a chat
     // that says "build me X" now auto-promotes here instead of the old
     // hardcoded `director_build:false`.
-    route.class.mutates_workspace() && route.depth.is_deliberate()
+    let director_build = route.class.mutates_workspace() && route.depth.is_deliberate();
+    ChatRoute {
+        route,
+        director_build,
+    }
 }
 
 /// After a TERMINAL chat route outcome (`Chat` / `Failed`), fire the next turn
@@ -2343,6 +2433,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         sink.clone(),
                                         route_tx.clone(),
                                         autonomous,
+                                        // Explicit `/run` carries no prior chat to
+                                        // inherit — the director build starts from the
+                                        // goal alone (unchanged behaviour).
+                                        Vec::new(),
+                                        // `None` → `for_run` FORCES a Build (the
+                                        // explicit-run contract), unchanged.
+                                        None,
                                     ));
                                 } else {
                                     // LEGACY (opt-in) or offline / non-host: drive the
@@ -2435,20 +2532,81 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 // shows an intent pre-commitment card and a plain
                                 // "build me X" auto-promotes into a deliberate
                                 // director build — instead of every free-text turn
-                                // silently taking the same light path with the old
-                                // hardcoded `director_build:false`. Fail-open: the
+                                // silently taking the same light path. Fail-open: the
                                 // deterministic Tier-0 floor never errors; a chat /
                                 // explain / quick turn stays light. `/run` remains
                                 // the explicit forced-Deep entry to the full pipeline.
-                                let director_build =
+                                let chat_route =
                                     route_turn(app, &opts.project_root, &text).await;
-                                run_task = Some(fire_agentic_routed(
-                                    app,
-                                    &sink,
-                                    &route_tx,
-                                    text,
-                                    director_build,
-                                ));
+                                // A host CLI is REQUIRED to drive the director build
+                                // loop (it opens a real base session via `session_for`).
+                                // An offline / non-host brain can't, so a chat-build
+                                // there fails open to the light streaming path below.
+                                let host_cli =
+                                    matches!(app.brain_spec(), BrainSpec::HostCli(_));
+                                if chat_route.director_build && host_cli {
+                                    // Blocker #2: a "build me X" said in plain CHAT now
+                                    // takes the SAME director loop as `/run` + the CLI
+                                    // — visible plan + step scheduling + finalize +
+                                    // acceptance + full firmware (repo-map / lessons /
+                                    // knowledge) — NOT the single-turn
+                                    // `drive_agentic_stream`. The honest route from
+                                    // `route_turn` is handed through (NOT re-forced via
+                                    // `for_run`), the live conversation is threaded in
+                                    // for Wave 5 memory, and `director_run_in_flight`
+                                    // makes `record_agentic_done` hand the build session
+                                    // back to chat on a clean finish. The routed loop
+                                    // emits the ONE intent card (so we DON'T emit it
+                                    // here — no double card). Same in-flight bookkeeping
+                                    // as `/run`'s `StartRun` arm: thinking + aliveness
+                                    // clock + agentic-in-flight + Ctrl-C handle in
+                                    // `run_task`.
+                                    continuous_run_active = false;
+                                    app.thinking = true;
+                                    app.thinking_started =
+                                        Some(std::time::Instant::now());
+                                    app.last_output_at = None;
+                                    app.tool_in_progress = false;
+                                    app.agentic_in_flight = true;
+                                    app.director_run_in_flight = true;
+                                    app.requirement.clone_from(&text);
+                                    let mut run_opts = current_run_options(app, &opts);
+                                    run_opts.requirement = text;
+                                    let autonomous =
+                                        continuous_autonomous(run_opts.mode);
+                                    let conversation = app.conversation_snapshot();
+                                    run_task = Some(spawn_director_loop(
+                                        run_opts,
+                                        sink.clone(),
+                                        route_tx.clone(),
+                                        autonomous,
+                                        conversation,
+                                        // Drive with the HONEST chat route (the intent
+                                        // card already classified it Build/deliberate),
+                                        // not a re-forced `for_run`.
+                                        Some(chat_route.route),
+                                    ));
+                                } else {
+                                    // Light path (chat / explain / quick edit, or a
+                                    // build with no host CLI): the fast single-turn
+                                    // streaming turn, UNCHANGED. The intent card is
+                                    // emitted HERE (the director loop is not driving
+                                    // this turn), exactly as before.
+                                    app.apply_engine(EngineEvent::intent_decided(
+                                        &chat_route.route,
+                                    ));
+                                    run_task = Some(fire_agentic_routed(
+                                        app,
+                                        &sink,
+                                        &route_tx,
+                                        text,
+                                        // A non-host "would-be build" stays a light
+                                        // turn but still keeps the run-lock + source
+                                        // hard-gate semantics it had before (it can
+                                        // only stream, but the floor still verifies).
+                                        chat_route.director_build,
+                                    ));
+                                }
                             }
                             Action::Revise(text) => {
                                 // Re-run the block that PRODUCED the current
@@ -2741,6 +2899,42 @@ mod tests {
         assert!(prior.len() < 100);
         // The kept window is the most-recent suffix (ends near the latest answer).
         assert!(prior.last().unwrap().content.contains("answer number 49"));
+    }
+
+    #[test]
+    fn director_directive_is_unchanged_for_an_explicit_run() {
+        // Blocker #2 fail-open invariant: an explicit `/run` passes an EMPTY
+        // conversation → the directive is the goal byte-for-byte (no history block),
+        // so the explicit-run path is exactly as before this change.
+        let goal = "## Goal\nbuild a forum".to_string();
+        let out = director_directive_with_history(&[], "build a forum", goal.clone());
+        assert_eq!(out, goal, "no prior chat → directive unchanged");
+        // A conversation that is ONLY the current task also yields the bare goal.
+        let only_current = vec![msg("user", "build a forum")];
+        let out2 = director_directive_with_history(&only_current, "build a forum", goal.clone());
+        assert_eq!(out2, goal);
+    }
+
+    #[test]
+    fn chat_director_build_inherits_the_conversation() {
+        // Blocker #2 memory invariant: a build PROMOTED from chat front-loads the
+        // prior dialogue (Wave 5 / G11) so the director's brain has the context the
+        // user already gave — NOT a cold start. The current task is not duplicated.
+        let conv = vec![
+            msg("user", "I'm building a kanban board"),
+            msg("assistant", "Nice — columns + drag-drop?"),
+            msg("user", "yes, now build it"),
+        ];
+        let goal = "## Goal\nbuild it".to_string();
+        let out = director_directive_with_history(&conv, "yes, now build it", goal);
+        // The prior turns are present (memory bridged into the directive)...
+        assert!(out.contains("I'm building a kanban board"));
+        assert!(out.contains("columns + drag-drop"));
+        // ...the goal still ends the directive...
+        assert!(out.trim_end().ends_with("build it"));
+        // ...and the trailing current task is NOT echoed a second time in history
+        // (it appears once, as the goal — `bounded_transcript` drops the duplicate).
+        assert_eq!(out.matches("yes, now build it").count(), 0);
     }
 
     /// A runtime spy that CAPTURES the request it was driven with, so a test can
@@ -3053,32 +3247,50 @@ mod tests {
     async fn router_promotes_build_request_to_deliberate() {
         // "build me a login app" → a Build-class, deliberate-depth route →
         // director-build = true (the auto-promotion the hardcoded false killed).
+        // `route_turn` now CLASSIFIES only and returns the honest route; the intent
+        // card is emitted by the CALLER (the director loop for a build, the light
+        // path directly) so a chat-promoted build shows exactly ONE card, never two.
         let mut app = routing_app();
         let root = std::env::temp_dir();
-        let director_build =
+        let decided =
             route_turn(&mut app, &root, "build me a full login app with email auth").await;
         assert!(
-            director_build,
+            decided.director_build,
             "a clear build must take the deliberate path"
         );
-        // The intent card landed AND recorded the class as build.
-        assert_eq!(app.last_intent_class.as_deref(), Some("build"));
+        // The honest route classified the turn as a Build (the director loop will
+        // drive with THIS route, not a re-forced `for_run`).
         assert!(
-            app.history
-                .iter()
-                .any(|m| matches!(m.role, crate::app::ChatRole::UmaDev)),
-            "an intent card was pushed"
+            decided.route.class.mutates_workspace(),
+            "the build route mutates the workspace"
+        );
+        assert!(
+            decided.route.depth.is_deliberate(),
+            "the build route is deliberate-depth"
+        );
+        // The card emission now happens at the call site (verified by the
+        // `Action::Route` branch), so `route_turn` itself no longer pushes it.
+        assert!(
+            app.last_intent_class.is_none(),
+            "route_turn classifies only — card emission moved to the caller"
         );
     }
 
     #[tokio::test]
     async fn router_keeps_greeting_as_light_chat() {
-        // A greeting must NOT take the deliberate director path.
+        // A greeting must NOT take the deliberate director path — it stays a light
+        // chat turn, and the caller (light path) emits the one intent card.
         let mut app = routing_app();
         let root = std::env::temp_dir();
-        let director_build = route_turn(&mut app, &root, "你好，今天怎么样？").await;
-        assert!(!director_build, "a greeting stays a light chat turn");
-        assert_eq!(app.last_intent_class.as_deref(), Some("chat"));
+        let decided = route_turn(&mut app, &root, "你好，今天怎么样？").await;
+        assert!(
+            !decided.director_build,
+            "a greeting stays a light chat turn"
+        );
+        assert!(
+            !decided.route.class.mutates_workspace(),
+            "a greeting does not mutate the workspace"
+        );
     }
 
     #[tokio::test]

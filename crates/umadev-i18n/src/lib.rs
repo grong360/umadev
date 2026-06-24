@@ -385,6 +385,7 @@ mod tests {
             "tui.hint.aborted",
             "config.save_failed_note",
             "chat.claims_unverified",
+            "chat.director_build_with_history",
             "gate.clarify_write_failed",
             // P2-D: gate-card artifact health labels (were hard-coded English).
             "gate.detail.missing",
