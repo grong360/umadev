@@ -5221,17 +5221,34 @@ mod tests {
         let sink = Arc::new(sink);
         let preview: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
-        // A free ephemeral port → `port_is_free` is true → we DO spawn.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let url = format!("http://127.0.0.1:{port}");
+        // Retry across ephemeral ports for determinism under parallel tests: a free
+        // port (`port_is_free` → we spawn) is found by bind(:0)+drop, but a CONCURRENT
+        // test can grab that just-freed port in the window before start_preview_server
+        // re-checks it — which would skip the spawn. Losing the race 8× is negligible.
         // `cd / && sleep 30` → parse_run_command resolves `sleep` directly (a real
         // long-lived child) in `/`, so the test never depends on `sh` resolution.
-        start_preview_server(&preview, &sink, &url, "cd / && sleep 30", std::path::Path::new("/"), false);
+        let mut registered = false;
+        for _ in 0..8 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let url = format!("http://127.0.0.1:{port}");
+            start_preview_server(
+                &preview,
+                &sink,
+                &url,
+                "cd / && sleep 30",
+                std::path::Path::new("/"),
+                false,
+            );
+            if preview.lock().unwrap().is_some() {
+                registered = true;
+                break;
+            }
+        }
         // A child was registered (the build flow never blocks; this is sync).
         assert!(
-            preview.lock().unwrap().is_some(),
+            registered,
             "dev-server child must be parked for exit cleanup"
         );
         // Exit cleanup: take + kill — must not leak.

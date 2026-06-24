@@ -462,6 +462,14 @@ mod tests {
             "tui.help.inspect.sessions",
             "tui.help.inspect.resume",
             "tui.help.edit.compact",
+            // Tool-call beautification + long-output folding (TUI transcript
+            // restructure): the merged read/grep batch headline, the grep metric,
+            // and the collapse/expand hints.
+            "tui.tool.batch",
+            "tui.tool.matches",
+            "tui.fold.collapsed",
+            "tui.fold.expand_hint",
+            "tui.help.edit.expand",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

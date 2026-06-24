@@ -292,7 +292,7 @@ mod theme {
 }
 use ratatui::Frame;
 
-use crate::app::{App, AppMode, ChatRole};
+use crate::app::{App, AppMode, ChatRole, MessageBody, ToolCall, ToolStatus};
 
 /// Set the terminal's light/dark classification, probed once at launch
 /// (OSC 11 + COLORFGBG) before raw mode. Re-exported from [`theme`].
@@ -2088,6 +2088,134 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
     ]
 }
 
+/// The status glyph for a structured tool row, by lifecycle. Built from
+/// codepoints so the source carries no literal pictographic glyph: queued = a
+/// dim hollow circle, running = the live spinner frame, ok = a filled circle
+/// (green), fail = a filled circle (red). Returned with its colour so the caller
+/// styles it consistently.
+fn tool_status_glyph(status: ToolStatus, spinner: char) -> (char, Color) {
+    match status {
+        // Hollow circle U+25CB, dimmed.
+        ToolStatus::Queued => (char::from_u32(0x25CB).unwrap_or('o'), theme::TEXT_MUTED()),
+        ToolStatus::Running => (spinner, theme::ACCENT()),
+        // Filled circle U+25CF.
+        ToolStatus::Ok => (char::from_u32(0x25CF).unwrap_or('*'), theme::SUCCESS()),
+        ToolStatus::Fail => (char::from_u32(0x25CF).unwrap_or('*'), theme::ERROR()),
+    }
+}
+
+/// The dim continuation gutter used under a tool row's result and folded
+/// summaries — a corner-bracket (`⎿  `) built from its codepoint, matching the
+/// Claude-Code tool-result indent.
+fn result_gutter() -> String {
+    let mut s = String::with_capacity(4);
+    s.push(char::from_u32(0x23BF).unwrap_or('|'));
+    s.push_str("  ");
+    s
+}
+
+/// Render one structured tool call as a single status line plus (when present
+/// and not collapsed) its result in a dim gutter below.
+///
+/// P4 — the beautified tool row: `[glyph] [name BOLD] [dim (arg)]`. A finished
+/// OK call's result is folded to a head-N preview + `… N more lines` summary
+/// (P6); a running / failed call always shows its result expanded. The row
+/// height is stable across pending→done (the glyph swaps in place, no reflow).
+fn render_tool_row(
+    tool: &ToolCall,
+    rendered: &mut Vec<(Line<'static>, usize)>,
+    lang: umadev_i18n::Lang,
+    spinner: char,
+) {
+    let (glyph, glyph_color) = tool_status_glyph(tool.status, spinner);
+    let mut head: Vec<Span<'static>> = Vec::with_capacity(4);
+    head.push(Span::styled(
+        format!("{glyph} "),
+        Style::default().fg(glyph_color),
+    ));
+    head.push(Span::styled(
+        tool.name.clone(),
+        Style::default()
+            .fg(theme::TEXT())
+            .add_modifier(Modifier::BOLD),
+    ));
+    if !tool.arg.is_empty() {
+        head.push(Span::styled(
+            format!(" ({})", tool.arg),
+            Style::default().fg(theme::TEXT_MUTED()),
+        ));
+    }
+    rendered.push((Line::from(head), 2));
+
+    // The result gutter. A failed / running call always shows it; a finished OK
+    // call shows it only when not collapsed. Long results fold to head-N + a
+    // summary line.
+    let Some(result) = tool.result.as_deref().filter(|r| !r.trim().is_empty()) else {
+        return;
+    };
+    // A failed call is force-expanded so the error is never hidden, regardless
+    // of the stored `collapsed` flag.
+    let show_collapsed = tool.collapsed && tool.status != ToolStatus::Fail;
+    let head_n = if tool.name == "Bash" {
+        crate::app::FOLD_HEAD_SHELL
+    } else {
+        crate::app::FOLD_HEAD_GENERAL
+    };
+    let gutter = result_gutter();
+    let lines: Vec<&str> = result.lines().collect();
+    let foldable = lines.len() > crate::app::FOLD_THRESHOLD;
+    let shown: Vec<&str> = if show_collapsed && foldable {
+        lines.iter().take(head_n).copied().collect()
+    } else {
+        lines.clone()
+    };
+    for (i, line) in shown.iter().enumerate() {
+        let prefix = if i == 0 { gutter.clone() } else { "   ".into() };
+        rendered.push((
+            Line::from(vec![
+                Span::styled(prefix, Style::default().fg(theme::TEXT_MUTED())),
+                Span::styled((*line).to_string(), Style::default().fg(theme::TEXT_MUTED())),
+            ]),
+            3,
+        ));
+    }
+    if show_collapsed && foldable {
+        let hidden = lines.len().saturating_sub(head_n);
+        rendered.push((fold_summary_line(hidden, lang), 3));
+    }
+}
+
+/// The `… N more lines · Ctrl+R expand` summary row shown under a folded body.
+fn fold_summary_line(hidden: usize, lang: umadev_i18n::Lang) -> Line<'static> {
+    let hint = umadev_i18n::t(lang, "tui.fold.expand_hint");
+    let text = umadev_i18n::tf(lang, "tui.fold.collapsed", &[&hidden.to_string(), hint]);
+    Line::from(Span::styled(text, Style::default().fg(theme::TEXT_MUTED())))
+}
+
+/// Fold a long GENERAL (Host/UmaDev text) body to its head-N lines + a
+/// `… N more lines` summary line (P6). Pure: takes the raw body, returns a
+/// shorter body string that still flows through the markdown renderer. The
+/// summary line is appended as plain text (it carries no markdown).
+fn fold_general_text(body: &str, lang: umadev_i18n::Lang) -> String {
+    let lines: Vec<&str> = body.lines().collect();
+    if lines.len() <= crate::app::FOLD_THRESHOLD {
+        return body.to_string();
+    }
+    let head_n = crate::app::FOLD_HEAD_GENERAL;
+    let hidden = lines.len().saturating_sub(head_n);
+    let hint = umadev_i18n::t(lang, "tui.fold.expand_hint");
+    let summary = umadev_i18n::tf(lang, "tui.fold.collapsed", &[&hidden.to_string(), hint]);
+    let mut head: String = lines
+        .iter()
+        .take(head_n)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    head.push_str("\n\n");
+    head.push_str(&summary);
+    head
+}
+
 /// The assistant bullet glyph (a filled circle, the Claude-Code
 /// `AssistantTextMessage` marker), built from its codepoint so the source
 /// carries no literal pictographic glyph. Followed by one space, it forms the
@@ -2128,17 +2256,27 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         if msg.role == ChatRole::Gate {
+            let body = msg.body();
             let mut block: Vec<Line<'static>> = Vec::new();
-            render_gate_block(&msg.body, theme::WARNING(), &mut block);
+            render_gate_block(&body, theme::WARNING(), &mut block);
             rendered.extend(block.into_iter().map(|l| (l, 2usize)));
             continue;
         }
 
+        // A structured tool row renders the same regardless of (Host) role: a
+        // single status line + a folded result gutter. Handled before the
+        // role-text match so its body never falls through to the prose path.
+        if let MessageBody::Tool(tool) = &msg.kind {
+            render_tool_row(tool, &mut rendered, app.lang, app.spinner());
+            continue;
+        }
+
+        let body = msg.body();
         match msg.role {
             // **User messages** — full-width tinted background bar (Claude Code:
             // userMessageBackground = rgb(55,55,55)), no leading dot.
             ChatRole::You => {
-                for line in msg.body.lines() {
+                for line in body.lines() {
                     rendered.push((
                         Line::from(Span::styled(
                             format!(" {line}"),
@@ -2152,8 +2290,16 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             // terminal background (Claude Code: AssistantTextMessage). The
             // two-column bullet gutter is also the hang width, so a long paragraph
             // that wraps lines up under the text, not under the bullet.
+            //
+            // **P6 long-output fold**: a collapsed long body is truncated to a
+            // head-N preview + a `… N more lines` summary (Ctrl+R expands).
             ChatRole::Host | ChatRole::UmaDev => {
-                let body_lines = markdown_to_lines(&msg.body, theme::TEXT());
+                let folded = if msg.collapsed && crate::app::message_is_collapsible(msg) {
+                    fold_general_text(&body, app.lang)
+                } else {
+                    body.into_owned()
+                };
+                let body_lines = markdown_to_lines(&folded, theme::TEXT());
                 for (i, bl) in body_lines.into_iter().enumerate() {
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     if i == 0 {
@@ -2170,7 +2316,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             }
             // **System messages** — dim/muted, no bullet.
             ChatRole::System => {
-                for line in msg.body.lines() {
+                for line in body.lines() {
                     rendered.push((
                         Line::from(Span::styled(
                             format!("  {line}"),
@@ -3190,6 +3336,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("Shift+Enter", umadev_i18n::t(lang, "tui.help.edit.newline")),
                     ("↑ / ↓", umadev_i18n::t(lang, "tui.help.edit.recall")),
                     ("Tab", umadev_i18n::t(lang, "tui.help.edit.autocomplete")),
+                    ("Ctrl+R", umadev_i18n::t(lang, "tui.help.edit.expand")),
                     ("/compact", umadev_i18n::t(lang, "tui.help.edit.compact")),
                     ("/clear", umadev_i18n::t(lang, "tui.help.edit.clear")),
                     ("/help or /?", umadev_i18n::t(lang, "tui.help.edit.help")),

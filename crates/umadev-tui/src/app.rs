@@ -31,6 +31,18 @@ use crate::config::UserConfig;
 
 /// Max lines kept in the chat history (older lines roll off).
 const HISTORY_CAP: usize = 1000;
+/// A Host/UmaDev text body (or a tool result) past this many SOURCE lines is
+/// foldable: the renderer shows a head-N preview + a `… N more lines` summary
+/// until the user expands it (Ctrl+R). This is what stops a single 998-line base
+/// reply from flooding the whole transcript. Counted on raw `\n`-split lines
+/// (cheap, pre-wrap); a borderline message that wraps to more visual rows is
+/// fine — the head-N is generous.
+pub(crate) const FOLD_THRESHOLD: usize = 20;
+/// Head lines kept when a long GENERAL (text / non-shell) body is folded.
+pub(crate) const FOLD_HEAD_GENERAL: usize = 3;
+/// Head lines kept when a long SHELL (Bash) tool result is folded — shell output
+/// gets a deeper preview (the tail of a build log is usually the signal).
+pub(crate) const FOLD_HEAD_SHELL: usize = 10;
 /// Max conversation-memory messages handed to the base per routed turn.
 /// Bounds prompt growth (≈ the last 8 user/assistant exchanges) while keeping
 /// enough context for the base to follow a multi-turn dialogue.
@@ -288,13 +300,147 @@ pub enum ChatRole {
     System,
 }
 
+/// Lifecycle of a structured tool call shown in the transcript. Drives the
+/// status glyph (queued = dim, running = spinner, ok = green, fail = red) and
+/// the auto-collapse policy (a finished OK call collapses; running / failed
+/// always stay expanded).
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ToolStatus {
+    /// Announced but not yet started (rare on the stream path; reserved).
+    Queued,
+    /// In flight — the base is executing the tool right now.
+    Running,
+    /// Completed successfully.
+    Ok,
+    /// Completed with an error.
+    Fail,
+}
+
+impl ToolStatus {
+    /// `true` once the call has reached a terminal state (used by the
+    /// auto-collapse policy: only a finished call may collapse).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ToolStatus::Ok | ToolStatus::Fail)
+    }
+}
+
+/// A structured tool invocation rendered as a single status line (a status
+/// glyph, the bold name, then the dim primary argument) with its result folded
+/// into a dim gutter line below. Replaces the old path that flattened a tool
+/// call into a sentence-like string, so a write/edit no longer reads like prose.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ToolCall {
+    /// The tool's name as the base reports it (`Read` / `Edit` / `Bash` …).
+    pub name: String,
+    /// The primary argument (a path, a query, a command) — already truncated
+    /// to a sane width; rendered dim in parentheses after the name.
+    pub arg: String,
+    /// Current lifecycle state — drives the status glyph + auto-collapse.
+    pub status: ToolStatus,
+    /// The result summary once the call returns (`None` while in flight).
+    pub result: Option<String>,
+    /// `true` when a low-signal read/grep/glob batch was merged into this one
+    /// line; `count` then carries how many calls folded together.
+    pub merged: bool,
+    /// How many calls this row represents (1 unless `merged`). Stored as the
+    /// "greatest seen" so a streaming count never visibly jumps backwards.
+    /// `u32` to line up with the streaming batch counter (`stream_tool_batch`).
+    pub count: u32,
+    /// Whether the result body is currently folded to a summary line. A
+    /// finished OK call defaults to collapsed; a running / failed call is
+    /// always shown expanded.
+    pub collapsed: bool,
+}
+
+/// The payload of one chat row — either free text (rendered via the shared
+/// `markdown_to_lines` compiler) or a structured tool call (rendered as a
+/// single status line + folded result). Keeping these as a typed enum is the
+/// P0 data-model foundation the tool-row beautification (P4) and the long-output
+/// folding (P6) build on; everything else stays plain `Text`, so the upgrade is
+/// backward-compatible by construction.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum MessageBody {
+    /// A free-text body (already cleaned of ANSI etc.). Goes through the shared
+    /// markdown renderer (`markdown_to_lines`) on the assistant/host path.
+    Text(String),
+    /// A structured tool call — its own status line + foldable result.
+    Tool(ToolCall),
+}
+
+impl MessageBody {
+    /// Borrow the flat text of this body — the `Text` string verbatim, or a
+    /// deterministic one-line rendering of a `Tool` call. Used by every
+    /// non-render consumer (history export, the resume preview, the brain
+    /// transcript) so they keep working unchanged after the enum upgrade.
+    #[must_use]
+    pub fn as_text(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            MessageBody::Text(s) => std::borrow::Cow::Borrowed(s),
+            MessageBody::Tool(t) => {
+                // The flat text (export / brain transcript / history preview)
+                // keeps the legacy bracket-tag look (`[read] Read`), with a
+                // terminal-state mark so a failed call still reads as failed.
+                let mark = match t.status {
+                    ToolStatus::Queued | ToolStatus::Running => tool_tag(&t.name),
+                    ToolStatus::Ok => "[ok]",
+                    ToolStatus::Fail => "[fail]",
+                };
+                let count = if t.count > 1 {
+                    format!(" ({})", t.count)
+                } else {
+                    String::new()
+                };
+                let arg = if t.arg.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", t.arg)
+                };
+                let result = t
+                    .result
+                    .as_deref()
+                    .filter(|r| !r.trim().is_empty())
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default();
+                std::borrow::Cow::Owned(format!("{mark} {}{count}{arg}{result}", t.name))
+            }
+        }
+    }
+}
+
 /// One row in the chat history.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ChatMessage {
     /// Who "said" this.
     pub role: ChatRole,
-    /// The text body (already cleaned of ANSI etc.).
-    pub body: String,
+    /// The structured payload — free text or a tool call.
+    pub kind: MessageBody,
+    /// Whether a long body (text or tool result) is currently folded to a
+    /// summary line. Toggled by the focus + expand key (P6); defaults to
+    /// `false` (everything starts expanded; the renderer applies the head-N
+    /// truncation only when this is set).
+    pub collapsed: bool,
+}
+
+impl ChatMessage {
+    /// Borrow the flat text of this message (see [`MessageBody::as_text`]).
+    /// Lets the many `msg.body`-style read sites become `msg.body()` with no
+    /// behavioural change.
+    #[must_use]
+    pub fn body(&self) -> std::borrow::Cow<'_, str> {
+        self.kind.as_text()
+    }
+
+    /// Mutable handle to the underlying text when this row is a `Text` body —
+    /// the streaming typewriter path appends deltas through this. Returns
+    /// `None` for a `Tool` row (tool rows are updated structurally, not by
+    /// string append), keeping the streaming append fail-open.
+    pub fn text_mut(&mut self) -> Option<&mut String> {
+        match &mut self.kind {
+            MessageBody::Text(s) => Some(s),
+            MessageBody::Tool(_) => None,
+        }
+    }
 }
 
 /// A scrollable full-screen overlay opened by `/spec` / `/verify` /
@@ -1064,10 +1210,164 @@ impl App {
     fn push(&mut self, role: ChatRole, body: impl Into<String>) {
         self.history.push_back(ChatMessage {
             role,
-            body: body.into(),
+            kind: MessageBody::Text(body.into()),
+            collapsed: false,
         });
         while self.history.len() > HISTORY_CAP {
             self.history.pop_front();
+        }
+    }
+
+    /// Push a structured tool row (or merge into a running low-signal batch).
+    ///
+    /// P4 — the tool-call beautification. A low-signal read/grep/glob folds into
+    /// the trailing merged batch row with an incrementing count (greatest-seen,
+    /// so a streamed count never jumps backwards); Write / Edit / Bash / web /
+    /// agent each push their own `Running` row. Fully fail-open: a corrupt
+    /// trailing row simply means a fresh row is pushed.
+    fn push_tool_use(&mut self, name: &str, detail: &str) {
+        let lang = self.lang;
+        let arg: String = detail.chars().take(80).collect();
+        let low_signal = is_low_signal_tool(name);
+
+        // Merge a contiguous low-signal run into one row. We only merge when the
+        // trailing row is ALSO a (low-signal) tool row — the moment a Write /
+        // Bash / text bubble lands, the next read starts a fresh batch.
+        if low_signal {
+            let mut merged_count: Option<u32> = None;
+            if let Some(last) = self.history.back_mut() {
+                if last.role == ChatRole::Host {
+                    if let MessageBody::Tool(t) = &mut last.kind {
+                        if t.merged {
+                            // Greatest-seen guard: never let a streamed count
+                            // visibly decrease.
+                            t.count = t.count.saturating_add(1).max(t.count);
+                            t.status = ToolStatus::Running;
+                            t.collapsed = false;
+                            t.arg = merged_batch_summary(lang, t.count);
+                            // The result of the prior call in the batch is no
+                            // longer the headline — the live count is.
+                            t.result = None;
+                            merged_count = Some(t.count);
+                        }
+                    }
+                }
+            }
+            if let Some(count) = merged_count {
+                self.stream_tool_batch = Some((name.to_string(), count));
+                return;
+            }
+            // Start a fresh merged batch row.
+            let count = 1;
+            self.stream_tool_batch = Some((name.to_string(), count));
+            let summary = merged_batch_summary(lang, count);
+            self.history.push_back(ChatMessage {
+                role: ChatRole::Host,
+                kind: MessageBody::Tool(ToolCall {
+                    name: name.to_string(),
+                    arg: summary,
+                    status: ToolStatus::Running,
+                    result: None,
+                    merged: true,
+                    count,
+                    collapsed: false,
+                }),
+                collapsed: false,
+            });
+            while self.history.len() > HISTORY_CAP {
+                self.history.pop_front();
+            }
+            return;
+        }
+
+        // A single-row tool (Write / Edit / Bash / web / agent / other): always
+        // its own `Running` row. Breaks any in-flight low-signal batch.
+        self.stream_tool_batch = None;
+        self.history.push_back(ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Tool(ToolCall {
+                name: name.to_string(),
+                arg,
+                status: ToolStatus::Running,
+                result: None,
+                merged: false,
+                count: 1,
+                collapsed: false,
+            }),
+            collapsed: false,
+        });
+        while self.history.len() > HISTORY_CAP {
+            self.history.pop_front();
+        }
+    }
+
+    /// Fold a `ToolResult` into the trailing tool row: flip its status to
+    /// Ok/Fail, attach the result summary, and auto-collapse a finished OK call
+    /// (a failed call stays expanded so the error is never hidden). A low-signal
+    /// merged row keeps its `read N files` summary as the headline and folds the
+    /// metric in rather than dumping the raw output. Fail-open: with no trailing
+    /// tool row (e.g. a result with no preceding use) it pushes a bare line.
+    fn attach_tool_result(&mut self, ok: bool, summary: &str) {
+        let lang = self.lang;
+        let status = if ok { ToolStatus::Ok } else { ToolStatus::Fail };
+        // Update the trailing tool row, then carry whether it was a merged batch
+        // out of the borrow so the (separate) `stream_tool_batch` field can be
+        // set without overlapping the `&mut self.history` borrow.
+        let mut batch: Option<(String, u32)> = None;
+        let mut handled = false;
+        if let Some(last) = self.history.back_mut() {
+            if last.role == ChatRole::Host {
+                if let MessageBody::Tool(t) = &mut last.kind {
+                    t.status = status;
+                    let preview: String = summary.chars().take(200).collect();
+                    if t.merged {
+                        // The headline stays the running count; only fold the
+                        // metric in (e.g. `(3 matches)`), never the raw dump.
+                        t.result = read_only_metric(lang, &t.name, &preview);
+                        batch = Some((t.name.clone(), t.count));
+                    } else {
+                        t.result = if preview.trim().is_empty() {
+                            None
+                        } else {
+                            Some(preview)
+                        };
+                    }
+                    // Auto-collapse a finished OK call; a failure stays open.
+                    t.collapsed = ok;
+                    handled = true;
+                }
+            }
+        }
+        if handled {
+            self.stream_tool_batch = batch;
+            return;
+        }
+        // No trailing tool row — fail-open to a plain status line (old look).
+        let mark = if ok { "[ok]" } else { "[fail]" };
+        let preview: String = summary.chars().take(100).collect();
+        if !preview.trim().is_empty() {
+            self.push(ChatRole::Host, format!("  {mark} {preview}"));
+        }
+    }
+
+    /// Toggle the fold state of the most recent collapsible row (P6 — Ctrl+R).
+    /// Walks from newest to oldest and flips the `collapsed` flag of the first
+    /// row long enough to be foldable (a long Host/UmaDev text body, or a
+    /// finished tool row whose result is long). No-op (fail-open) when nothing
+    /// in view is long enough to fold.
+    fn toggle_last_collapsible(&mut self) {
+        if let Some(msg) = self
+            .history
+            .iter_mut()
+            .rev()
+            .find(|m| message_is_collapsible(m))
+        {
+            match &mut msg.kind {
+                // A long tool result lives on the ToolCall's own `collapsed`.
+                MessageBody::Tool(t) => t.collapsed = !t.collapsed,
+                // A long text body uses the message-level `collapsed`.
+                MessageBody::Text(_) => msg.collapsed = !msg.collapsed,
+            }
         }
     }
 
@@ -2191,14 +2491,21 @@ impl App {
                 // Group consecutive host-output lines into the same chat
                 // bubble — they belong to one phase's stream and reading
                 // them as separate messages is visually noisy.
-                if let Some(last) = self.history.back_mut() {
-                    if last.role == ChatRole::Host {
-                        last.body.push('\n');
-                        last.body.push_str(&trimmed);
-                    } else {
-                        self.push(ChatRole::Host, trimmed);
-                    }
-                } else {
+                // Group only into a live Host *text* bubble. A trailing tool
+                // row (Host role, but a `Tool` body) must NOT absorb the line —
+                // `text_mut()` returns `None` there, so we fall through to a
+                // fresh text bubble (fail-open).
+                let appended = self
+                    .history
+                    .back_mut()
+                    .filter(|last| last.role == ChatRole::Host)
+                    .and_then(ChatMessage::text_mut)
+                    .map(|s| {
+                        s.push('\n');
+                        s.push_str(&trimmed);
+                    })
+                    .is_some();
+                if !appended {
                     self.push(ChatRole::Host, trimmed);
                 }
             }
@@ -2315,14 +2622,21 @@ impl App {
                                     if m.role != ChatRole::Host {
                                         return false;
                                     }
-                                    if m.body.len() >= SEGMENT_BYTES_MAX {
+                                    // A live Host *text* segment only — a tool
+                                    // row never absorbs streamed prose.
+                                    let MessageBody::Text(body) = &m.kind else {
+                                        return false;
+                                    };
+                                    if body.len() >= SEGMENT_BYTES_MAX {
                                         return false;
                                     }
-                                    m.body.len() < SEGMENT_BYTES || has_open_code_fence(&m.body)
+                                    body.len() < SEGMENT_BYTES || has_open_code_fence(body)
                                 });
                             if append_in_place {
-                                if let Some(last) = self.history.back_mut() {
-                                    last.body.push_str(&delta);
+                                if let Some(last) =
+                                    self.history.back_mut().and_then(ChatMessage::text_mut)
+                                {
+                                    last.push_str(&delta);
                                 }
                             } else {
                                 // Either a fresh stream, or a rollover because the
@@ -2345,44 +2659,7 @@ impl App {
                         // `Bash`/`run` tool can be one). Cleared on its result.
                         self.long_op_in_progress =
                             matches!(name.as_str(), "Bash") && is_long_running_command(&detail);
-                        let icon = match name.as_str() {
-                            "Read" | "NotebookEdit" => "[read]",
-                            "Write" | "Edit" => "[write]",
-                            "Bash" => "[run]",
-                            "Grep" | "Glob" => "[search]",
-                            "WebSearch" | "WebFetch" => "[web]",
-                            "Task" | "Agent" => "[agent]",
-                            _ => "[auto]",
-                        };
-                        let detail_display = if detail.is_empty() {
-                            String::new()
-                        } else {
-                            let d: String = detail.chars().take(80).collect();
-                            format!(" `{d}`")
-                        };
-                        // **Throttle**: if the last message was the same tool
-                        // type, increment a counter and update the message
-                        // in-place instead of pushing a new line. This turns
-                        // 10 × `[read] Read` into one `[read] Read (10): last_file`.
-                        let is_same_batch = self
-                            .stream_tool_batch
-                            .as_ref()
-                            .is_some_and(|(prev_name, _)| prev_name == &name);
-                        if is_same_batch {
-                            // Update the existing batch entry.
-                            let count = self.stream_tool_batch.as_ref().unwrap().1 + 1;
-                            self.stream_tool_batch = Some((name.clone(), count));
-                            // Replace the last Host message with the updated count.
-                            if let Some(last) = self.history.back_mut() {
-                                if last.role == ChatRole::Host {
-                                    last.body = format!("{icon} {name} ({count}){detail_display}");
-                                }
-                            }
-                        } else {
-                            // New tool type — push a fresh message.
-                            self.stream_tool_batch = Some((name.clone(), 1));
-                            self.push(ChatRole::Host, format!("{icon} {name}{detail_display}"));
-                        }
+                        self.push_tool_use(&name, &detail);
                     }
                     umadev_runtime::StreamEvent::ToolResult { ok, summary } => {
                         self.stream_text_active = false;
@@ -2390,11 +2667,7 @@ impl App {
                         // on a tool"; the stall clock applies normally again.
                         self.tool_in_progress = false;
                         self.long_op_in_progress = false;
-                        let mark = if ok { "[ok]" } else { "[fail]" };
-                        let preview: String = summary.chars().take(100).collect();
-                        if !preview.trim().is_empty() {
-                            self.push(ChatRole::Host, format!("  {mark} {preview}"));
-                        }
+                        self.attach_tool_result(ok, &summary);
                     }
                     umadev_runtime::StreamEvent::Warning { message } => {
                         self.stream_text_active = false;
@@ -2934,6 +3207,13 @@ impl App {
                 self.should_quit = true;
                 Action::Quit
             }
+            // Ctrl+R toggles the fold of the most recent collapsible row (a long
+            // Host/UmaDev text wall, or a finished tool row's result) — the P6
+            // "expand the 998-line wall" lever. No-op when nothing is foldable.
+            KeyCode::Char('r') if ctrl => {
+                self.toggle_last_collapsible();
+                Action::None
+            }
 
             // ---- printable char ----
             KeyCode::Char(c) => {
@@ -3293,8 +3573,12 @@ impl App {
         self.stream_text_active = false;
         let marker = umadev_i18n::t(self.lang, "chat.interrupted");
         if let Some(last) = self.history.back_mut() {
-            if last.role == ChatRole::Host && !last.body.ends_with(marker) {
-                last.body.push_str(marker);
+            if last.role == ChatRole::Host {
+                if let Some(text) = last.text_mut() {
+                    if !text.ends_with(marker) {
+                        text.push_str(marker);
+                    }
+                }
             }
         }
     }
@@ -5426,7 +5710,7 @@ impl App {
                 ChatRole::Gate => "GATE",
                 ChatRole::System => "system",
             };
-            body.push_str(&format!("[{label}] {}\n", msg.body));
+            body.push_str(&format!("[{label}] {}\n", msg.body()));
             body.push('\n');
         }
         if body.is_empty() {
@@ -6194,7 +6478,7 @@ impl App {
                     format!(
                         "- [{:?}] {}",
                         m.role,
-                        m.body.chars().take(120).collect::<String>()
+                        m.body().chars().take(120).collect::<String>()
                     )
                 })
                 .collect::<Vec<_>>()
@@ -6407,6 +6691,74 @@ pub(crate) struct ChatSession {
 /// in `chrono` — the TUI crate stays dependency-light. Derived from the Unix
 /// epoch via a plain civil-date conversion (days-from-epoch → Y/M/D). Used only
 /// for human-facing ordering/labels, so a leap-second-level imprecision is fine.
+/// Whether a message is long enough to be FOLDABLE (P6). A Host/UmaDev text
+/// body, or a tool row whose result, exceeds [`FOLD_THRESHOLD`] source lines.
+/// Used by both the Ctrl+R toggle (to pick the row to flip) and the renderer (to
+/// decide whether to draw the head-N preview + summary). Cheap line count;
+/// fail-open (anything else → not foldable).
+pub(crate) fn message_is_collapsible(m: &ChatMessage) -> bool {
+    match &m.kind {
+        MessageBody::Text(s) => {
+            matches!(m.role, ChatRole::Host | ChatRole::UmaDev)
+                && s.lines().count() > FOLD_THRESHOLD
+        }
+        MessageBody::Tool(t) => t
+            .result
+            .as_deref()
+            .is_some_and(|r| r.lines().count() > FOLD_THRESHOLD),
+    }
+}
+
+/// The headline for a merged low-signal batch row, e.g. `读取 3 个文件,搜索` /
+/// `inspected 3 items`. One localized phrase carries the live count; the count
+/// is greatest-seen so a streamed value never visibly jumps backwards.
+fn merged_batch_summary(lang: umadev_i18n::Lang, count: u32) -> String {
+    umadev_i18n::tf(lang, "tui.tool.batch", &[&count.to_string()])
+}
+
+/// Fold a read-only tool's raw result into a single metric instead of dumping
+/// it: a `Grep`/`Glob` summary that mentions a count keeps `(N matches)`,
+/// otherwise the result is suppressed entirely (the merged headline already
+/// says what happened). Returns `None` when there is nothing worth a gutter
+/// line. Fail-open: any parse miss → `None`.
+fn read_only_metric(lang: umadev_i18n::Lang, name: &str, preview: &str) -> Option<String> {
+    // Pull the first integer out of the summary, if any (`3 matches`, `Found 5`).
+    let n: Option<usize> = preview
+        .split(|c: char| !c.is_ascii_digit())
+        .find_map(|s| s.parse::<usize>().ok());
+    match (name, n) {
+        ("Grep" | "Glob", Some(n)) => {
+            Some(umadev_i18n::tf(lang, "tui.tool.matches", &[&n.to_string()]))
+        }
+        _ => None,
+    }
+}
+
+/// A low-signal read-only tool whose calls may be *merged* into one transcript
+/// row with an incrementing count (`read N files, searched M times`). These
+/// never mutate the tree and their raw output is noise, so dumping each one as
+/// its own row buries the actual work; folding them keeps the transcript
+/// legible. Write / Edit / Bash / web / agent are NOT here — they each get their
+/// own row (their result IS the signal).
+fn is_low_signal_tool(name: &str) -> bool {
+    matches!(name, "Read" | "Grep" | "Glob" | "NotebookRead")
+}
+
+/// The bracket tag historically shown before a tool name (`[read]` / `[write]`
+/// …). Kept for the flat text rendering (export / brain transcript) and as a
+/// fallback; the structured transcript row uses a status glyph instead.
+fn tool_tag(name: &str) -> &'static str {
+    match name {
+        "Read" | "NotebookRead" | "NotebookEdit" => "[read]",
+        "Write" | "Edit" => "[write]",
+        "Bash" => "[run]",
+        "Grep" | "Glob" => "[search]",
+        "WebSearch" | "WebFetch" => "[web]",
+        "Task" | "Agent" => "[agent]",
+        _ => "[auto]",
+    }
+}
+
 /// Whether a `Bash` command detail looks like a legitimately-long operation
 /// (dependency install / full build / image pull) that runs for minutes with no
 /// output — so the stall watchdog should widen its window instead of flashing red
@@ -7316,7 +7668,7 @@ mod tests {
         // The pushed status line must be the i18n string, not a raw literal.
         let last = app.history.back().expect("a status line was pushed");
         assert_eq!(
-            last.body,
+            last.body(),
             umadev_i18n::t(app.lang, "slash.mouse_on"),
             "/mouse status text must come from the i18n catalog"
         );
@@ -7373,7 +7725,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.role == ChatRole::Host && m.body == "你好,我是底座"));
+            .any(|m| m.role == ChatRole::Host && m.body() == "你好,我是底座"));
 
         // Memory stays bounded to the most recent CONVERSATION_CAP messages.
         for i in 0..CONVERSATION_CAP * 2 {
@@ -7434,7 +7786,7 @@ mod tests {
         assert!(app2
             .history
             .iter()
-            .any(|m| m.role == ChatRole::System && m.body.contains("恢复")));
+            .any(|m| m.role == ChatRole::System && m.body().contains("恢复")));
     }
 
     #[test]
@@ -7455,7 +7807,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.body.contains(&id_a) && m.body.contains("已保存")));
+            .any(|m| m.body().contains(&id_a) && m.body().contains("已保存")));
 
         // `/resume <id_a>` reopens chat A's transcript.
         let _ = app.try_slash_command(&format!("/resume {id_a}"));
@@ -7477,7 +7829,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.role == ChatRole::System && m.body.contains("没找到")));
+            .any(|m| m.role == ChatRole::System && m.body().contains("没找到")));
     }
 
     #[test]
@@ -7658,7 +8010,7 @@ mod tests {
         // No output dir / notes file → guidance message, no StartPreview.
         let action = app.slash_preview();
         assert!(matches!(action, Action::None));
-        assert!(app.history.iter().any(|m| m.body.contains("还没有可预览")));
+        assert!(app.history.iter().any(|m| m.body().contains("还没有可预览")));
     }
 
     #[test]
@@ -7780,7 +8132,7 @@ mod tests {
         // Greeting is the very first message.
         let first = app.history.front().unwrap();
         assert_eq!(first.role, ChatRole::UmaDev);
-        assert!(first.body.contains("claude-code"));
+        assert!(first.body().contains("claude-code"));
     }
 
     #[test]
@@ -7859,9 +8211,9 @@ mod tests {
             .find(|m| m.role == ChatRole::UmaDev)
             .unwrap();
         // …carrying the BUILD headline, the rough budget, the team, and the reason.
-        assert!(card.body.contains("160"), "shows the budget");
-        assert!(card.body.contains("architect"), "shows the team");
-        assert!(card.body.contains("研发流程"), "carries the rationale");
+        assert!(card.body().contains("160"), "shows the budget");
+        assert!(card.body().contains("architect"), "shows the team");
+        assert!(card.body().contains("研发流程"), "carries the rationale");
         // …and the class is recorded so the status chip can show it.
         assert_eq!(app.last_intent_class.as_deref(), Some("build"));
     }
@@ -7962,7 +8314,7 @@ mod tests {
         let action = app.try_slash_command("/plan").unwrap();
         assert_eq!(action, Action::None);
         // A "no active plan" hint + the usage line land (not silent).
-        let joined: String = app.history.iter().map(|m| m.body.clone()).collect();
+        let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
         assert!(joined.contains("/plan skip"), "usage shown: {joined}");
     }
 
@@ -7997,7 +8349,7 @@ mod tests {
         let _ = app.try_slash_command("/plan veto s9").unwrap();
         // No such step → nothing queued, an honest "no step" note instead.
         assert!(app.queued_steer.is_empty());
-        let joined: String = app.history.iter().map(|m| m.body.clone()).collect();
+        let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
         assert!(joined.contains("s9"));
     }
 
@@ -8192,7 +8544,7 @@ mod tests {
         // After /clear: only the localized "history cleared" system note remains.
         assert_eq!(app.history.len(), 1);
         assert_eq!(
-            app.history.front().unwrap().body,
+            app.history.front().unwrap().body(),
             umadev_i18n::t(app.lang, "slash.history_cleared")
         );
     }
@@ -8247,7 +8599,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.body.contains("还没启动流水线") || m.body.contains("没有打开的 gate")));
+            .any(|m| m.body().contains("还没启动流水线") || m.body().contains("没有打开的 gate")));
     }
 
     #[test]
@@ -8274,7 +8626,7 @@ mod tests {
         }
         let action = app.apply_key(KeyCode::Enter);
         assert_eq!(action, Action::None);
-        assert!(app.history.iter().any(|m| m.body.contains("/revise")));
+        assert!(app.history.iter().any(|m| m.body().contains("/revise")));
     }
 
     #[test]
@@ -8294,7 +8646,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.body.contains("build a shippable todo app")));
+            .any(|m| m.body().contains("build a shippable todo app")));
     }
 
     #[test]
@@ -8306,7 +8658,7 @@ mod tests {
         }
         let action = app.apply_key(KeyCode::Enter);
         assert_eq!(action, Action::None);
-        assert!(app.history.iter().any(|m| m.body.contains("/goal")));
+        assert!(app.history.iter().any(|m| m.body().contains("/goal")));
     }
 
     #[test]
@@ -8325,7 +8677,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.body.contains("未知命令") && m.body.contains("/foo")));
+            .any(|m| m.body().contains("未知命令") && m.body().contains("/foo")));
     }
 
     #[test]
@@ -8402,9 +8754,9 @@ mod tests {
         );
         // The user sees the cause, and the sentinel marker is stripped.
         let last = app.history.back().unwrap();
-        assert!(last.body.contains("本轮已中止"));
+        assert!(last.body().contains("本轮已中止"));
         assert!(
-            !last.body.contains(crate::ABORT_SENTINEL),
+            !last.body().contains(crate::ABORT_SENTINEL),
             "the internal sentinel marker must never be shown to the user"
         );
         // The status bar carries the explicit aborted label, not an idle look.
@@ -8446,7 +8798,7 @@ mod tests {
         });
         let last = app.history.back().unwrap();
         assert_eq!(last.role, ChatRole::Host);
-        assert!(last.body.contains("Similar products"));
+        assert!(last.body().contains("Similar products"));
     }
 
     #[test]
@@ -8559,7 +8911,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.role == ChatRole::UmaDev && m.body.contains("umadev.yaml")));
+            .any(|m| m.role == ChatRole::UmaDev && m.body().contains("umadev.yaml")));
     }
 
     #[test]
@@ -8592,9 +8944,9 @@ mod tests {
             .find(|m| m.role == ChatRole::Host)
             .unwrap();
         assert!(
-            last.body.contains(marker.trim()),
+            last.body().contains(marker.trim()),
             "an interrupted reply must be marked incomplete: {:?}",
-            last.body
+            last.body()
         );
         assert!(!a.stream_text_active, "the stream flag is cleared on seal");
     }
@@ -8612,7 +8964,7 @@ mod tests {
             .find(|m| m.role == ChatRole::Host)
             .unwrap();
         assert_eq!(
-            last.body, "a finished reply",
+            last.body(), "a finished reply",
             "no marker when nothing streamed"
         );
     }
@@ -8753,11 +9105,11 @@ mod tests {
         let resume_msg = app
             .history
             .iter()
-            .find(|m| m.body.contains("docs_confirm"))
+            .find(|m| m.body().contains("docs_confirm"))
             .expect("resume hint should mention the paused gate");
         assert_eq!(resume_msg.role, ChatRole::System);
-        assert!(resume_msg.body.contains("做一个登录系统"));
-        assert!(resume_msg.body.contains("/continue"));
+        assert!(resume_msg.body().contains("做一个登录系统"));
+        assert!(resume_msg.body().contains("/continue"));
     }
 
     #[test]
@@ -8791,9 +9143,9 @@ mod tests {
         let msg = app
             .history
             .iter()
-            .find(|m| m.body.contains("上次跑完了") || m.body.contains("上次会话"))
+            .find(|m| m.body().contains("上次跑完了") || m.body().contains("上次会话"))
             .expect("delivery-state should produce a chat hint");
-        assert!(msg.body.contains("做个 todo"));
+        assert!(msg.body().contains("做个 todo"));
     }
 
     #[test]
@@ -8814,7 +9166,7 @@ mod tests {
         assert!(!app
             .history
             .iter()
-            .any(|m| m.body.contains("docs_confirm") || m.body.contains("上次")));
+            .any(|m| m.body().contains("docs_confirm") || m.body().contains("上次")));
     }
 
     // ---- /model + /version + /changelog + typo did-you-mean ----
@@ -8827,7 +9179,7 @@ mod tests {
             let _ = a.apply_key(KeyCode::Char(c));
         }
         assert!(matches!(a.apply_key(KeyCode::Enter), Action::None));
-        assert!(a.history.iter().any(|m| m.body.contains("没有正在运行")));
+        assert!(a.history.iter().any(|m| m.body().contains("没有正在运行")));
         // Running → /cancel returns Action::Cancel (event loop aborts the task).
         a.run_started = true;
         a.finished = false;
@@ -8838,7 +9190,7 @@ mod tests {
         // cancel_run resets state back to a clean prompt.
         a.cancel_run();
         assert!(!a.is_pipeline_active());
-        assert!(a.history.iter().any(|m| m.body.contains("已取消")));
+        assert!(a.history.iter().any(|m| m.body().contains("已取消")));
     }
 
     #[test]
@@ -8914,7 +9266,7 @@ mod tests {
         );
         assert_eq!(a.backend, before, "the backend must be unchanged mid-run");
         assert!(
-            a.history.iter().any(|m| m.body.contains("/cancel")),
+            a.history.iter().any(|m| m.body().contains("/cancel")),
             "the rejection tells the user to /cancel first"
         );
     }
@@ -8945,11 +9297,11 @@ mod tests {
         assert!(
             a.history
                 .iter()
-                .any(|m| m.body.contains("使用统计") || m.body.contains("还没有使用记录")),
+                .any(|m| m.body().contains("使用统计") || m.body().contains("还没有使用记录")),
             "partial /usag + Enter should run /usage"
         );
         assert!(
-            !a.history.iter().any(|m| m.body.contains("未知命令")),
+            !a.history.iter().any(|m| m.body().contains("未知命令")),
             "should not report unknown command for a resolvable partial"
         );
     }
@@ -8964,7 +9316,7 @@ mod tests {
         assert!(a
             .history
             .iter()
-            .any(|m| m.body.contains("切换:/model") && m.body.contains("当前 model")));
+            .any(|m| m.body().contains("切换:/model") && m.body().contains("当前 model")));
         // config.model still None.
         assert!(a.config.model.is_none());
     }
@@ -9143,7 +9495,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.body.contains("还没有部署指令")));
+            .any(|m| m.body().contains("还没有部署指令")));
     }
 
     #[test]
@@ -9178,7 +9530,7 @@ mod tests {
         assert!(app
             .history
             .iter()
-            .any(|m| m.body.contains("npx vercel --prod")));
+            .any(|m| m.body().contains("npx vercel --prod")));
         // /deploy confirm actually runs it.
         let action = app.slash_deploy("confirm");
         match action {
@@ -9279,9 +9631,9 @@ mod tests {
         }
         let _ = a.apply_key(KeyCode::Enter);
         let last = a.history.back().unwrap();
-        assert!(last.body.contains("/quitz"));
-        assert!(last.body.contains("/quit"));
-        assert!(last.body.contains("是想用"));
+        assert!(last.body().contains("/quitz"));
+        assert!(last.body().contains("/quit"));
+        assert!(last.body().contains("是想用"));
     }
 
     #[test]
@@ -9347,13 +9699,13 @@ mod tests {
             .find(|m| m.role == ChatRole::Gate)
             .expect("gate card must land in chat");
         // Lists the three core docs by slug.
-        assert!(card.body.contains("output/demo-prd.md"));
-        assert!(card.body.contains("output/demo-architecture.md"));
-        assert!(card.body.contains("output/demo-uiux.md"));
+        assert!(card.body().contains("output/demo-prd.md"));
+        assert!(card.body().contains("output/demo-architecture.md"));
+        assert!(card.body().contains("output/demo-uiux.md"));
         // Lists next-step verbs.
-        assert!(card.body.contains("/continue"));
-        assert!(card.body.contains("/revise"));
-        assert!(card.body.contains("/diff"));
+        assert!(card.body().contains("/continue"));
+        assert!(card.body().contains("/revise"));
+        assert!(card.body().contains("/diff"));
     }
 
     #[test]
@@ -9371,8 +9723,8 @@ mod tests {
             .iter()
             .find(|m| m.role == ChatRole::Gate)
             .expect("gate card must land in chat");
-        assert!(card.body.contains("output/shop-frontend-notes.md"));
-        assert!(card.body.contains("output/shop-execution-plan.md"));
+        assert!(card.body().contains("output/shop-frontend-notes.md"));
+        assert!(card.body().contains("output/shop-execution-plan.md"));
     }
 
     #[test]
@@ -9391,8 +9743,8 @@ mod tests {
             .find(|m| m.role == ChatRole::Gate)
             .expect("gate card must land in chat");
         // The checklist tells the user WHAT to verify before approving.
-        assert!(card.body.contains("审批清单"));
-        assert!(card.body.contains("验收标准") || card.body.contains("验收"));
+        assert!(card.body().contains("审批清单"));
+        assert!(card.body().contains("验收标准") || card.body().contains("验收"));
     }
 
     #[test]
@@ -9444,9 +9796,9 @@ mod tests {
         let msg = a
             .history
             .iter()
-            .find(|m| m.body.contains("[fail]"))
+            .find(|m| m.body().contains("[fail]"))
             .expect("verify failure message");
-        assert!(msg.body.contains("依赖未安装"), "got: {}", msg.body);
+        assert!(msg.body().contains("依赖未安装"), "got: {}", msg.body());
     }
 
     #[test]
@@ -9468,7 +9820,7 @@ mod tests {
         let action = a.apply_key(KeyCode::Enter);
         // Outside a gate, "c" is neither approval nor a real requirement.
         assert_eq!(action, Action::Route("c".to_string()));
-        assert!(!a.history.iter().any(|m| m.body.contains("直接描述需求")));
+        assert!(!a.history.iter().any(|m| m.body().contains("直接描述需求")));
     }
 
     #[test]
@@ -9479,7 +9831,7 @@ mod tests {
         }
         let action = a.apply_key(KeyCode::Enter);
         assert_eq!(action, Action::Route("你好".to_string()));
-        assert!(!a.history.iter().any(|m| m.body.contains("收到需求")));
+        assert!(!a.history.iter().any(|m| m.body().contains("收到需求")));
     }
 
     #[test]
@@ -9490,7 +9842,7 @@ mod tests {
         }
         let action = a.apply_key(KeyCode::Enter);
         assert_eq!(action, Action::Route("你好吗？我很好啊".to_string()));
-        assert!(!a.history.iter().any(|m| m.body.contains("流水线启动")));
+        assert!(!a.history.iter().any(|m| m.body().contains("流水线启动")));
     }
 
     #[test]
@@ -9502,9 +9854,9 @@ mod tests {
         let _ = a.apply_key(KeyCode::Enter);
         let last = a.history.back().unwrap();
         assert!(
-            last.body.contains("还没启动流水线"),
+            last.body().contains("还没启动流水线"),
             "expected redirect hint, got: {}",
-            last.body
+            last.body()
         );
     }
 
@@ -9514,9 +9866,9 @@ mod tests {
         a.prepare_worker_routed_run("build me a thing");
         // The UmaDev preflight message includes the 9-phase plan.
         assert!(a.history.iter().any(|m| m.role == ChatRole::UmaDev
-            && m.body.contains("9 阶段")
-            && m.body.contains("docs_confirm")
-            && m.body.contains("preview_confirm")));
+            && m.body().contains("9 阶段")
+            && m.body().contains("docs_confirm")
+            && m.body().contains("preview_confirm")));
     }
 
     // ---- cursor + editing ----
@@ -9816,7 +10168,7 @@ mod tests {
             .filter(|m| m.role == ChatRole::Host)
             .collect();
         assert_eq!(host_msgs.len(), 1);
-        let body = &host_msgs[0].body;
+        let body = &host_msgs[0].body();
         assert!(body.contains("# header"));
         assert!(body.contains("## section"));
         assert!(body.contains("body line"));
@@ -10103,7 +10455,7 @@ mod tests {
             .history
             .iter()
             .skip(before)
-            .map(|m| m.body.clone())
+            .map(|m| m.body().into_owned())
             .collect();
         assert!(
             pushed.iter().any(|b| b.contains("[warn]")),
@@ -10121,14 +10473,14 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         app.record_chat_reply("我已修改了 app.rs 并新增了一个函数".to_string());
         assert!(
-            app.history.iter().any(|m| m.body.contains("[warn]")),
+            app.history.iter().any(|m| m.body().contains("[warn]")),
             "a chat reply claiming code changes must get a verify warning"
         );
         // A benign chat reply (no change claim) must NOT be warned.
         let mut benign = fresh_app(Some("offline"));
         benign.record_chat_reply("你好,有什么可以帮你的?".to_string());
         assert!(
-            !benign.history.iter().any(|m| m.body.contains("[warn]")),
+            !benign.history.iter().any(|m| m.body().contains("[warn]")),
             "a plain chat reply must not trigger the warning"
         );
     }
@@ -10151,14 +10503,14 @@ mod tests {
         let _ = app.apply_key(KeyCode::Enter);
         let last = app.history.back().unwrap();
         assert!(
-            !last.body.contains("已记录"),
+            !last.body().contains("已记录"),
             "a failed write must NOT claim the answer was recorded: {}",
-            last.body
+            last.body()
         );
         assert!(
-            last.body.contains("[warn]"),
+            last.body().contains("[warn]"),
             "a failed clarify write must surface a warning: {}",
-            last.body
+            last.body()
         );
         let _ = std::fs::remove_file(&blocker);
     }
@@ -10175,7 +10527,7 @@ mod tests {
         });
         let last = a.history.back().unwrap();
         assert_eq!(last.role, ChatRole::Host);
-        assert!(last.body.contains("Hello world"));
+        assert!(last.body().contains("Hello world"));
         assert!(
             a.stream_text_active,
             "stream_text_active should be true after first text"
@@ -10207,7 +10559,7 @@ mod tests {
             1,
             "two consecutive text deltas should be one message"
         );
-        assert_eq!(host_msgs[0].body, "Part 1 Part 2");
+        assert_eq!(host_msgs[0].body(), "Part 1 Part 2");
     }
 
     #[test]
@@ -10231,7 +10583,7 @@ mod tests {
             .history
             .iter()
             .filter(|m| m.role == ChatRole::Host)
-            .map(|m| m.body.chars().count())
+            .map(|m| m.body().chars().count())
             .sum();
         let expected = chunk.chars().count() * n;
         assert_eq!(
@@ -10251,9 +10603,9 @@ mod tests {
         );
         for m in &host_msgs {
             assert!(
-                !m.body.contains('…'),
+                !m.body().contains('…'),
                 "no segment should be truncated with an ellipsis: {}",
-                m.body
+                m.body()
             );
         }
     }
@@ -10278,7 +10630,7 @@ mod tests {
                 delta: "New text".into(),
             },
         });
-        assert!(!a.stream_text_active || a.history.back().unwrap().body == "New text");
+        assert!(!a.stream_text_active || a.history.back().unwrap().body() == "New text");
     }
 
     #[test]
@@ -10310,16 +10662,20 @@ mod tests {
         assert_eq!(
             host_msgs.len(),
             1,
-            "3 same-type tool calls should batch to 1 message"
+            "3 same-type read calls should merge into 1 structured tool row"
         );
+        // The merged row is a STRUCTURED tool call, not a flattened sentence.
+        let MessageBody::Tool(t) = &host_msgs[0].kind else {
+            panic!("merged read batch must be a Tool body, got Text");
+        };
+        assert!(t.merged, "low-signal reads merge into one batch row");
+        assert_eq!(t.count, 3, "the count tracks all three reads");
+        assert_eq!(t.status, ToolStatus::Running, "still in flight");
+        // The flat text still surfaces the count for export / history.
         assert!(
-            host_msgs[0].body.contains("(3)"),
-            "should show count: {}",
-            host_msgs[0].body
-        );
-        assert!(
-            host_msgs[0].body.contains("file3"),
-            "should show last detail"
+            host_msgs[0].body().contains('3'),
+            "flat text carries the count: {}",
+            host_msgs[0].body()
         );
     }
 
@@ -10348,6 +10704,237 @@ mod tests {
             2,
             "different tool types should be separate messages"
         );
+        // The Bash row is a single, un-merged tool row (its result IS signal).
+        let MessageBody::Tool(bash) = &host_msgs[1].kind else {
+            panic!("Bash must render as a structured tool row");
+        };
+        assert!(!bash.merged, "Bash is a single-row tool, never merged");
+        assert_eq!(bash.name, "Bash");
+    }
+
+    // ---- P4: structured tool rows ----------------------------------------
+
+    #[test]
+    fn tool_use_pushes_structured_tool_row_not_a_sentence() {
+        // A ToolUse no longer flattens into a `[write] Edit `path`` string — it
+        // becomes a typed `MessageBody::Tool` the renderer draws as one status
+        // line. Guards against regressing to the "tool call reads like prose" bug.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Edit".into(),
+                detail: "src/main.rs".into(),
+            },
+        });
+        let last = a.history.back().unwrap();
+        let MessageBody::Tool(t) = &last.kind else {
+            panic!("a tool use must produce a Tool body, not Text");
+        };
+        assert_eq!(t.name, "Edit");
+        assert_eq!(t.arg, "src/main.rs");
+        assert_eq!(t.status, ToolStatus::Running);
+        assert!(t.result.is_none(), "no result yet while in flight");
+    }
+
+    #[test]
+    fn tool_result_attaches_to_the_running_row_and_auto_collapses_on_ok() {
+        // A successful result flips the SAME row to Ok (not a new line) and
+        // auto-collapses it; a row height stays stable pending→done.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Write".into(),
+                detail: "README.md".into(),
+            },
+        });
+        let before = a.history.len();
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolResult {
+                ok: true,
+                summary: "wrote 12 lines".into(),
+            },
+        });
+        assert_eq!(a.history.len(), before, "result updates in place, no new row");
+        let MessageBody::Tool(t) = &a.history.back().unwrap().kind else {
+            panic!("still a Tool row");
+        };
+        assert_eq!(t.status, ToolStatus::Ok);
+        assert_eq!(t.result.as_deref(), Some("wrote 12 lines"));
+        assert!(t.collapsed, "a finished OK call auto-collapses");
+    }
+
+    #[test]
+    fn failed_tool_result_stays_expanded() {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Bash".into(),
+                detail: "cargo build".into(),
+            },
+        });
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolResult {
+                ok: false,
+                summary: "error[E0308]".into(),
+            },
+        });
+        let MessageBody::Tool(t) = &a.history.back().unwrap().kind else {
+            panic!("Tool row");
+        };
+        assert_eq!(t.status, ToolStatus::Fail);
+        assert!(!t.collapsed, "a failed call must never hide its error");
+    }
+
+    #[test]
+    fn read_only_grep_folds_a_metric_not_the_raw_dump() {
+        // A merged read/grep batch keeps its `inspected N` headline and folds
+        // the grep result into a `(N matches)` metric — never the raw output.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Grep".into(),
+                detail: "TODO".into(),
+            },
+        });
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolResult {
+                ok: true,
+                summary: "3 files\nsrc/a.rs\nsrc/b.rs\nsrc/c.rs".into(),
+            },
+        });
+        let MessageBody::Tool(t) = &a.history.back().unwrap().kind else {
+            panic!("Tool row");
+        };
+        assert!(t.merged, "a grep is a low-signal mergeable tool");
+        // The metric folds in; the raw file list is NOT dumped into the result.
+        let result = t.result.as_deref().unwrap_or("");
+        assert!(result.contains('3'), "folds the count metric: {result}");
+        assert!(
+            !result.contains("src/a.rs"),
+            "must not dump the raw output: {result}"
+        );
+    }
+
+    #[test]
+    fn contiguous_low_signal_reads_merge_with_increasing_count() {
+        // Five reads in a row collapse to one row with count 5 — and the count
+        // is greatest-seen, so it can never visibly jump backwards.
+        let mut a = fresh_app(Some("offline"));
+        for i in 0..5 {
+            a.apply_engine(EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::ToolUse {
+                    name: "Read".into(),
+                    detail: format!("file{i}"),
+                },
+            });
+        }
+        let host_rows: Vec<_> = a
+            .history
+            .iter()
+            .filter(|m| m.role == ChatRole::Host)
+            .collect();
+        assert_eq!(host_rows.len(), 1, "five reads merge into one row");
+        let MessageBody::Tool(t) = &host_rows[0].kind else {
+            panic!("Tool row");
+        };
+        assert_eq!(t.count, 5);
+        assert!(t.merged);
+    }
+
+    #[test]
+    fn a_write_breaks_the_read_batch_so_the_next_read_starts_fresh() {
+        let mut a = fresh_app(Some("offline"));
+        for ev in [
+            ("Read", "a"),
+            ("Read", "b"),
+            ("Write", "out.txt"),
+            ("Read", "c"),
+        ] {
+            a.apply_engine(EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::ToolUse {
+                    name: ev.0.into(),
+                    detail: ev.1.into(),
+                },
+            });
+        }
+        let host_rows: Vec<_> = a
+            .history
+            .iter()
+            .filter(|m| m.role == ChatRole::Host)
+            .collect();
+        // batch(a,b) · write · batch(c) → 3 rows.
+        assert_eq!(host_rows.len(), 3, "a write splits the read batch");
+    }
+
+    // ---- P6: long-output folding -----------------------------------------
+
+    #[test]
+    fn a_long_host_reply_is_collapsible_and_ctrl_r_toggles_it() {
+        let mut a = fresh_app(Some("offline"));
+        // A 50-line Host reply — well past the fold threshold.
+        let wall: String = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        a.push(ChatRole::Host, wall);
+        let idx = a.history.len() - 1;
+        assert!(
+            message_is_collapsible(&a.history[idx]),
+            "a 50-line wall is foldable"
+        );
+        assert!(!a.history[idx].collapsed, "starts expanded");
+        // Ctrl+R folds the most recent collapsible row.
+        let _ = a.apply_key_with_mods(
+            KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert!(a.history[idx].collapsed, "Ctrl+R collapsed the wall");
+        // Ctrl+R again expands it.
+        let _ = a.apply_key_with_mods(
+            KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert!(!a.history[idx].collapsed, "Ctrl+R re-expanded the wall");
+    }
+
+    #[test]
+    fn a_short_reply_is_not_collapsible() {
+        let mut a = fresh_app(Some("offline"));
+        a.push(ChatRole::Host, "just one short line");
+        let last = a.history.back().unwrap();
+        assert!(
+            !message_is_collapsible(last),
+            "a short reply is never folded"
+        );
+    }
+
+    #[test]
+    fn ctrl_r_is_a_noop_when_nothing_is_foldable() {
+        let mut a = fresh_app(Some("offline"));
+        a.push(ChatRole::Host, "short");
+        let before = a.clone();
+        let _ = a.apply_key_with_mods(
+            KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        // No foldable row → history unchanged (fail-open).
+        assert_eq!(a.history.len(), before.history.len());
+        assert!(!a.history.back().unwrap().collapsed);
+    }
+
+    // ---- backward-compat: plain Text rows ---------------------------------
+
+    #[test]
+    fn plain_push_stays_a_text_body_and_body_reads_through() {
+        // Every existing `push(role, String)` call still produces a Text body
+        // and `body()` reads it back verbatim — the upgrade is invisible to the
+        // dozens of plain-message call sites.
+        let mut a = fresh_app(Some("offline"));
+        a.push(ChatRole::System, "hello world");
+        let last = a.history.back().unwrap();
+        assert!(matches!(last.kind, MessageBody::Text(_)));
+        assert_eq!(last.body(), "hello world");
+        assert!(!last.collapsed);
     }
 
     #[test]
@@ -10359,9 +10946,9 @@ mod tests {
         let last = a.history.back().unwrap();
         assert_eq!(last.role, ChatRole::System);
         assert!(
-            last.body.contains("thinking"),
+            last.body().contains("thinking"),
             "should show thinking indicator: {}",
-            last.body
+            last.body()
         );
     }
 
@@ -10375,8 +10962,8 @@ mod tests {
             },
         });
         let last = a.history.back().unwrap();
-        assert!(last.body.contains("[ok]"), "success should show checkmark");
-        assert!(last.body.contains("4.6.0"));
+        assert!(last.body().contains("[ok]"), "success should show checkmark");
+        assert!(last.body().contains("4.6.0"));
     }
 
     #[test]
@@ -10389,7 +10976,7 @@ mod tests {
             },
         });
         let last = a.history.back().unwrap();
-        assert!(last.body.contains("[fail]"), "error should show cross");
+        assert!(last.body().contains("[fail]"), "error should show cross");
     }
 
     #[test]
@@ -10417,7 +11004,7 @@ mod tests {
             },
         });
         let last = a.history.back().unwrap();
-        assert!(last.body.contains("rate limited"));
+        assert!(last.body().contains("rate limited"));
     }
 
     #[test]
@@ -10533,7 +11120,7 @@ mod tests {
         assert!(a
             .history
             .iter()
-            .any(|m| m.body.contains("nonsense") || m.body.contains("未知")));
+            .any(|m| m.body().contains("nonsense") || m.body().contains("未知")));
     }
 
     #[test]
@@ -10589,7 +11176,7 @@ mod tests {
             umadev_agent::trust::SUGGEST_THRESHOLD
         );
         assert!(
-            a.history.iter().any(|m| m.body.contains("[trust]")),
+            a.history.iter().any(|m| m.body().contains("[trust]")),
             "a trust suggestion should have fired once at the threshold"
         );
     }
@@ -10705,7 +11292,7 @@ mod tests {
         let _ = a.submit_text("second".to_string());
         // Echoed: the user's "second" message is in the transcript.
         assert!(
-            a.history.iter().any(|m| m.body == "second"),
+            a.history.iter().any(|m| m.body() == "second"),
             "the queued user message is still echoed to the transcript"
         );
         // NOT YET recorded in conversation memory: a queued turn is recorded only
@@ -10721,7 +11308,7 @@ mod tests {
         assert!(a.history.len() >= hist_before + 2);
         let note = umadev_i18n::t(a.lang, "chat.queued");
         assert!(
-            a.history.iter().any(|m| m.body == note),
+            a.history.iter().any(|m| m.body() == note),
             "the queue note uses chat.queued, not the gate-flavoured run.queued"
         );
         assert_eq!(a.queued_chat.len(), 1);

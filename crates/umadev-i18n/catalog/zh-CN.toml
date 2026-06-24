@@ -522,6 +522,12 @@
 # 滚动指示器(数字为占位、箭头为符号)
 "tui.scroll.both" = "↑ {} · ↓ {} 更多 —— End 回到底部"
 "tui.scroll.above" = "↑ 上方还有 {} 行"
+# 工具调用行:连续只读工具合并后的标题 + grep 命中计数
+"tui.tool.batch" = "读取 {} 个文件"
+"tui.tool.matches" = "{} 处匹配"
+# 长输出折叠:折叠摘要行 + 每条消息的展开提示
+"tui.fold.collapsed" = "… 还有 {} 行 · {} 展开"
+"tui.fold.expand_hint" = "Ctrl+R 展开"
 # 输入框下方提示行
 "tui.hint.palette" = "↑↓ 选择 · Tab 补全 · Enter 执行"
 "tui.hint.gate_tag" = "[gate] 闸门 `{}`"
@@ -601,6 +607,7 @@
 "tui.help.edit.recall" = "调取输入历史"
 "tui.help.edit.autocomplete" = "从斜杠面板补全"
 "tui.help.edit.compact" = "压缩并折叠对话以释放上下文"
+"tui.help.edit.expand" = "展开 / 折叠最近的长回复或工具输出"
 "tui.help.edit.clear" = "清空对话历史(配置保留)"
 "tui.help.edit.help" = "本浮层"
 "tui.help.edit.quit" = "退出"

@@ -522,6 +522,12 @@
 # Transcript scroll indicators (counts are placeholders; arrows are symbols)
 "tui.scroll.both" = "↑ {} · ↓ {} more — End to bottom"
 "tui.scroll.above" = "↑ {} lines above"
+# Tool-call rows: merged read/grep batch headline + grep metric
+"tui.tool.batch" = "inspected {} files"
+"tui.tool.matches" = "{} matches"
+# Long-output folding: collapsed-summary line + the per-message expand hint
+"tui.fold.collapsed" = "… {} more lines · {} to expand"
+"tui.fold.expand_hint" = "Ctrl+R expand"
 # Prompt meta-row hints
 "tui.hint.palette" = "↑↓ choose · Tab autocomplete · Enter run"
 "tui.hint.gate_tag" = "[gate] gate `{}`"
@@ -601,6 +607,7 @@
 "tui.help.edit.recall" = "recall input history"
 "tui.help.edit.autocomplete" = "autocomplete from slash palette"
 "tui.help.edit.compact" = "summarize-and-fold the chat to free up context"
+"tui.help.edit.expand" = "expand / collapse the latest long reply or tool output"
 "tui.help.edit.clear" = "clear chat history (config stays)"
 "tui.help.edit.help" = "this overlay"
 "tui.help.edit.quit" = "exit"
