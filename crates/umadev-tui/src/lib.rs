@@ -997,6 +997,227 @@ fn route_floor_options(project_root: &std::path::Path, requirement: &str) -> Run
     }
 }
 
+/// Reactive-build context for the light chat path — lets [`drive_agentic_stream`]
+/// turn a chat turn into a build the MOMENT the base writes its first real file,
+/// without any up-front classification. `None` disables the whole reaction (the
+/// explicit `/run` director path, the queued-drain, and every unit test pass
+/// `None`, so their behaviour is byte-for-byte unchanged).
+///
+/// **Why react instead of pre-classify:** the base has tools and is the brain — it
+/// judges chat-vs-build by ACTING (a reply is chat; a file write is a build). So
+/// the chat surface opens the session ONCE (fast, no cold triage subprocess) and
+/// watches: the first `Write`/`Edit`-family tool call (see
+/// [`is_workspace_write_tool`]) flips the turn into a build — grab the
+/// single-writer run-lock (if not already held), isolate onto `umadev/<slug>`
+/// (`setup_run_isolation`: a `switch -c` carries the just-written change onto the
+/// branch and leaves the user's branch alone — best-effort; a tree already dirty
+/// from the write fails open to running in place), and surface the `Build` intent
+/// card + the trust note. A pure-reply turn never trips it and stays a fast chat.
+///
+/// **Fail-open throughout:** a lock that can't be taken / an isolation that skips
+/// just leaves the turn running in place (it never aborts a turn the way the
+/// up-front `/run` lock does — a chat-build that loses the race to a concurrent
+/// run is still better completed than killed). Idempotent: it fires its reaction
+/// exactly once (`reacted` latches), so a 200-file build isolates one time.
+struct ReactiveBuild {
+    /// Whether a real **host CLI** drives this turn — only a host build mutates a
+    /// workspace the lock/isolation protect (an offline turn writes nothing real).
+    /// The whole reaction no-ops when this is false (mirrors the `director_build &&
+    /// host_cli` gate the up-front `/run` lock uses).
+    host_cli: bool,
+    /// Latched the first time a write tool is seen, so the lock + isolation + intent
+    /// card fire exactly once for the rest of the (possibly hundreds-of-write) turn.
+    reacted: std::sync::atomic::AtomicBool,
+    /// Set true once a write was observed — read after the stream to carry
+    /// `director_build: true` on the terminal `AgenticDone` (drives the Wave-5
+    /// session hand-back + the objective source-present hard-gate, exactly as a
+    /// pre-classified build would).
+    became_build: std::sync::atomic::AtomicBool,
+    /// Holds the run-lock guard for the rest of the turn once the reaction grabs it
+    /// (dropped when the `Arc` is dropped at the end of [`drive_agentic_stream`]).
+    /// `Mutex` for interior mutability from the shared `Fn` stream closure.
+    lock: std::sync::Mutex<Option<umadev_agent::run_lock::RunLock>>,
+}
+
+impl ReactiveBuild {
+    /// A fresh, un-triggered reactive context for a host-or-not chat turn.
+    fn new(host_cli: bool) -> Self {
+        Self {
+            host_cli,
+            reacted: std::sync::atomic::AtomicBool::new(false),
+            became_build: std::sync::atomic::AtomicBool::new(false),
+            lock: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+/// The **proportional default route** the chat surface drives the light path with
+/// — used because the chat dispatcher NO LONGER pre-classifies each message with a
+/// slow one-shot brain consult (that cold `claude --print` was the ~30s
+/// first-reply latency this whole change removes). Instead, every chat turn opens
+/// the persistent session ONCE on the light path with this fixed "可干活" route,
+/// and the base — which has tools — decides for itself whether to chat (reply with
+/// text) or to build (write files); UmaDev reacts to that behaviour (see
+/// [`drive_agentic_stream`]'s reactive write detection).
+///
+/// A `QuickEdit` / `Fast` route is the deliberately-proportional firmware tier in
+/// [`umadev_agent::compose_firmware`]: it injects the identity, the compact craft
+/// law, and the repo-map slice of the user's code, but NOT the heavy full-build
+/// layers (JIT knowledge + pitfall memory). So day-to-day chat carries enough
+/// firmware to actually do small work without paying the full-build prompt cost on
+/// every message. It is NOT shown as the intent card — the card is derived from the
+/// base's behaviour (text reply = chat, a write = build), see [`run_routed_turn`].
+///
+/// Deterministic + allocation-light; fail-open by construction (it always builds).
+#[must_use]
+fn light_default_route() -> RoutePlan {
+    use umadev_agent::{Budget, Depth, RouteClass, TaskKind};
+    RoutePlan {
+        class: RouteClass::QuickEdit,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        // No pre-sized team: the base runs its OWN internal PM → design → code → QA
+        // for a chat-build; the full schedulable team lives on the explicit `/run`
+        // director loop. An empty team keeps the identity layer compact.
+        team: Vec::new(),
+        scope: Vec::new(),
+        needs_clarify: None,
+        est_budget: Budget::for_route(RouteClass::QuickEdit, Depth::Fast),
+        confidence: 0.5,
+    }
+}
+
+/// The intent card shown for a chat turn the MOMENT it is dispatched — before the
+/// base has done anything, so the only honest signal is "this is conversation".
+/// Derived from behaviour, not a pre-classification: a turn that turns out to
+/// write files is re-surfaced as a build by the reactive detector in
+/// [`drive_agentic_stream`] (which emits a fresh `Build` intent card then). This
+/// keeps the firmware default ([`light_default_route`]) decoupled from what the
+/// user SEES (a `QuickEdit` firmware tier should not read as "small change" on the
+/// card when the turn is, so far, just a reply).
+#[must_use]
+fn chat_intent_route() -> RoutePlan {
+    use umadev_agent::{Budget, Depth, RouteClass, TaskKind};
+    RoutePlan {
+        class: RouteClass::Chat,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        team: Vec::new(),
+        scope: Vec::new(),
+        needs_clarify: None,
+        est_budget: Budget::for_route(RouteClass::Chat, Depth::Fast),
+        confidence: 0.5,
+    }
+}
+
+/// The `Build` intent card surfaced REACTIVELY the first time the base writes a
+/// real file on the light chat path — the behaviour-derived "构建中" signal. A
+/// `Fast` build (the chat surface never auto-schedules the heavy team — that is
+/// `/run`), so the card reads "full build, fast" with no pre-committed roster.
+#[must_use]
+fn reactive_build_route() -> RoutePlan {
+    use umadev_agent::{Budget, Depth, RouteClass, TaskKind};
+    RoutePlan {
+        class: RouteClass::Build,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        team: Vec::new(),
+        scope: Vec::new(),
+        needs_clarify: None,
+        est_budget: Budget::for_route(RouteClass::Build, Depth::Fast),
+        confidence: 0.6,
+    }
+}
+
+/// `true` iff a base tool-call NAME mutates the workspace (creates / edits a
+/// file) — the signal that turns a chat turn into a build on the light path.
+///
+/// All three bases normalise their write tools to these names in their stream
+/// parsers (`umadev_host::claude` / `codex` / `opencode` emit `Write` for a new
+/// file, `Edit` for an in-place change; a multi-edit / notebook-edit variant maps
+/// onto the same family). A `Read` / `Grep` / `Bash` / `Glob` call is NOT a
+/// workspace write (a `Bash` may technically write, but the deterministic
+/// post-turn git fact-check is the floor for that — we only react to an EXPLICIT
+/// file-write tool so a pure read/inspect/answer turn stays light). Case-folded so
+/// a base that lower-cases tool names still matches. Pure + cheap.
+#[must_use]
+fn is_workspace_write_tool(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "write" | "edit" | "multiedit" | "notebookedit" | "create" | "apply_patch" | "applypatch"
+    )
+}
+
+/// React to the FIRST workspace write on the light chat path: flip the turn into a
+/// build. Called from the stream closure the instant a `Write`/`Edit`-family tool
+/// call is seen. Fires its side-effects exactly ONCE (the `reacted` latch), so a
+/// build that writes 200 files isolates one time. **Returns immediately + no-ops**
+/// when reactive build is disabled (`None`), when the brain is not a host CLI
+/// (nothing real to lock/isolate), or when it has already reacted this turn.
+///
+/// On the first real write it, in order and all **fail-open**:
+/// 1. marks `became_build` (so the terminal `AgenticDone` carries
+///    `director_build: true` → Wave-5 hand-back + the source hard-gate);
+/// 2. surfaces the `Build` intent card (the behaviour-derived "构建中" signal) and
+///    a one-line note that the turn is now a build (`chat.build_detected`);
+/// 3. takes the single-writer run-lock (a chat-build serializes with other
+///    workspace-mutating runs); a lock that can't be taken is swallowed (NOT the
+///    `/run` hard-abort: a chat-build losing the race to another run is better
+///    finished than killed — fail-open), the guard parks in `reactive.lock`;
+/// 4. isolates onto `umadev/<slug>` + run-baseline (`setup_run_isolation`), emitting
+///    the trust note ONLY when a fresh isolation branch was actually created.
+///
+/// Idempotent + fail-open by contract: any failure leaves the turn running in
+/// place, exactly the pre-change behaviour for a chat-build.
+fn react_to_first_write(
+    reactive: Option<&ReactiveBuild>,
+    project_root: &std::path::Path,
+    sink: &Arc<ChannelSink>,
+) {
+    use std::sync::atomic::Ordering;
+    let Some(reactive) = reactive else { return };
+    // Only a real HOST build mutates a workspace the lock/isolation protect.
+    if !reactive.host_cli {
+        return;
+    }
+    // One-shot: `swap` returns the PREVIOUS value — if it was already `true`, a
+    // prior write already reacted, so bail (no second lock / isolation / card).
+    if reactive.reacted.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // (1) This turn is now a build — the terminal decision will carry it back.
+    reactive.became_build.store(true, Ordering::SeqCst);
+    // (2) Behaviour-derived intent card ("构建中") + the one-line build note.
+    sink.emit(EngineEvent::intent_decided(&reactive_build_route()));
+    sink.emit(EngineEvent::Note(
+        umadev_i18n::tl("chat.build_detected").to_string(),
+    ));
+    // (3) Single-writer run-lock for the rest of the turn — fail-open: a lock held
+    // by a DIFFERENT live run is swallowed (the chat-build proceeds in place rather
+    // than hard-aborting); any other IO fails open inside `acquire_for_run` to an
+    // un-owned guard. The guard parks in `reactive.lock` for the turn's lifetime.
+    if let Ok(guard) = umadev_agent::run_lock::RunLock::acquire_for_run(project_root) {
+        if let Ok(mut slot) = reactive.lock.lock() {
+            *slot = Some(guard);
+        }
+    }
+    // (4) Branch isolation: `switch -c umadev/<slug>` carries the just-written change
+    // onto the isolation branch and leaves the user's branch untouched (fail-open: a
+    // non-git dir / a tree already dirty from the write / any error skips silently
+    // and the turn runs in place). Emit the trust note only on a fresh isolation.
+    let slug = project_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("project");
+    if let Some((branch, from)) = umadev_agent::setup_run_isolation(project_root, slug) {
+        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "trust.branch_isolated",
+            &[&branch, &from],
+        )));
+    }
+}
+
 /// The light agentic turn body — the non-spawning core of [`spawn_agentic`].
 ///
 /// Split out so the brain-routed chat dispatcher ([`run_routed_turn`]) can drive a
@@ -1099,6 +1320,15 @@ async fn run_agentic(
                 return;
             }
         };
+        // Reactive build for the light chat path: a chat turn that was NOT
+        // dispatched as a build can still BECOME one if the base writes a file —
+        // enable the reactive detector so the first write grabs the lock + isolates
+        // + shows the `Build` intent card (see [`ReactiveBuild`] /
+        // [`react_to_first_write`]). Disabled when the turn was ALREADY dispatched
+        // as a build (`director_build` true) — that path grabbed the lock + isolated
+        // up-front above, so a second reaction would be redundant. The context
+        // internally no-ops for a non-host brain, so passing it is always safe.
+        let reactive = (!director_build).then(|| Arc::new(ReactiveBuild::new(host_cli)));
         drive_agentic_stream(
             brain.as_ref(),
             &task,
@@ -1110,6 +1340,7 @@ async fn run_agentic(
             &conversation,
             &sink,
             &route_tx,
+            reactive.as_ref(),
         )
         .await;
     }
@@ -1479,6 +1710,13 @@ async fn drive_agentic_stream(
     conversation: &[Message],
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    // Reactive build context for the LIGHT CHAT path (see [`ReactiveBuild`]): the
+    // first `Write`/`Edit`-family tool call flips this chat turn into a build
+    // (run-lock + isolation + a `Build` intent card), without any up-front
+    // classification. `None` disables the reaction entirely — the explicit `/run`
+    // path, the queued-drain, and every unit test pass `None`, so they are
+    // byte-for-byte unchanged.
+    reactive: Option<&Arc<ReactiveBuild>>,
 ) {
     // (1) Reality injection — snapshot the live git state BEFORE the turn so the
     // base is anchored to the real tree, and keep `before` for the post-turn
@@ -1548,9 +1786,24 @@ async fn drive_agentic_stream(
     let truncated = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stream_sink = Arc::clone(sink);
     let truncated_flag = Arc::clone(&truncated);
+    // Reactive-build captures for the stream closure (cloned `Arc`s so the closure
+    // is `'static + Send + Sync`, as `complete_streaming` requires). `None` when
+    // reactive build is disabled (non-chat path) — the write check then no-ops.
+    let reactive_ctx = reactive.cloned();
+    let reactive_root = project_root.to_path_buf();
+    let reactive_sink = Arc::clone(sink);
     let on_event = move |ev: umadev_runtime::StreamEvent| {
         if matches!(ev, umadev_runtime::StreamEvent::Warning { .. }) {
             truncated_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // Reactive build: the FIRST `Write`/`Edit`-family tool call flips this chat
+        // turn into a build (lock + isolate + a `Build` intent card). `react_to_
+        // first_write` is one-shot + fail-open, so this is cheap on every later
+        // write and a no-op when reactive build is disabled / already triggered.
+        if let umadev_runtime::StreamEvent::ToolUse { name, .. } = &ev {
+            if is_workspace_write_tool(name) {
+                react_to_first_write(reactive_ctx.as_deref(), &reactive_root, &reactive_sink);
+            }
         }
         stream_sink.emit(EngineEvent::WorkerStream { event: ev });
     };
@@ -1586,6 +1839,15 @@ async fn drive_agentic_stream(
                      / turn may be incomplete or not fully written — verify the working tree",
                 );
             }
+            // The effective build-ness of this turn: a turn dispatched AS a build
+            // (`director_build`), OR a light chat turn the reactive detector turned
+            // into one when the base wrote its first file (`became_build`). Drives
+            // the source hard-gate below AND the terminal `AgenticDone` (so the
+            // Wave-5 session hand-back fires for a chat-promoted build too). Fail-open:
+            // no reactive context → just the original `director_build`.
+            let effective_build = director_build
+                || reactive
+                    .is_some_and(|r| r.became_build.load(std::sync::atomic::Ordering::SeqCst));
             // (4) Director-build hard-gate — the deterministic reality floor for
             // an explicit `/run` (Wave 1). The director was told to BUILD a full
             // product; after it reports done we OBJECTIVELY check whether real
@@ -1596,8 +1858,8 @@ async fn drive_agentic_stream(
             // bar shows a real aborted state, like the pipeline's no-source hard
             // stop). This verifies RESULT, it does not dictate the route: a
             // director that legitimately only answered a question (claimed no build)
-            // is left alone. Fail-open: skipped entirely for a non-director turn.
-            if director_build {
+            // is left alone. Fail-open: skipped entirely for a non-build turn.
+            if effective_build {
                 if let Some(note) = director_source_hardgate(project_root, &reply) {
                     sink.emit(EngineEvent::Note(note));
                 }
@@ -1622,11 +1884,12 @@ async fn drive_agentic_stream(
             // event loop ONLY to record it as the assistant turn. An empty body
             // (the base emitted only tool calls / a side-effect) is still a clean
             // finish — send AgenticDone with what we have so `thinking` clears
-            // uniformly. Carry the turn's `director_build` so the event loop can
-            // drive the Wave-5 hand-back without a pre-spawn flag.
+            // uniformly. Carry the turn's EFFECTIVE build-ness (dispatched as a build
+            // OR reactively promoted into one) so the event loop drives the Wave-5
+            // hand-back without a pre-spawn flag.
             let _ = route_tx.send(RouteDecision::AgenticDone {
                 reply,
-                director_build,
+                director_build: effective_build,
             });
         }
         Err(e) => {
@@ -1716,24 +1979,24 @@ fn fire_agentic(
     handle
 }
 
-/// Everything the brain-routed chat dispatcher ([`run_routed_turn`]) needs, all
-/// snapshotted from `&mut App` on the UI thread BEFORE the task spawns — so the
-/// task never touches app state (it runs concurrently with the event loop).
+/// Everything the chat dispatcher ([`run_routed_turn`]) needs, all snapshotted from
+/// `&mut App` on the UI thread BEFORE the task spawns — so the task never touches
+/// app state (it runs concurrently with the event loop).
+///
+/// The chat turn drives the LIGHT path only (the reactive detector promotes it to a
+/// build if the base writes a file), so this carries no `RunOptions` / autonomy
+/// flag — those belong to the EXPLICIT `/run` director loop, a separate path.
 struct RoutedTurnInputs {
     /// The user's free-text turn (already recorded into conversation memory).
     text: String,
     /// Which base drives the turn (always a `HostCli` when `host_cli` is true).
     spec: BrainSpec,
-    /// `true` when a real base CLI is configured — REQUIRED to drive a director
-    /// build (it opens a live session). A non-host brain can only stream → the
-    /// light path, even for a Build-class verdict.
+    /// `true` when a real base CLI is configured. Gates the reactive build
+    /// (run-lock + isolation only mean something for a real host that mutates the
+    /// workspace); a non-host brain streams the light path and never isolates.
     host_cli: bool,
-    /// Run options for the director-build path (requirement + slug + mode etc.).
-    options: RunOptions,
-    /// Trust-tier autonomy flag for the director session.
-    autonomous: bool,
     /// UmaDev's OWN bounded conversation transcript (Wave 5 / G11) — threaded into
-    /// BOTH the director directive and the light request so memory is not cold.
+    /// the light request so memory is not cold.
     conversation: Vec<Message>,
     /// Resume the same chat session (light path) — `host_chat_session_active`
     /// OR a just-handed-back director session.
@@ -1746,35 +2009,43 @@ struct RoutedTurnInputs {
     project_root: PathBuf,
 }
 
-/// Dispatch ONE free-text chat turn by asking the **borrowed brain** to classify it
-/// — the brain-router (`route_via_brain`), NOT a keyword table. UmaDev borrows the
-/// base's brain to think; "is this a greeting / a small edit / a real build?" is a
-/// judgment the base's own model makes far better than any hardcoded keyword list,
-/// so there is **no deterministic keyword classifier** on this path (an unreachable
-/// brain degrades to [`RouteClass::Chat`], the lightest pass-through — see
-/// `route_via_brain`).
+/// Dispatch ONE free-text chat turn by driving the persistent session **once** on
+/// the light streaming path — NO up-front classification, NO separate triage
+/// subprocess. This is the fix for the ~30s first-reply latency: the old path ran
+/// a one-shot `route_via_brain` consult (a COLD `claude --print` ≈ several seconds)
+/// to classify the turn, THEN cold-started a SECOND base process to actually answer
+/// — two cold starts per message. The borrowed brain already HAS tools and IS the
+/// judge of chat-vs-build; making it classify in a separate stateless call before
+/// it is even allowed to answer was redundant latency that broke the "one
+/// continuous session" contract (a chat turn should `--continue` the same dialogue,
+/// not spin up a throwaway).
 ///
-/// **Why this runs in a spawned task and classifies INSIDE it:** `route_via_brain`
-/// is a one-shot base consult (`claude --print` ≈ 1-3s). The event loop's
-/// `Action::Route` arm runs inline on the UI thread, so awaiting the consult there
-/// would FREEZE the terminal (no redraw, no input) for those seconds. The dispatcher
-/// therefore returns to the UI thread immediately (the arm only sets `thinking` +
-/// the aliveness clock); the classification + drive happen here, off the render path.
+/// **The base decides chat-vs-build by ACTING, and UmaDev reacts:** the turn opens
+/// the chat session once (fast, `--continue`), streams the base's own agentic loop,
+/// and watches the tool calls. A pure-reply turn stays a fast, light chat; the
+/// FIRST `Write`/`Edit`-family tool call flips the turn into a build via the
+/// reactive detector in [`drive_agentic_stream`] (run-lock + branch isolation + a
+/// `Build` intent card), with NO pre-commitment. So:
+/// - the intent card shown at dispatch is the behaviour-derived "对话" (Chat) card —
+///   honest at t=0, when the only signal is "the user typed a message";
+/// - the firmware is sized by a fixed proportional default ([`light_default_route`]
+///   — identity + craft + repo-map, but not the heavy full-build layers), since the
+///   turn is no longer pre-classified;
+/// - a turn that turns out to build re-surfaces a "构建中" card the moment the first
+///   file is written (see [`react_to_first_write`]).
 ///
-/// Then it drives one of the SAME two paths the rest of the TUI uses, never a third
-/// copy:
-/// - **`Build` + host CLI** → [`run_director_loop`] (run-lock + branch isolation +
-///   firmware + the routed plan / step-schedule / finalize loop + source hard-gate);
-///   the loop emits the ONE intent card, so we do NOT emit it here. Its terminal
-///   `AgenticDone` carries `director_build: true` → the Wave-5 session hand-back.
-/// - **everything else** (chat / explain / quick-edit / debug, or a build with no
-///   host CLI) → emit the intent card here, then [`run_agentic`] streams the turn on
-///   the light path. Its terminal `AgenticDone` carries the routed `director_build`.
+/// The full plan / team-schedule / finalize delivery flow is the EXPLICIT `/run`
+/// director loop (unchanged) — a chat-build runs the base's OWN internal
+/// PM→design→code→QA, and the user opts into the heavy flow with `/run`.
 ///
-/// **Fail-open throughout:** the classify brain failing to build degrades to a Chat
-/// route (light path); a session that can't open is the existing `ABORT_SENTINEL` +
-/// terminal `Failed` inside `run_director_loop`; a streaming error is a terminal
-/// `Failed` inside `run_agentic`. The shell never wedges.
+/// **Why a spawned task:** the event loop's `Action::Route` arm runs inline on the
+/// UI thread, so any `.await` there would freeze the terminal. The arm sets the
+/// immediate UI state + snapshots app inputs, then spawns this; dispatch returns
+/// instantly and the UI keeps redrawing the "thinking…" state from `engine_rx`.
+///
+/// **Fail-open throughout:** the session failing to open / a streaming error is a
+/// terminal `Failed` inside [`run_agentic`]; a reactive isolation that can't run
+/// leaves the turn in place. The shell never wedges.
 async fn run_routed_turn(
     inputs: RoutedTurnInputs,
     sink: Arc<ChannelSink>,
@@ -1784,8 +2055,6 @@ async fn run_routed_turn(
         text,
         spec,
         host_cli,
-        mut options,
-        autonomous,
         conversation,
         continue_session,
         session_id,
@@ -1793,67 +2062,34 @@ async fn run_routed_turn(
         project_root,
     } = inputs;
 
-    // Build a STATELESS classification brain (no `--continue`, no pinned session id):
-    // the triage consult must not resume or pollute the chat session — it is a pure
-    // one-shot `complete()`. Fail-open: if the brain can't be built (an unknown
-    // backend should be impossible here, since `spec` came from the live app), classify
-    // against an offline runtime, which `route_via_brain` degrades to a Chat route.
-    let route = if let Ok(classify_brain) = build_brain(&spec, false, None, &project_root) {
-        umadev_agent::router::route_via_brain(&*classify_brain, &text).await
-    } else {
-        let offline = OfflineRuntime::new(RuntimeKind::Anthropic);
-        umadev_agent::router::route_via_brain(&offline, &text).await
-    };
-    // The brain is AUTHORITATIVE: a `Build` verdict IS the director-build path
-    // (consistent with the CLI `umadev run`, which shows a plan for every build); a
-    // chat / explain / quick-edit / debug verdict stays on the light streaming path.
-    let director_build = matches!(route.class, umadev_agent::RouteClass::Build);
+    // The behaviour-derived intent card at t=0: the only honest signal before the
+    // base acts is "this is conversation". A turn that goes on to write files
+    // re-surfaces a `Build` card from `react_to_first_write` the instant it does.
+    sink.emit(EngineEvent::intent_decided(&chat_intent_route()));
 
-    if director_build && host_cli {
-        // Director build: reuse the EXACT `/run` loop (run-lock + isolation + firmware
-        // + routed plan/step/finalize + source hard-gate). It emits the ONE intent
-        // card itself (we pass the honest route, NOT a re-forced `for_run`), threads
-        // the conversation in for Wave-5 memory, and sends a terminal `AgenticDone`
-        // carrying `director_build: true` so the event loop hands the session back.
-        options.requirement.clone_from(&text);
-        run_director_loop(
-            options,
-            sink,
-            route_tx,
-            autonomous,
+    // Drive the light streaming path ONCE — `director_build: false` (the base, not a
+    // pre-classifier, decides by acting), the proportional default firmware route
+    // ([`light_default_route`]: identity + craft + repo-map), and reactive build
+    // ENABLED (the first write flips this into a build). The terminal `AgenticDone`
+    // carries the EFFECTIVE build-ness (false for a pure chat; true if a write was
+    // seen), driving the Wave-5 session hand-back exactly as a classified build would.
+    run_agentic(
+        AgenticTurn {
+            task: text,
+            spec,
+            continue_session,
+            session_id,
+            fallback_model,
+            project_root,
+            director_build: false,
+            host_cli,
+            route: Some(light_default_route()),
             conversation,
-            Some(route),
-        )
-        .await;
-    } else {
-        // Light path: the director loop is NOT driving this turn, so we emit the ONE
-        // intent card here (through the sink → `apply_engine` in the event loop), then
-        // stream the turn. A non-host "would-be build" stays light but keeps its
-        // `director_build` so the source hard-gate still verifies reality. The terminal
-        // `AgenticDone` carries `director_build` for the hand-back decision.
-        sink.emit(EngineEvent::intent_decided(&route));
-        run_agentic(
-            AgenticTurn {
-                task: text,
-                spec,
-                continue_session,
-                session_id,
-                fallback_model,
-                project_root,
-                director_build,
-                host_cli,
-                // The light path injects firmware sized by the brain-router's route
-                // (HIGH #3 / MEDIUM #6) — chat = identity only, quick-edit = + craft,
-                // a non-host would-be build = full. Move the route in (the intent
-                // card above borrowed it).
-                route: Some(route),
-                conversation,
-            },
-            sink,
-            route_tx,
-        )
-        .await;
-    }
+        },
+        sink,
+        route_tx,
+    )
+    .await;
 }
 
 /// After a TERMINAL chat route outcome (`Chat` / `Failed`), fire the next turn
@@ -2593,23 +2829,25 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 ));
                             }
                             Action::Route(text) => {
-                                // Brain-routed chat dispatch: ask the BORROWED BRAIN to
-                                // classify the turn (`route_via_brain`), NOT a keyword
-                                // table — the base's own model judges greeting vs. small
-                                // edit vs. real build far better than any hardcoded list.
+                                // Chat dispatch: drive the persistent session ONCE on the
+                                // light path — NO up-front classification subprocess. The
+                                // base HAS tools and IS the brain; it decides chat-vs-build
+                                // by ACTING (a reply is chat; a file write is a build), and
+                                // UmaDev reacts (`react_to_first_write`). This is the fix
+                                // for the ~30s first reply: the old path cold-started a
+                                // throwaway `claude --print` to classify, THEN cold-started
+                                // a SECOND base to answer — two cold starts per message.
                                 //
-                                // CRITICAL: that consult is a one-shot base call (≈1-3s).
                                 // This arm runs INLINE on the UI thread (the `keys.next()`
-                                // branch of the `tokio::select!`), so awaiting the consult
-                                // HERE would freeze the terminal — no redraw, no input —
-                                // for those seconds. Instead we (a) set the immediate UI
-                                // state here, (b) snapshot every `&mut App` input the turn
-                                // needs (the spawned task can't touch app state — it runs
-                                // concurrently with this loop), and (c) spawn ONE task
-                                // (`run_routed_turn`) that classifies, emits the intent
-                                // card, and drives the director / light path off the render
-                                // path. Dispatch returns instantly; the UI keeps redrawing
-                                // the "thinking…" state from `engine_rx` events.
+                                // branch of the `tokio::select!`), so any `.await` HERE
+                                // would freeze the terminal — no redraw, no input. Instead
+                                // we (a) set the immediate UI state here, (b) snapshot every
+                                // `&mut App` input the turn needs (the spawned task can't
+                                // touch app state — it runs concurrently with this loop),
+                                // and (c) spawn ONE task (`run_routed_turn`) that emits the
+                                // chat intent card + streams the turn off the render path.
+                                // Dispatch returns instantly; the UI keeps redrawing the
+                                // "thinking…" state from `engine_rx` events.
                                 let host_cli =
                                     matches!(app.brain_spec(), BrainSpec::HostCli(_));
                                 // Immediate UI state (same bookkeeping the `/run` arm sets):
@@ -2621,11 +2859,12 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 app.last_output_at = None;
                                 app.tool_in_progress = false;
                                 app.agentic_in_flight = true;
-                                // The class is NOT known yet (the brain consult happens in
-                                // the task), so `director_run_in_flight` can't be set
-                                // truthfully here — it no longer drives the hand-back
-                                // anyway (that rides the terminal `AgenticDone`), so leave
-                                // it false. Record the goal for the status bar / a revise.
+                                // The turn is NOT pre-classified anymore (the base
+                                // decides chat-vs-build by acting — see
+                                // `run_routed_turn`), so `director_run_in_flight` stays
+                                // false; the hand-back rides the terminal `AgenticDone`'s
+                                // effective build-ness. Record the goal for the status
+                                // bar / a revise.
                                 app.director_run_in_flight = false;
                                 app.requirement.clone_from(&text);
                                 // ── Snapshot the session-continuity inputs on the UI
@@ -2646,15 +2885,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 // Conversation snapshot stays taken on the UI thread so
                                 // memory is never cold (Wave 5 / G11), passed into the task.
                                 let conversation = app.conversation_snapshot();
-                                let mut run_opts = current_run_options(app, &opts);
-                                run_opts.requirement.clone_from(&text);
-                                let autonomous = continuous_autonomous(run_opts.mode);
                                 let inputs = RoutedTurnInputs {
                                     text,
                                     spec: app.brain_spec(),
                                     host_cli,
-                                    options: run_opts,
-                                    autonomous,
                                     conversation,
                                     continue_session,
                                     session_id,
@@ -3091,6 +3325,7 @@ mod tests {
             &conversation,
             &sink,
             &route_tx,
+            None,
         )
         .await;
         let req = seen.lock().unwrap().take().expect("request captured");
@@ -3127,6 +3362,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
         match route_rx.try_recv() {
@@ -3295,6 +3531,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
 
@@ -3376,12 +3613,14 @@ mod tests {
 
     #[tokio::test]
     async fn director_build_is_decided_by_the_brain_class() {
-        // The chat surface now classifies via the BORROWED BRAIN
-        // (`route_via_brain`), NOT a keyword table. The `RouteSpy` plays the base's
-        // one-shot triage verdict; the dispatcher's rule is `director_build =
-        // class == Build`. A `build` verdict → director-build (the visible plan +
-        // run-lock path); a `chat` verdict → the light streaming path. This locks
-        // the brain-authoritative decision that replaces the old keyword `route_turn`.
+        // `route_via_brain` is RETAINED for the explicit `/run` router consult — it
+        // is no longer on the CHAT hot path (the chat surface drives the light path
+        // ONCE with no triage subprocess; the base decides chat-vs-build by acting,
+        // and `react_to_first_write` promotes a write into a build — see the
+        // `reactive_*` tests). This test still locks `route_via_brain`'s
+        // brain-authoritative verdict mapping where it IS used: a `build` verdict →
+        // a Build route; a `chat` verdict → a non-mutating Chat route. The `RouteSpy`
+        // plays the base's one-shot triage verdict.
         let build_spy = RouteSpy::with_class("build");
         let route = umadev_agent::router::route_via_brain(&build_spy, "做一个待办应用").await;
         assert!(
@@ -3450,6 +3689,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
 
@@ -3529,6 +3769,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
         let req = seen.lock().unwrap().take().expect("request captured");
@@ -3733,6 +3974,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
 
@@ -3775,6 +4017,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
 
@@ -3817,6 +4060,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
 
@@ -3857,6 +4101,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
 
@@ -3958,6 +4203,7 @@ mod tests {
             &[],
             &sink,
             &route_tx,
+            None,
         )
         .await;
 
@@ -4447,6 +4693,363 @@ mod tests {
         assert!(
             isolated_host,
             "a HOST director build isolates onto umadev/<slug> as before"
+        );
+    }
+
+    // ── Reactive-build (the ~30s-latency fix) ───────────────────────────────
+    //
+    // The chat surface drives the persistent session ONCE on the light path with
+    // NO up-front classification subprocess; the base decides chat-vs-build by
+    // ACTING, and `react_to_first_write` promotes the turn the instant the first
+    // `Write`/`Edit`-family tool call appears. These tests lock that behaviour.
+
+    /// A streaming spy that emits a caller-chosen tool call (so the reactive write
+    /// detector can be exercised) and OPTIONALLY runs a side effect AFTER emitting
+    /// it (e.g. writes a file — mirroring how a real base writes a file when its
+    /// `Write` tool executes, just AFTER announcing the `tool_use`). Not offline,
+    /// so it drives the host-CLI code paths. A fixed reply closes the turn.
+    struct WriteSpy {
+        tool_name: &'static str,
+        reply: &'static str,
+        /// Run after the tool event is emitted (the file write the tool performs).
+        effect: Box<dyn Fn() + Send + Sync>,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for WriteSpy {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            unreachable!("the chat light path must stream, never one-shot complete")
+        }
+        async fn complete_streaming(
+            &self,
+            _req: CompletionRequest,
+            on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            // Announce the tool call FIRST (clean tree → `setup_run_isolation` can
+            // switch onto a fresh branch), THEN perform the write so the change is
+            // carried onto the isolation branch — the real `switch -c` semantics.
+            on_event(umadev_runtime::StreamEvent::ToolUse {
+                name: self.tool_name.to_string(),
+                detail: "src/App.tsx".to_string(),
+            });
+            (self.effect)();
+            on_event(umadev_runtime::StreamEvent::Text {
+                delta: self.reply.to_string(),
+            });
+            Ok(umadev_runtime::CompletionResponse {
+                text: self.reply.to_string(),
+                id: "spy".to_string(),
+                model: "spy".to_string(),
+                usage: umadev_runtime::Usage::default(),
+            })
+        }
+    }
+
+    /// Read the current git branch of `root` (empty on failure).
+    fn git_branch(root: &std::path::Path) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Reactive build, the load-bearing case: a HOST chat turn whose base writes its
+    /// first real file is promoted to a build — it isolates onto `umadev/<slug>`
+    /// (carrying the just-written file) and the user's branch is left untouched,
+    /// AND the terminal decision carries `director_build: true` (so the Wave-5
+    /// hand-back + source hard-gate fire). The intent card + the build note surface.
+    #[tokio::test]
+    async fn reactive_first_write_isolates_and_keeps_branch_clean() {
+        // A committed repo on its default branch — the only state in which
+        // `setup_run_isolation` will create + switch to an isolation branch.
+        let tmp = init_git_repo();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        std::fs::write(tmp.path().join("seed.txt"), "seed").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        let start_branch = git_branch(tmp.path());
+
+        let (sink, mut rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let target = tmp.path().join("src");
+        let reactive = Arc::new(ReactiveBuild::new(true));
+        let spy = WriteSpy {
+            tool_name: "Write",
+            reply: "Created src/App.tsx",
+            effect: Box::new(move || {
+                std::fs::create_dir_all(&target).unwrap();
+                std::fs::write(target.join("App.tsx"), "export const A = 1;").unwrap();
+            }),
+        };
+        drive_agentic_stream(
+            &spy,
+            "做一个登录页",
+            "m",
+            "claude-code",
+            tmp.path(),
+            false, // dispatched as CHAT (not a pre-classified build)
+            &light_default_route(),
+            &[],
+            &sink,
+            &route_tx,
+            Some(&reactive),
+        )
+        .await;
+
+        // The turn became a build: the terminal decision carries it (→ hand-back).
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone { director_build, .. }) => assert!(
+                director_build,
+                "a chat turn that wrote a file is reactively a build"
+            ),
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+        // It isolated onto a fresh `umadev/<slug>` branch (carrying the write) and
+        // surfaced both the build note and the trust/isolation note.
+        let now_branch = git_branch(tmp.path());
+        assert_ne!(
+            now_branch, start_branch,
+            "the turn switched off the user branch"
+        );
+        assert!(
+            now_branch.starts_with("umadev/"),
+            "isolated onto umadev/<slug>, got `{now_branch}`"
+        );
+        // The user's original branch has NO new commit — UmaDev never auto-commits
+        // / merges; the work sits uncommitted on the isolation branch.
+        let mut saw_isolated = false;
+        let mut saw_build_note = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.contains("umadev/") {
+                    saw_isolated = true;
+                }
+                if n.contains("[build]") {
+                    saw_build_note = true;
+                }
+            }
+        }
+        assert!(saw_isolated, "the trust/isolation note was surfaced");
+        assert!(saw_build_note, "the reactive build note was surfaced");
+    }
+
+    /// A pure chat reply (the base only emits text, never a write) stays a fast,
+    /// light chat: NO run-lock, NO branch isolation, and the terminal decision
+    /// carries `director_build: false` (no Wave-5 hand-back, no source hard-gate).
+    #[tokio::test]
+    async fn pure_chat_reply_does_not_isolate_or_lock() {
+        let tmp = init_git_repo();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        std::fs::write(tmp.path().join("seed.txt"), "seed").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        let start_branch = git_branch(tmp.path());
+
+        let (sink, mut rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reactive = Arc::new(ReactiveBuild::new(true));
+        // A spy that only READS + replies (no write tool, no effect).
+        let spy = WriteSpy {
+            tool_name: "Read",
+            reply: "Here's how that works…",
+            effect: Box::new(|| ()),
+        };
+        drive_agentic_stream(
+            &spy,
+            "解释一下这段代码",
+            "m",
+            "claude-code",
+            tmp.path(),
+            false,
+            &light_default_route(),
+            &[],
+            &sink,
+            &route_tx,
+            Some(&reactive),
+        )
+        .await;
+
+        // Still a chat: the terminal decision did NOT promote it to a build.
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone { director_build, .. }) => {
+                assert!(!director_build, "a pure-reply turn stays a chat");
+            }
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+        // No isolation: still on the user's branch, no run-lock left on disk, and
+        // no `umadev/` isolation note emitted.
+        assert_eq!(
+            git_branch(tmp.path()),
+            start_branch,
+            "stayed on the user branch"
+        );
+        assert!(
+            !tmp.path().join(".umadev/run.lock").exists(),
+            "a pure chat turn takes no run-lock"
+        );
+        let mut saw_isolated = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.contains("umadev/") {
+                    saw_isolated = true;
+                }
+            }
+        }
+        assert!(!saw_isolated, "a pure chat turn never isolates");
+    }
+
+    /// The hot path is a SINGLE base call: the chat dispatcher no longer runs a
+    /// separate `route_via_brain` triage `complete()` before answering (the two
+    /// cold starts that caused the ~30s first reply). Driving the chat light path
+    /// must hit `complete_streaming` exactly once and `complete` (the one-shot
+    /// triage surface) ZERO times.
+    #[tokio::test]
+    async fn chat_first_reply_is_one_streaming_call_no_triage() {
+        let (sink, _rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let complete_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let streaming_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spy = StreamSpy {
+            complete_calls: Arc::clone(&complete_calls),
+            streaming_calls: Arc::clone(&streaming_calls),
+            fail: false,
+        };
+        let reactive = Arc::new(ReactiveBuild::new(true));
+        let tmp = tempfile::TempDir::new().unwrap();
+        drive_agentic_stream(
+            &spy,
+            "你好，能帮我做什么？",
+            "m",
+            "claude-code",
+            tmp.path(),
+            false,
+            &light_default_route(),
+            &[],
+            &sink,
+            &route_tx,
+            Some(&reactive),
+        )
+        .await;
+        assert_eq!(
+            complete_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "NO separate triage `complete()` on the chat hot path"
+        );
+        assert_eq!(
+            streaming_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly ONE base call drives the first reply"
+        );
+    }
+
+    /// `is_workspace_write_tool` recognises the write family across the three bases'
+    /// normalised tool names, and treats read/inspect/run tools as non-writes (so a
+    /// pure read/answer turn never trips the reactive build).
+    #[test]
+    fn write_tool_detection_covers_the_write_family_only() {
+        for w in [
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "write",
+            "edit",
+            "apply_patch",
+            "create",
+        ] {
+            assert!(is_workspace_write_tool(w), "`{w}` is a workspace write");
+        }
+        for r in ["Read", "Grep", "Glob", "Bash", "WebFetch", "Task", ""] {
+            assert!(
+                !is_workspace_write_tool(r),
+                "`{r}` is NOT a workspace write"
+            );
+        }
+    }
+
+    /// Reactive build is OPT-IN per turn: with `reactive: None` (the explicit `/run`
+    /// path + the queued-drain + the test default), a write tool does NOT isolate —
+    /// the behaviour is byte-for-byte the pre-change light path.
+    #[tokio::test]
+    async fn reactive_disabled_never_isolates_on_write() {
+        let tmp = init_git_repo();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        std::fs::write(tmp.path().join("seed.txt"), "seed").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        let start_branch = git_branch(tmp.path());
+
+        let (sink, mut rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let target = tmp.path().join("written.txt");
+        let spy = WriteSpy {
+            tool_name: "Write",
+            reply: "done",
+            effect: Box::new(move || std::fs::write(&target, "x").unwrap()),
+        };
+        drive_agentic_stream(
+            &spy,
+            "x",
+            "m",
+            "claude-code",
+            tmp.path(),
+            false,
+            &light_default_route(),
+            &[],
+            &sink,
+            &route_tx,
+            None, // reactive build disabled
+        )
+        .await;
+        assert_eq!(
+            git_branch(tmp.path()),
+            start_branch,
+            "with reactive disabled a write never isolates"
+        );
+        let mut saw_isolated = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.contains("umadev/") {
+                    saw_isolated = true;
+                }
+            }
+        }
+        assert!(
+            !saw_isolated,
+            "no isolation note when reactive build is off"
         );
     }
 }
