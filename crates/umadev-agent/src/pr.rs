@@ -553,11 +553,15 @@ fn git_has_changes(project_root: &Path) -> bool {
                 // whether the USER has uncommitted edits.
                 let path = line.get(3..).unwrap_or("").trim().trim_matches('"');
                 let path = path.rsplit(" -> ").next().unwrap_or(path);
-                !path.is_empty()
-                    && !path.starts_with(".umadev/")
-                    && !path.starts_with(".umadev\\")
-                    && !path.starts_with("output/")
-                    && !path.starts_with("output\\")
+                // UmaDev's own tooling dirs, written before isolation runs and never
+                // the user's product code: `.umadev/` (run-lock/plan/audit),
+                // `output/` (artifacts), `.claude/` (the governance PreToolUse-hook
+                // settings UmaDev installs). A `switch -c` carries any of these over
+                // to the isolation branch harmlessly anyway.
+                let our_dir = |d: &str| {
+                    path.starts_with(&format!("{d}/")) || path.starts_with(&format!("{d}\\"))
+                };
+                !path.is_empty() && !our_dir(".umadev") && !our_dir("output") && !our_dir(".claude")
             })
         })
         .unwrap_or(false)
