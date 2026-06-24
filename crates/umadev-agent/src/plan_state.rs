@@ -236,8 +236,11 @@ impl Plan {
 
     /// Normalise a freshly-parsed plan: drop empty-id steps, dedupe ids, drop
     /// `depends_on` entries that reference a non-existent step (so the DAG is
-    /// self-consistent and `ready_steps` can't deadlock on a dangling dep). Returns
-    /// `None` if nothing usable survives (the caller then fail-opens to no plan).
+    /// self-consistent and `ready_steps` can't deadlock on a dangling dep), then
+    /// break any dependency CYCLES (so the DAG is acyclic and `ready_steps` can
+    /// always make progress — a cyclic `a → b → a` would otherwise leave both steps
+    /// permanently un-ready, a silent deadlock). Returns `None` if nothing usable
+    /// survives (the caller then fail-opens to no plan).
     fn normalized(mut self) -> Option<Self> {
         let mut seen: HashSet<String> = HashSet::new();
         self.steps.retain(|s| {
@@ -251,16 +254,88 @@ impl Plan {
         for s in &mut self.steps {
             s.id = s.id.trim().to_string();
             s.title = s.title.trim().to_string();
-            s.depends_on
-                .retain(|d| d.trim() != s.id && ids.contains(d.trim()));
+            // Trim each dep and drop self-edges + dangling refs to non-existent steps.
+            s.depends_on = s
+                .depends_on
+                .iter()
+                .map(|d| d.trim().to_string())
+                .filter(|d| d != &s.id && ids.contains(d))
+                .collect();
             // A fresh plan starts every step Pending regardless of what the brain
             // emitted — the director drives status from reality, not the brain's
             // optimistic claim.
             s.status = StepStatus::Pending;
         }
+        self.break_dependency_cycles();
         self.risks.retain(|r| !r.trim().is_empty());
         self.open_questions.retain(|q| !q.trim().is_empty());
         Some(self)
+    }
+
+    /// Detect and break dependency cycles via DFS. A back-edge (a dep that points to
+    /// a step currently on the DFS stack) closes a cycle; that single `depends_on`
+    /// entry is dropped so the step still runs — it just loses the cyclic ordering
+    /// constraint that could never be satisfied. Each broken edge is logged
+    /// (`tracing::warn!`), never silently swallowed. Assumes self-edges and dangling
+    /// deps have already been stripped (see [`Self::normalized`]).
+    fn break_dependency_cycles(&mut self) {
+        // Index steps by id → position so we can look up neighbours quickly.
+        let index: std::collections::HashMap<String, usize> = self
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id.clone(), i))
+            .collect();
+
+        // Iterative DFS with explicit colours: 0 = white (unseen), 1 = grey (on the
+        // current stack), 2 = black (fully explored). A grey target = a back-edge.
+        let n = self.steps.len();
+        let mut colour = vec![0u8; n];
+        // Edges to drop, collected as (step_index, dep_id) — applied after the walk so
+        // we don't mutate `depends_on` while iterating it.
+        let mut to_drop: Vec<(usize, String)> = Vec::new();
+
+        for root in 0..n {
+            if colour[root] != 0 {
+                continue;
+            }
+            // Stack frame: (node, next-dep-cursor).
+            let mut stack: Vec<(usize, usize)> = vec![(root, 0)];
+            colour[root] = 1;
+            while let Some(&(node, cursor)) = stack.last() {
+                if cursor >= self.steps[node].depends_on.len() {
+                    colour[node] = 2;
+                    stack.pop();
+                    continue;
+                }
+                // Advance the cursor for this frame before recursing.
+                stack.last_mut().unwrap().1 += 1;
+                let dep_id = self.steps[node].depends_on[cursor].clone();
+                let Some(&target) = index.get(&dep_id) else {
+                    continue; // dangling deps were already stripped; defensive.
+                };
+                match colour[target] {
+                    1 => {
+                        // Back-edge → this dep closes a cycle. Drop it.
+                        tracing::warn!(
+                            step = %self.steps[node].id,
+                            depends_on = %dep_id,
+                            "plan: dropping cyclic dependency edge to keep the DAG acyclic"
+                        );
+                        to_drop.push((node, dep_id));
+                    }
+                    0 => {
+                        colour[target] = 1;
+                        stack.push((target, 0));
+                    }
+                    _ => {} // black: fully explored, no cycle through it.
+                }
+            }
+        }
+
+        for (i, dep) in to_drop {
+            self.steps[i].depends_on.retain(|d| d != &dep);
+        }
     }
 }
 
@@ -339,12 +414,17 @@ struct BrainStep {
 /// blocks.
 /// Send ONE directive on the MAIN session and collect its full text reply (for
 /// JSON parsing). Bounded by a generous idle timeout per event; non-text events
-/// (an unexpected tool call / result on a JSON-only turn) are ignored, and a
-/// pending approval is left unanswered so the watchdog ends the turn rather than
-/// letting the planning turn mutate anything. Fail-open: a dead session / a
-/// timeout / an empty reply → `None` (the caller then runs the plain build).
+/// (an unexpected tool call / result on a JSON-only turn) are ignored.
+///
+/// A pending [`SessionEvent::NeedApproval`] is **answered with `Deny`** (and, if the
+/// `respond` itself fails, the turn is `interrupt()`ed) rather than left dangling:
+/// this is a JSON-only PLAN turn that must mutate nothing, and an unanswered
+/// approval would wedge the base waiting on a decision — poisoning this same shared
+/// session for the later fallback build. Cleanly denying ends the turn and leaves
+/// the session usable. Fail-open: a dead session / a timeout / an empty reply →
+/// `None` (the caller then runs the plain build on the still-usable session).
 async fn drain_plan_turn(session: &mut dyn BaseSession, directive: String) -> Option<String> {
-    use umadev_runtime::SessionEvent;
+    use umadev_runtime::{ApprovalDecision, SessionEvent};
     if session.send_turn(directive).await.is_err() {
         return None;
     }
@@ -354,8 +434,22 @@ async fn drain_plan_turn(session: &mut dyn BaseSession, directive: String) -> Op
         {
             Ok(Some(SessionEvent::TextDelta(t))) => text.push_str(&t),
             Ok(Some(SessionEvent::TurnDone { .. })) => break,
-            // A JSON-only plan turn should emit no tools; ignore anything else and
-            // let the next-event timeout bound a misbehaving turn.
+            // The plan turn forbids tools; an approval request means the base tried to
+            // act anyway. DENY it (best-effort) so the JSON-only turn ends cleanly and
+            // the shared session stays usable for the fallback build. If `respond`
+            // fails, interrupt the turn to un-wedge the session, then bail.
+            Ok(Some(SessionEvent::NeedApproval { req_id, .. })) => {
+                if session
+                    .respond(&req_id, ApprovalDecision::Deny)
+                    .await
+                    .is_err()
+                {
+                    let _ = session.interrupt().await;
+                    return None;
+                }
+            }
+            // A JSON-only plan turn should emit no other tools; ignore anything else
+            // and let the next-event timeout bound a misbehaving turn.
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => return None,
         }
@@ -540,6 +634,65 @@ mod tests {
     }
 
     #[test]
+    fn normalize_breaks_a_two_node_cycle() {
+        // LOW #2: a → b → a is a cycle; left intact, `ready_steps` would NEVER surface
+        // either step (silent deadlock). Normalisation must break the back-edge so the
+        // DAG is acyclic and at least one step becomes ready.
+        let p = plan(vec![step("a", &["b"]), step("b", &["a"])])
+            .normalized()
+            .expect("a usable plan survives");
+        assert_eq!(p.steps.len(), 2, "no step is dropped, only an edge");
+        // Exactly one back-edge is dropped, so one of the two becomes ready.
+        let ready = p.ready_steps();
+        assert!(
+            !ready.is_empty(),
+            "breaking the cycle must leave at least one step ready: {:?}",
+            p.steps
+        );
+        // The DAG is now acyclic: total surviving deps across both nodes is at most 1.
+        let total_deps: usize = p.steps.iter().map(|s| s.depends_on.len()).sum();
+        assert!(
+            total_deps <= 1,
+            "the cyclic edge was broken: {total_deps} deps left"
+        );
+    }
+
+    #[test]
+    fn normalize_breaks_a_three_node_cycle_but_keeps_acyclic_edges() {
+        // a → b → c → a is a 3-cycle, plus a legit acyclic edge d → a. The cycle is
+        // broken; the acyclic d → a edge survives.
+        let p = plan(vec![
+            step("a", &["c"]),
+            step("b", &["a"]),
+            step("c", &["b"]),
+            step("d", &["a"]),
+        ])
+        .normalized()
+        .expect("a usable plan survives");
+        assert_eq!(p.steps.len(), 4);
+        // The whole graph must be schedulable: repeatedly mark ready steps Done until
+        // none remain pending; if a cycle survived this would loop without draining.
+        let mut p = p;
+        let mut guard = 0;
+        loop {
+            let ready: Vec<String> = p.ready_steps().iter().map(|s| s.id.clone()).collect();
+            if ready.is_empty() {
+                break;
+            }
+            for id in ready {
+                p.mark(&id, StepStatus::Done);
+            }
+            guard += 1;
+            assert!(guard < 10, "the DAG must drain (no surviving cycle)");
+        }
+        let (done, total) = p.progress();
+        assert_eq!(
+            done, total,
+            "every step became reachable → the DAG is acyclic"
+        );
+    }
+
+    #[test]
     fn save_and_load_round_trip() {
         let dir = std::env::temp_dir().join(format!("umadev-plan-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -557,6 +710,126 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("umadev-plan-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(load(&dir).is_none());
+    }
+
+    // ── drain_plan_turn cleanly handles a mid-turn approval (MEDIUM #3) ──
+
+    /// A minimal scripted [`BaseSession`] for `drain_plan_turn` tests: it replays a
+    /// fixed event batch after `send_turn`, records approval replies + interrupts, and
+    /// can be told to FAIL `respond` (to exercise the interrupt fallback).
+    struct ScriptedSession {
+        events: std::collections::VecDeque<umadev_runtime::SessionEvent>,
+        responded:
+            std::sync::Arc<std::sync::Mutex<Vec<(String, umadev_runtime::ApprovalDecision)>>>,
+        interrupts: std::sync::Arc<std::sync::Mutex<usize>>,
+        respond_fails: bool,
+    }
+
+    impl ScriptedSession {
+        fn new(events: Vec<umadev_runtime::SessionEvent>, respond_fails: bool) -> Self {
+            Self {
+                events: events.into_iter().collect(),
+                responded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                interrupts: std::sync::Arc::new(std::sync::Mutex::new(0)),
+                respond_fails,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for ScriptedSession {
+        async fn send_turn(
+            &mut self,
+            _directive: String,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            self.events.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            req_id: &str,
+            decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            self.responded
+                .lock()
+                .unwrap()
+                .push((req_id.to_string(), decision));
+            if self.respond_fails {
+                Err(umadev_runtime::SessionError::Send(
+                    "scripted respond failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            *self.interrupts.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_plan_turn_denies_an_approval_and_finishes_without_wedging() {
+        use umadev_runtime::{ApprovalDecision, SessionEvent, TurnStatus};
+        // The plan turn forbids tools, but the base asks to act anyway. drain must DENY
+        // the approval (not ignore it → wedge) and still drain to the JSON reply.
+        let mut s = ScriptedSession::new(
+            vec![
+                SessionEvent::NeedApproval {
+                    req_id: "req-1".into(),
+                    action: "write".into(),
+                    target: "app.rs".into(),
+                },
+                SessionEvent::TextDelta("{\"steps\":[]}".into()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                },
+            ],
+            false,
+        );
+        let responded = std::sync::Arc::clone(&s.responded);
+        let out = drain_plan_turn(&mut s, "plan please".into()).await;
+        assert_eq!(
+            out.as_deref(),
+            Some("{\"steps\":[]}"),
+            "drained the JSON reply"
+        );
+        let replies = responded.lock().unwrap();
+        assert_eq!(
+            replies.len(),
+            1,
+            "the approval was answered, not left dangling"
+        );
+        assert_eq!(replies[0], ("req-1".to_string(), ApprovalDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn drain_plan_turn_interrupts_when_respond_fails() {
+        use umadev_runtime::SessionEvent;
+        // If `respond` itself fails, drain must interrupt() to un-wedge the shared
+        // session, then bail (None) so the caller runs the plain build on a live
+        // session rather than one stuck waiting on an approval.
+        let mut s = ScriptedSession::new(
+            vec![SessionEvent::NeedApproval {
+                req_id: "req-1".into(),
+                action: "write".into(),
+                target: "app.rs".into(),
+            }],
+            true, // respond fails
+        );
+        let interrupts = std::sync::Arc::clone(&s.interrupts);
+        let out = drain_plan_turn(&mut s, "plan please".into()).await;
+        assert!(out.is_none(), "a failed respond bails out fail-open");
+        assert_eq!(
+            *interrupts.lock().unwrap(),
+            1,
+            "the session was interrupted to un-wedge it for the fallback build"
+        );
     }
 
     #[test]

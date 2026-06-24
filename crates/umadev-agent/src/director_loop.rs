@@ -593,10 +593,10 @@ async fn drive_plan_steps(
 
         let (accepted, reply, drove) = match step.kind {
             plan_state::StepKind::Build => {
-                drive_build_step(session, options, events, route, &step).await
+                drive_build_step(session, options, events, route, &step, deadline).await
             }
             plan_state::StepKind::Review => {
-                drive_review_step(session, options, events, route, &step).await
+                drive_review_step(session, options, events, route, &step, deadline).await
             }
         };
         if !reply.is_empty() {
@@ -626,13 +626,29 @@ async fn drive_plan_steps(
         persist_plan_ref(plan, options);
     }
 
+    // MEDIUM #2 — honest scope: a Blocked step permanently strands its dependents as
+    // Pending (they never become ready, since readiness needs every dep Done). The
+    // scheduling loop above just leaves them; without this they'd sit Pending forever
+    // while the run still reports Done — a SILENT loss of scope. Mark every Pending
+    // step that is unreachable because a dependency (transitively) Blocked as Blocked
+    // too, surface a one-line Note, and persist — so the checklist and the conclusion
+    // are honest about what was actually skipped. Fail-open: an empty/clean plan
+    // strands nothing → no Note.
+    let stranded = mark_unreachable_pending_blocked(plan, events);
+    if stranded > 0 {
+        events.emit(EngineEvent::Note(format!(
+            "team · {stranded} 个计划步骤因前置被阻塞而跳过(标记为已阻塞,未执行)"
+        )));
+        persist_plan_ref(plan, options);
+    }
+
     // Final whole-build QC gate — the SAME objective pass the single-turn loop runs
     // as its last word (source-present hard floor + content governance + optional
     // review), so a step-driven build is held to the identical floor. Advisory: it
     // does not re-drive here (each step was already verified); it folds any residual
     // finding into ONE last fix turn, bounded, then settles. This guarantees a
     // step-driven build is never held to a WEAKER bar than the single-turn build.
-    let final_reply = run_final_gate(session, options, events, route, &last_reply).await;
+    let final_reply = run_final_gate(session, options, events, route, &last_reply, deadline).await;
     if !final_reply.is_empty() {
         last_reply = final_reply;
     }
@@ -650,12 +666,18 @@ async fn drive_plan_steps(
 /// `acceptance` on the deterministic floor. A failing acceptance folds its evidence
 /// into a bounded fix re-drive ([`MAX_STEP_FIX_ROUNDS`]). Returns
 /// `(accepted, last_reply, drove_at_least_one_turn)`.
+///
+/// Wall-clock ceiling (graceful): the `deadline` bounds the EXTRA fix rounds, not the
+/// real work — round 0 (the step's actual doer turn) ALWAYS runs, so a budget already
+/// spent before this step never starves the step itself; only the re-drives past the
+/// budget are skipped (the doc'd "hard ceiling" is honoured inside the step too).
 async fn drive_build_step(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
     step: &plan_state::PlanStep,
+    deadline: std::time::Instant,
 ) -> (bool, String, bool) {
     let seat_id = step.seat.role_id();
     // The step's focused instruction + (fail-open) recalled stack pitfalls so the
@@ -672,6 +694,19 @@ async fn drive_build_step(
     let mut drove = false;
     let mut last_reply = String::new();
     for round in 0..=MAX_STEP_FIX_ROUNDS {
+        // Wall-clock ceiling (graceful): an EXTRA fix round past the budget is
+        // abandoned — round 0 (the actual work) always runs, only the re-drives are
+        // skipped, so a build can't keep grinding minute-long summon turns past its
+        // deadline (the doc'd hard ceiling). The step stays unaccepted → the caller
+        // marks it Blocked + the final gate / hard-gate still own reality.
+        if round > 0 && std::time::Instant::now() >= deadline {
+            events.emit(EngineEvent::Note(
+                "team · time budget reached — skipping further fix rounds on this step \
+                 (raise UMADEV_RUN_BUDGET_SECS for more)"
+                    .to_string(),
+            ));
+            break;
+        }
         // `instruction` carries the focused task on round 0 and is rewritten with
         // the failing acceptance evidence on each re-drive (see the loop tail).
         let summoned = director::summon(
@@ -722,12 +757,19 @@ async fn drive_build_step(
 /// blackboard. A review step is "accepted" when no seat raises a blocking finding;
 /// blocking findings fold into ONE bounded fix turn on the MAIN session (the doer
 /// repairs), then we re-read. Returns `(accepted, last_reply, drove)`.
+///
+/// Wall-clock ceiling (graceful): the read-only fork review ALWAYS runs (it's cheap
+/// and surfaces honest findings), but the minute-level main-session FIX turn it would
+/// trigger is skipped once the budget is spent — the findings are then surfaced as an
+/// honest note and left for the final gate / hard-gate, never silently grinding past
+/// the deadline.
 async fn drive_review_step(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
     step: &plan_state::PlanStep,
+    deadline: std::time::Instant,
 ) -> (bool, String, bool) {
     let _ = step;
     // Wave 2 deliverable 3: size the review team from the ROUTE's seats (the seats
@@ -736,6 +778,18 @@ async fn drive_review_step(
     let review = director::review_with_seats(session, options, events, &route.team).await;
     if !review.has_blocking() {
         return (true, String::new(), review.seats > 0);
+    }
+    // Wall-clock ceiling: the team found blocking issues, but the budget is already
+    // spent — skip the (minute-level) fix turn and surface the findings honestly. A
+    // review step is advisory, so we still "accept" it (the final gate / hard-gate
+    // own reality); we just don't grind another doer turn past the deadline.
+    if std::time::Instant::now() >= deadline {
+        events.emit(EngineEvent::Note(
+            "team · time budget reached — review findings left for the final gate \
+             (raise UMADEV_RUN_BUDGET_SECS to repair them in this run)"
+                .to_string(),
+        ));
+        return (true, String::new(), false);
     }
     // The team found blocking issues — fold them into ONE bounded fix turn on the
     // main session (the doer repairs), then accept (advisory: the deterministic
@@ -753,9 +807,20 @@ async fn drive_review_step(
          your turn."
     );
     let drove = crate::continuous::drive_rework_turn(session, options, events, directive).await;
-    // A review step is advisory: after one bounded repair we accept it (the final
-    // QC gate + hard-gate still own reality). This keeps the schedule moving while
-    // never letting an LLM verdict drive termination.
+    // LOW #1 — re-VERIFY the repair instead of blindly accepting it: re-run the
+    // (read-only, cheap) cross-review once after the fix turn. A review step stays
+    // advisory (the final QC gate + hard-gate own termination, never an LLM verdict),
+    // so we always "accept" to keep the schedule moving — but we now report HONESTLY
+    // whether the fix actually cleared the findings rather than silently assuming it
+    // did. Fail-open: if the re-review can't fork it returns no-blocking (accept).
+    let recheck = director::review_with_seats(session, options, events, &route.team).await;
+    if recheck.has_blocking() {
+        events.emit(EngineEvent::Note(format!(
+            "team · review step repaired but {} finding(s) remain after the fix turn — \
+             left for the final gate (objective hard-gate owns reality)",
+            recheck.blocking.len()
+        )));
+    }
     (true, String::new(), drove)
 }
 
@@ -861,21 +926,29 @@ fn acceptance_from_verify(r: VerifyResult) -> StepVerdict {
 /// bounded fix turn so a step-driven build is held to the identical objective floor.
 /// Returns the fix turn's reply (empty when QC was already clean). Bounded by
 /// [`MAX_QC_ROUNDS`]; fail-open throughout.
+///
+/// Wall-clock ceiling (graceful): the read-only QC READ ALWAYS runs (every iteration),
+/// so the build is ALWAYS held to the objective floor even at the budget; only the
+/// minute-level FIX TURN it would trigger is skipped once the deadline is spent (the
+/// doc'd "hard ceiling" — the build could otherwise run several fix turns over budget
+/// here). The objective hard-gate the caller runs still owns reality.
 async fn run_final_gate(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
     seed_reply: &str,
+    deadline: std::time::Instant,
 ) -> String {
     let mut last_reply = String::new();
     // The incremental-verify signal seeds from the LAST step's reply (the steps just
     // ran the build/test); each fix round below then carries its own turn's reply.
     let mut verify_signal = seed_reply.to_string();
     for round in 0..MAX_QC_ROUNDS {
-        // The final gate sizes its review team from the ROUTE (deliverable 3). Pass
-        // the freshest reply so the build/test read is skipped when the base already
-        // ran it green (Wave 3 incremental verify).
+        // The QC read ALWAYS runs (it is read-only + cheap), so the build is held to
+        // the objective floor every iteration — even at the budget. The final gate
+        // sizes its review team from the ROUTE (deliverable 3). Pass the freshest reply
+        // so the build/test read is skipped when the base already ran it green.
         let qc = run_auto_qc(
             session,
             options,
@@ -890,6 +963,19 @@ async fn run_final_gate(
         if round + 1 >= MAX_QC_ROUNDS {
             events.emit(EngineEvent::Note(
                 "team · final QC reached its fix-round budget — settling (objective hard-gate decides reality)"
+                    .to_string(),
+            ));
+            return last_reply;
+        }
+        // Wall-clock ceiling (graceful): the QC READ above ran (the floor still bites),
+        // but the minute-level FIX TURN it would trigger is skipped once the budget is
+        // spent — the residual findings are surfaced honestly and left for the
+        // objective hard-gate rather than driving more over-budget fix turns. This is
+        // the doc'd "hard ceiling": the build can't keep grinding fix turns past it.
+        if std::time::Instant::now() >= deadline {
+            events.emit(EngineEvent::Note(
+                "team · time budget reached — final QC findings left for the objective \
+                 hard-gate (raise UMADEV_RUN_BUDGET_SECS for more fix rounds)"
                     .to_string(),
             ));
             return last_reply;
@@ -955,6 +1041,65 @@ fn route_focus_line(route: &RoutePlan) -> String {
 /// Best-effort + fail-open: a write error is ignored, never blocks the schedule.
 fn persist_plan_ref(plan: &Plan, options: &RunOptions) {
     let _ = plan_state::save(plan, &options.project_root);
+}
+
+/// MEDIUM #2 — after the schedule drains, honestly mark every Pending step that can
+/// NEVER become ready because a dependency (directly or transitively) ended Blocked.
+/// A Blocked step never flips to Done, so `ready_steps` (which requires every dep
+/// Done) leaves its dependents Pending forever; left alone they'd silently vanish
+/// from the conclusion while the run still reports Done. This flips each such step to
+/// Blocked + emits a `PlanStepStatus`, so the checklist + the run's verdict are honest
+/// about the skipped scope. Returns the count of newly-Blocked steps (0 = nothing
+/// stranded). Pure + bounded (one fixpoint sweep per Pending step, ≤ steps²);
+/// fail-open by construction (it only flips Pending→Blocked, never an error).
+fn mark_unreachable_pending_blocked(plan: &mut Plan, events: &Arc<dyn EventSink>) -> usize {
+    use std::collections::HashSet;
+    // Seed the "blocked set" with the steps that are already Blocked.
+    let mut blocked: HashSet<String> = plan
+        .steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Blocked)
+        .map(|s| s.id.clone())
+        .collect();
+    if blocked.is_empty() {
+        return 0; // nothing Blocked ⇒ nothing can be transitively stranded
+    }
+    // Fixpoint: a Pending step that depends on ANYTHING in the blocked set is itself
+    // unreachable → add it and sweep again, until no new step joins (transitive
+    // closure over `depends_on`). Bounded by the step count (each sweep adds ≥1 or
+    // stops).
+    loop {
+        let mut grew = false;
+        for s in &plan.steps {
+            if s.status == StepStatus::Pending
+                && !blocked.contains(&s.id)
+                && s.depends_on.iter().any(|d| blocked.contains(d))
+            {
+                blocked.insert(s.id.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // Flip the newly-unreachable Pending steps to Blocked + surface each transition.
+    let to_block: Vec<(String, String)> = plan
+        .steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Pending && blocked.contains(&s.id))
+        .map(|s| (s.id.clone(), s.title.clone()))
+        .collect();
+    for (id, title) in &to_block {
+        if plan.mark(id, StepStatus::Blocked) {
+            events.emit(EngineEvent::plan_step_status(
+                id.clone(),
+                title.clone(),
+                StepStatus::Blocked,
+            ));
+        }
+    }
+    to_block.len()
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1053,12 +1198,18 @@ async fn drive_one_turn(
             IdleEvent::SessionEnded => {
                 // `None` = the session ended (process dead / EOF). Per the
                 // BaseSession contract, treat as a failed turn — fail-open, no panic.
+                // LOW #2: an interrupted/dead turn still consumed tokens (the directive
+                // + whatever streamed before the cut) — record the estimate so `/usage`
+                // is honest about cost on a failed turn, not just a clean one.
+                record_turn_usage(options, est_tokens);
                 return Err("base session ended mid-turn".to_string());
             }
             IdleEvent::IdleTimedOut => {
                 // No event within the idle window → the base is hung. Settle as a
                 // Failed outcome so the loop ends and `thinking` clears, rather than
                 // blocking forever (the interrupt was already issued, bounded).
+                // LOW #2: record the tokens spent up to the hang (fail-open).
+                record_turn_usage(options, est_tokens);
                 return Err(idle_reason(idle));
             }
         };
@@ -1112,6 +1263,9 @@ async fn drive_one_turn(
                     ApprovalDecision::Allow
                 };
                 if let Err(e) = session.respond(&req_id, decision).await {
+                    // LOW #2: a turn that dies on the approval round-trip still spent
+                    // its tokens — record the estimate (fail-open) before bailing.
+                    record_turn_usage(options, est_tokens);
                     return Err(format!("session respond: {e}"));
                 }
             }
@@ -1126,8 +1280,17 @@ async fn drive_one_turn(
                     capture_turn_pitfalls(options, events, &pitfalls);
                     return Ok(TurnResult { text });
                 }
-                TurnStatus::Interrupted => return Err("director turn interrupted".to_string()),
-                TurnStatus::Failed(reason) => return Err(reason),
+                // LOW #2: an Interrupted/Failed turn still consumed tokens — record the
+                // estimate on these paths too (not just Completed/Truncated), so
+                // `/usage` reflects the real cost of a turn that didn't finish clean.
+                TurnStatus::Interrupted => {
+                    record_turn_usage(options, est_tokens);
+                    return Err("director turn interrupted".to_string());
+                }
+                TurnStatus::Failed(reason) => {
+                    record_turn_usage(options, est_tokens);
+                    return Err(reason);
+                }
             },
         }
     }
@@ -2462,8 +2625,8 @@ mod tests {
         let mut sess = FakeSession::new(turns, true, "");
         let o = opts(tmp.path());
         let route = build_route(); // deliberate Standard
-        // An already-spent budget (deadline in the past). `checked_sub` avoids the
-        // unchecked-Instant-subtraction lint; fall back to "now" (still ≤ now).
+                                   // An already-spent budget (deadline in the past). `checked_sub` avoids the
+                                   // unchecked-Instant-subtraction lint; fall back to "now" (still ≤ now).
         let already_past = std::time::Instant::now()
             .checked_sub(Duration::from_secs(1))
             .unwrap_or_else(std::time::Instant::now);
@@ -2823,6 +2986,258 @@ mod tests {
                 |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "blocked")
             ) >= 1,
             "an unacceptable step is marked Blocked"
+        );
+    }
+
+    // ── HIGH #1: the wall-clock deadline binds the step-internal + final-gate fix
+    //    rounds (round 0 always runs; extra fix rounds past budget are skipped). ──
+
+    /// A 1-step Build plan whose acceptance NEVER passes (no source on disk). The
+    /// `id` lets the caller assert the step.
+    fn one_failing_build_plan() -> crate::plan_state::Plan {
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        Plan {
+            steps: vec![PlanStep {
+                id: "a".into(),
+                title: "Step A".into(),
+                seat: crate::critics::Seat::FrontendEngineer,
+                kind: StepKind::Build,
+                depends_on: vec![],
+                acceptance: AcceptanceSpec::SourcePresent,
+                status: StepStatus::Pending,
+            }],
+            risks: vec![],
+            open_questions: vec![],
+        }
+    }
+
+    /// A deadline already in the past (the budget is fully spent before the call).
+    fn spent_deadline() -> std::time::Instant {
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now)
+    }
+
+    #[tokio::test]
+    async fn budget_skips_step_internal_fix_rounds_round0_still_runs() {
+        // HIGH #1: a Build step whose acceptance fails would normally re-drive
+        // MAX_STEP_FIX_ROUNDS extra summon turns. With the wall-clock budget ALREADY
+        // spent, round 0 (the real work) STILL runs once, but every EXTRA fix round is
+        // skipped — so the step drives exactly ONE doer turn, not three. The honest
+        // "skipping further fix rounds" note fires. (Compare
+        // a_failing_step_acceptance_is_bounded_and_marks_blocked, which lets the full
+        // fix budget run under a future deadline.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source → the source-present acceptance fails every round.
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(
+            vec![
+                text_turn("Worked on it. Done."),
+                text_turn("Tried again. Done."),
+                text_turn("Once more. Done."),
+            ],
+            false,
+            "",
+        );
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = one_failing_build_plan();
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            Duration::from_millis(200),
+            spent_deadline(),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+        // EXACTLY ONE doer turn drove the step (round 0) — the extra fix rounds were
+        // skipped by the budget. The final gate also adds NO fix turn (its own round-0
+        // QC read found the gap but the budget skipped the fix turn), so the main
+        // session received exactly one directive total.
+        let n = sent.lock().unwrap().len();
+        assert_eq!(
+            n, 1,
+            "round 0 runs but extra fix rounds + final-gate fix turns are skipped: {n}"
+        );
+        assert!(
+            note_seen(&rec, "skipping further fix rounds on this step"),
+            "the step-internal budget note fires"
+        );
+        // The step still ended Blocked (round 0's acceptance failed) — honest.
+        assert_eq!(plan.steps[0].status, crate::plan_state::StepStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn budget_skips_final_gate_fix_turns_round0_qc_still_runs() {
+        // HIGH #1: the final whole-build QC gate's round 0 (the read-only QC read)
+        // always runs so the build is held to the floor; but its minute-level FIX
+        // turns past the budget are skipped. With source present but a governance
+        // violation (an emoji-as-icon write on codex), round-0 QC flags a finding —
+        // and with the budget spent NO fix turn is driven for it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Source present (so the step's acceptance passes + the step ticks Done), plus
+        // a governance violation the FINAL gate's QC will flag.
+        std::fs::write(
+            tmp.path().join("button.tsx"),
+            "export const Btn = () => <button>\u{1F680} Launch</button>;",
+        )
+        .unwrap();
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![text_turn("Built step a. Done.")], false, "");
+        let sent = sess.sent_handle();
+        let mut o = codex_opts(tmp.path()); // codex → the QC governance scan is its gate
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = one_failing_build_plan(); // acceptance is source-present → passes here
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            Duration::from_millis(200),
+            spent_deadline(),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+        // The step drove ONCE (its acceptance passed → Done). The final gate's round-0
+        // QC flagged the governance violation, but the budget skipped its fix turn —
+        // so the main session saw exactly ONE directive (the step), no final-gate fix.
+        let n = sent.lock().unwrap().len();
+        assert_eq!(
+            n, 1,
+            "the step ran; the final-gate fix turn was skipped past budget: {n}"
+        );
+        assert!(
+            note_seen(&rec, "final QC findings left for the objective"),
+            "the final-gate budget note fires"
+        );
+        assert_eq!(plan.steps[0].status, crate::plan_state::StepStatus::Done);
+    }
+
+    // ── MEDIUM #2: a Pending step stranded behind a Blocked dependency is honestly
+    //    re-marked Blocked + a Note fires (no silent scope loss). ──
+
+    #[test]
+    fn unreachable_pending_behind_a_blocked_dep_is_marked_blocked() {
+        // The pure helper: a → (Blocked); b depends on a (Pending); c depends on b
+        // (Pending); d is independent (Pending). a's block transitively strands b AND
+        // c, but NOT the independent d. Marks b + c Blocked, leaves d Pending.
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let (events, rec) = sink();
+        let mk = |id: &str, deps: &[&str], status: StepStatus| PlanStep {
+            id: id.into(),
+            title: format!("step {id}"),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            status,
+        };
+        let mut plan = Plan {
+            steps: vec![
+                mk("a", &[], StepStatus::Blocked),
+                mk("b", &["a"], StepStatus::Pending),
+                mk("c", &["b"], StepStatus::Pending),
+                mk("d", &[], StepStatus::Pending),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        let n = mark_unreachable_pending_blocked(&mut plan, &events);
+        assert_eq!(n, 2, "b and c are transitively stranded → 2 newly Blocked");
+        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(by("b"), StepStatus::Blocked);
+        assert_eq!(by("c"), StepStatus::Blocked);
+        assert_eq!(
+            by("d"),
+            StepStatus::Pending,
+            "the independent step is untouched"
+        );
+        // A Blocked status event was emitted for each stranded step.
+        assert_eq!(
+            rec.count(
+                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "blocked")
+            ),
+            2
+        );
+        // A clean plan (nothing Blocked) strands nothing.
+        let mut clean = Plan {
+            steps: vec![
+                mk("x", &[], StepStatus::Done),
+                mk("y", &["x"], StepStatus::Pending),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        let (e2, _r2) = sink();
+        assert_eq!(mark_unreachable_pending_blocked(&mut clean, &e2), 0);
+    }
+
+    #[tokio::test]
+    async fn blocked_step_strands_its_dependent_which_is_honestly_marked_and_noted() {
+        // End-to-end MEDIUM #2: a 2-step plan where step a (no source → acceptance
+        // fails, bounded) ends Blocked, and step b depends on a. b never becomes ready
+        // (its dep a is not Done), so the scheduler leaves it Pending — the silent
+        // scope loss. The post-schedule honesty pass marks b Blocked + emits the
+        // "因前置被阻塞而跳过" Note, so the checklist and the conclusion are honest.
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source → step a's source-present acceptance fails every round → Blocked.
+        let (events, rec) = sink();
+        let mk = |id: &str, deps: &[&str]| PlanStep {
+            id: id.into(),
+            title: format!("step {id}"),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            status: StepStatus::Pending,
+        };
+        let mut plan = Plan {
+            steps: vec![mk("a", &[]), mk("b", &["a"])],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        // Plenty of default-completing turns; a future deadline so the FULL fix budget
+        // runs (this isolates MEDIUM #2 from HIGH #1 — the strand, not the budget).
+        let turns: Vec<Vec<SessionEvent>> =
+            (0..6).map(|_| text_turn("Worked on it. Done.")).collect();
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            Duration::from_millis(200),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+        // BOTH a (drove + failed) and b (stranded) ended Blocked — no Pending leftover.
+        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(by("a"), StepStatus::Blocked, "step a failed its acceptance");
+        assert_eq!(
+            by("b"),
+            StepStatus::Blocked,
+            "step b is honestly marked Blocked (stranded), not silently left Pending"
+        );
+        // The honest skip Note fired so the conclusion isn't silently incomplete.
+        assert!(
+            note_seen(&rec, "因前置被阻塞而跳过"),
+            "the stranded-scope Note is surfaced"
         );
     }
 

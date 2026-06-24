@@ -680,13 +680,26 @@ pub async fn route_via_brain(
     match consult_brain_oneshot(runtime, requirement).await {
         Some(brain) => brain_to_route(&brain),
         // Simplest possible degradation (NOT a keyword fallback): treat it as a
-        // chat turn and pass it straight to the base.
+        // chat turn and pass it straight to the base. This path is reached only
+        // after `consult_brain_oneshot` already retried a prose (non-JSON) reply
+        // once with a stricter JSON-only ask — so a real build whose first reply
+        // was narrated still has a chance to route correctly before we fall back to
+        // Chat. The Chat default here is a DELIBERATE design choice (UmaDev depends
+        // on the base ecosystem; if the brain is truly unreachable the product can't
+        // run anyway, so we never guess intent from a keyword list).
         None => brain_unavailable_chat_route(),
     }
 }
 
 /// One stateless `complete()` triage call on the borrowed brain. `None` on offline
 /// / empty input / a call error / unparseable JSON.
+///
+/// On a first reply that yields no parseable JSON object (the brain answered in
+/// prose), retry ONCE with a stricter "ONLY a JSON object, no prose" instruction
+/// before giving up. A model that narrates intent is exactly the case where a build
+/// would otherwise silently degrade to Chat (see [`brain_unavailable_chat_route`]);
+/// the cheap second ask recovers it. Still fully fail-open — both calls returning
+/// nothing usable leaves the caller on the lightest (Chat) path by design.
 async fn consult_brain_oneshot(
     runtime: &dyn umadev_runtime::Runtime,
     requirement: &str,
@@ -694,8 +707,28 @@ async fn consult_brain_oneshot(
     if runtime.is_offline() || requirement.trim().is_empty() {
         return None;
     }
+    // First ask: the standard triage system prompt.
+    if let Some(parsed) = triage_once(runtime, ROUTER_TRIAGE_SYSTEM, requirement).await {
+        return Some(parsed);
+    }
+    // Retry once, harder: a prose reply (no JSON) on a real build would otherwise
+    // degrade to Chat — re-ask demanding a bare JSON object only.
+    let strict_system = format!(
+        "{ROUTER_TRIAGE_SYSTEM}\n\nIMPORTANT: Reply with EXACTLY ONE JSON object and \
+         NOTHING ELSE — no markdown, no code fence, no prose, no explanation."
+    );
+    triage_once(runtime, &strict_system, requirement).await
+}
+
+/// One stateless triage round-trip: send `system` + the requirement, extract the
+/// JSON object, parse it. `None` on a call error / no JSON / unparseable JSON.
+async fn triage_once(
+    runtime: &dyn umadev_runtime::Runtime,
+    system: &str,
+    requirement: &str,
+) -> Option<BrainRoute> {
     let prompt = crate::experts::Prompt {
-        system: ROUTER_TRIAGE_SYSTEM.to_string(),
+        system: system.to_string(),
         user: format!("Request:\n{requirement}"),
     };
     let resp = runtime
@@ -713,7 +746,20 @@ async fn consult_brain_oneshot(
 fn brain_to_route(brain: &BrainRoute) -> RoutePlan {
     let class = parse_class(&brain.class).unwrap_or(RouteClass::Chat);
     let depth = parse_depth(&brain.complexity).unwrap_or(Depth::Fast);
-    let kind = parse_kind(&brain.kind).unwrap_or(TaskKind::Light);
+    // Default kind: a mutating class (build / quick-edit / debug) whose `kind` field
+    // is unparseable must NOT fall back to `Light` — `Light` convenes ZERO team, so a
+    // brain that says "build, complex" but garbles `kind` would silently lose the
+    // delivery roster (a deliberate build with no critics). Default a mutating class
+    // to a BUILD-SHAPED kind (`Greenfield` → the full roster via `team_for_kind`); a
+    // read-only class (chat / explain) keeps the light `Light` default (no team
+    // wanted there anyway). The brain may still narrow it via a parseable `kind`.
+    let kind = parse_kind(&brain.kind).unwrap_or_else(|| {
+        if class.mutates_workspace() {
+            TaskKind::Greenfield
+        } else {
+            TaskKind::Light
+        }
+    });
     let team = reconcile_team(&[], kind, class, depth, &brain.needs);
     let scope = union_scope(&[], &brain.scope);
     let needs_clarify = build_clarify(brain);
@@ -969,6 +1015,83 @@ mod tests {
         assert_eq!(p.class, RouteClass::Build);
         assert_eq!(p.depth, Depth::Deep);
         assert!(!p.team.is_empty(), "a complex build convenes a team");
+    }
+
+    #[tokio::test]
+    async fn brain_build_with_unparseable_kind_still_convenes_a_team() {
+        // MEDIUM #1: the brain says "build, complex" but garbles `kind` ("widget").
+        // `parse_kind` fails → it must NOT fall back to `Light` (zero team). A
+        // mutating class defaults to a build-shaped kind (Greenfield) so a deliberate
+        // build always has a delivery roster.
+        let brain = TriageBrain(
+            "{\"class\":\"build\",\"kind\":\"widget\",\"complexity\":\"complex\",\"confidence\":0.9}",
+        );
+        let p = route_via_brain(&brain, "做一个完整的后台系统").await;
+        assert_eq!(p.class, RouteClass::Build);
+        assert_eq!(
+            p.kind,
+            TaskKind::Greenfield,
+            "bad kind on a build → Greenfield"
+        );
+        assert!(
+            !p.team.is_empty(),
+            "a deliberate build with a bad kind must still convene a team"
+        );
+    }
+
+    #[tokio::test]
+    async fn brain_chat_with_unparseable_kind_keeps_light_no_team() {
+        // The flip side: a read-only class (chat) with a bad kind keeps the light
+        // `Light` default — no team is wanted on a chat turn regardless.
+        let brain = TriageBrain(
+            "{\"class\":\"chat\",\"kind\":\"widget\",\"complexity\":\"simple\",\"confidence\":0.9}",
+        );
+        let p = route_via_brain(&brain, "你好").await;
+        assert_eq!(p.class, RouteClass::Chat);
+        assert_eq!(p.kind, TaskKind::Light);
+        assert!(p.team.is_empty());
+    }
+
+    #[tokio::test]
+    async fn brain_prose_then_json_retry_recovers_a_build() {
+        // LOW #1: the brain narrates intent on the FIRST reply (no JSON) — a real
+        // build would otherwise degrade to Chat. The stricter JSON-only retry on the
+        // second call recovers it. This brain returns prose first, JSON second.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ProseThenJson(AtomicUsize);
+        #[async_trait]
+        impl Runtime for ProseThenJson {
+            fn kind(&self) -> RuntimeKind {
+                RuntimeKind::Anthropic
+            }
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, RuntimeError> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let text = if n == 0 {
+                    "Sure, this looks like a real build — I'd start by scaffolding the app."
+                        .to_string()
+                } else {
+                    "{\"class\":\"build\",\"kind\":\"greenfield\",\"complexity\":\"complex\",\"confidence\":0.9}"
+                        .to_string()
+                };
+                Ok(CompletionResponse {
+                    text,
+                    id: "t".into(),
+                    model: "t".into(),
+                    usage: Usage::default(),
+                })
+            }
+        }
+        let brain = ProseThenJson(AtomicUsize::new(0));
+        let p = route_via_brain(&brain, "做一个完整的 SaaS 产品").await;
+        assert_eq!(
+            p.class,
+            RouteClass::Build,
+            "the JSON-only retry recovered the build"
+        );
+        assert!(!p.team.is_empty());
     }
 
     #[tokio::test]

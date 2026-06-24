@@ -185,6 +185,48 @@ const DESTRUCTIVE_TOKENS: &[&str] = &[
     "sudo ",
 ];
 
+/// Bare destructive verbs (no recursive flag) that still lose data and so flip
+/// an action to [`Reversibility::Destructive`]. Unlike [`DESTRUCTIVE_TOKENS`]
+/// these are matched **at a command position** (start, or after a shell
+/// separator / `sudo`/`xargs`/…) via [`verb_at_command_position`] so the common
+/// English fragments that *contain* them (`perform`/`transform` ⊃ `rm`,
+/// `remove`/`move` ⊃ `mv`) never false-positive. Conservative on purpose: a
+/// plain `rm file`, `mv a b` (overwrites `b`), or `unlink x` deletes/overwrites
+/// without a recursive flag, so it escalates to a confirmation rather than
+/// running silently under Auto.
+const BARE_DESTRUCTIVE_VERBS: &[&str] = &["rm", "mv", "unlink"];
+
+/// Whether `verb` is invoked as a command (not merely a substring of an
+/// argument/word) anywhere in the already-lowercased `cmd`. A command position
+/// is the very start, or immediately after a shell separator (`;`/`|`/`&`/
+/// newline/`(`) or a privilege/exec wrapper (`sudo`/`doas`/`xargs`/…). The char
+/// right after the verb must be whitespace so `rmdir`/`mvn`/`unlinkat` don't
+/// match. Mirrors the precision of `rules::appears_as_command`. Fail-safe: any
+/// odd input simply yields `false` (no escalation forced by a parser quirk).
+fn verb_at_command_position(cmd: &str, verb: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = cmd[from..].find(verb) {
+        let start = from + rel;
+        let end = start + verb.len();
+        // The verb must be followed by whitespace (an argument follows): so `rm `
+        // / `mv ` match but `rmdir` / `move` / `mvn` / `unlinkat` do not.
+        let after_ok = cmd[end..].chars().next().is_some_and(char::is_whitespace);
+        // Command position: start, or after a separator / privilege+exec wrapper.
+        let before = cmd[..start].trim_end();
+        let before_ok = before.is_empty()
+            || before.ends_with([';', '|', '&', '\n', '('])
+            || matches!(
+                before.rsplit(char::is_whitespace).next().unwrap_or(""),
+                "sudo" | "doas" | "exec" | "nohup" | "env" | "xargs" | "time" | "command"
+            );
+        if after_ok && before_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
 /// Tokens that indicate the action reaches the network.
 const NETWORK_TOKENS: &[&str] = &[
     "git push",
@@ -214,6 +256,16 @@ const NETWORK_TOKENS: &[&str] = &[
 pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
     let cmd = command.to_ascii_lowercase();
     if DESTRUCTIVE_TOKENS.iter().any(|t| cmd.contains(t)) {
+        return Reversibility::Destructive;
+    }
+    // Bare destructive verbs (no recursive flag): a plain `rm file` / `mv a b`
+    // (silently overwrites `b`) / `unlink x` still loses data and so escalates.
+    // Matched at a command position so `perform`/`transform`/`remove`/`git rm`
+    // (VCS, handled below) are NOT mis-classified as a bare destructive verb.
+    if BARE_DESTRUCTIVE_VERBS
+        .iter()
+        .any(|v| verb_at_command_position(&cmd, v))
+    {
         return Reversibility::Destructive;
     }
     if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) {
@@ -250,6 +302,15 @@ fn path_touches_vcs(s: &str) -> bool {
         || s.contains("git merge ")
         || s.contains("git rm ")
         || s.contains("git branch -d")
+        // Long-form / plumbing history rewriters the short-form list missed
+        // (`branch --delete` == `-d`/`-D`; `update-ref -d` / `symbolic-ref -d`
+        // delete refs directly; `reflog delete` prunes the recovery net;
+        // `worktree remove` drops a linked tree + its uncommitted work).
+        || s.contains("git branch --delete")
+        || s.contains("git update-ref -d")
+        || s.contains("git symbolic-ref -d")
+        || s.contains("git reflog delete")
+        || s.contains("git worktree remove")
         || s.contains("git stash drop")
         || s.contains("git stash clear")
 }
@@ -774,6 +835,77 @@ mod tests {
         assert_eq!(
             reversibility_class("git merge-base main feature", ""),
             Reversibility::Reversible
+        );
+    }
+
+    #[test]
+    fn long_form_history_rewriters_escalate_as_vcs() {
+        // MEDIUM #4: the long-form / plumbing ref-deleters the short-form list
+        // missed must also escalate on every tier (VCS class).
+        for cmd in [
+            "git branch --delete umadev/old",
+            "git update-ref -d refs/heads/x",
+            "git symbolic-ref -d HEAD",
+            "git reflog delete HEAD@{2}",
+            "git worktree remove ../wt",
+        ] {
+            assert_eq!(
+                reversibility_class(cmd, ""),
+                Reversibility::VersionControl,
+                "{cmd} must escalate as VCS"
+            );
+            assert!(
+                requires_confirmation(TrustMode::Auto, cmd, ""),
+                "{cmd} must confirm even in Auto"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_destructive_verbs_escalate_but_not_lookalikes() {
+        // MEDIUM #5: a plain `rm`/`mv`/`unlink` (no recursive flag) loses/overwrites
+        // data, so it escalates on EVERY tier — conservative by design.
+        for cmd in [
+            "rm src/old.ts",
+            "rm -f config.json",
+            "rm -r build",
+            "mv a.txt b.txt", // overwrites b.txt
+            "unlink socket",
+            "cd /tmp && rm scratch",
+            "sudo rm /etc/hosts",
+        ] {
+            assert_eq!(
+                reversibility_class(cmd, ""),
+                Reversibility::Destructive,
+                "{cmd} must escalate as destructive"
+            );
+            assert!(
+                requires_confirmation(TrustMode::Auto, cmd, ""),
+                "{cmd} must confirm even in Auto"
+            );
+        }
+        // Look-alikes that merely CONTAIN the verb as a substring must NOT escalate
+        // (a governor that confirms `npm run perform-build` or `git mv` mis-classed
+        // as destructive is broken). These stay non-destructive.
+        for cmd in [
+            "npm run perform-build", // "perform" ⊃ rm — not a command-position rm
+            "node transform.js",     // "transform" ⊃ rm
+            "echo confirm the file", // "confirm" ⊃ rm, but it's an echo arg
+            "warm-cache.sh",         // "warm" ⊃ rm at a non-command position
+            "mvn package",           // "mvn" ⊃ mv but not `mv ` at command position
+            "cargo build",
+        ] {
+            assert_ne!(
+                reversibility_class(cmd, ""),
+                Reversibility::Destructive,
+                "{cmd} must NOT be mis-classed as a bare destructive verb"
+            );
+        }
+        // `git rm` stays VCS (the `git` prefix means the bare-rm check does not
+        // fire; the VCS classifier owns it) — order is preserved.
+        assert_eq!(
+            reversibility_class("git rm tracked.ts", ""),
+            Reversibility::VersionControl
         );
     }
 

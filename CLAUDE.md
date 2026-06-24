@@ -32,11 +32,16 @@ layers, every brain consult fail-open to a deterministic floor:
   (`umadev_knowledge::repo_map`) of the user's existing code — injected on
   every path through each base's own native system-prompt surface.
 - **L1 router** (`umadev_agent::router`) — classifies the turn into a typed
-  `RoutePlan { class, kind, depth, team, scope, … }` (deterministic Tier-0
-  floor + an optional forked brain consult that may escalate, never silently
-  de-scope). The route is **surfaced** (`EngineEvent::IntentDecided`) so the
-  user sees "small change, on it" vs "full build, entering the delivery
-  flow," and can override it.
+  `RoutePlan { class, kind, depth, team, scope, … }`. The **default chat
+  surface borrows the brain to judge intent** (`route_via_brain`: one
+  stateless `complete()` triage — the base's own model decides chat /
+  explain / quick_edit / debug / build, **authoritative**, no keyword
+  classifier; brain unreachable → the lightest path, never a keyword guess).
+  The fork-based `route()` + the explicit-`/run` `for_run` keep the
+  deterministic Tier-0 floor + escalate-only consult for build *sizing*. The
+  route is **surfaced** (`EngineEvent::IntentDecided`) so the user sees
+  "small change, on it" vs "full build, entering the delivery flow," and can
+  override it.
 - **L2 plan + scheduling** (`umadev_agent::plan_state`) — for a deliberate
   build the director asks the brain for a strict plan it **parses and owns**
   as a dependency DAG (`.umadev/plan.json`), rendered as a live, steerable

@@ -7346,6 +7346,93 @@ const DESTRUCTIVE_BASH_PATTERNS: &[BashPattern] = &[
         git_only: true,
         allow_if: &[],
     },
+    // --- Irreversible / network VCS verbs the trust floor catches on the
+    // NeedApproval path but a hook-less base (codex/opencode `approvalPolicy=never`)
+    // would otherwise run directly via Bash. These mirror `trust::path_touches_vcs`
+    // + `NETWORK_TOKENS` so the pre-bash floor protects BOTH the claude PreToolUse
+    // hook AND the codex/opencode `govern_tool_call` path. All `git_only` so they
+    // never fire outside a git invocation; triggers carry a trailing space (or the
+    // explicit verb) so read-only neighbours are NOT caught:
+    //   `git push`     → blocked   |  `git push --dry-run` → allowed (allow_if)
+    //   `git merge `   → blocked   |  `git merge-base …`    → NOT caught (no space)
+    //   `git rm `      → blocked
+    //   `git branch -d`/`-D`/`--delete` → blocked (a branch drop loses commits)
+    //   `git stash drop`/`clear`        → blocked (stashed work lost)
+    //   `git update-ref -d`/`reflog delete`/`worktree remove` → blocked (history)
+    // A plain `git push` reaches the network and rewrites the remote, so it
+    // escalates even though it's not a `--force`.
+    BashPattern {
+        trigger: "git push",
+        why: "`git push` sends commits to a remote and (per UmaDev's trust contract) UmaDev never auto-pushes — the customer reviews and pushes themselves.",
+        fix: "Let the user run the push, or confirm the branch + remote explicitly. `git push --dry-run` is allowed for inspection.",
+        git_only: true,
+        // `--dry-run` is inspection-only; `--force-with-lease` stays consistent
+        // with the dedicated `push --force` pattern above (which already allows it).
+        allow_if: &["--dry-run", "--force-with-lease"],
+    },
+    BashPattern {
+        trigger: "git merge ",
+        why: "`git merge` mutates the current branch's history — UmaDev isolates work on `umadev/<slug>` and never auto-merges into the user's branch.",
+        fix: "Leave the merge to the user after they review the diff. (Read-only `git merge-base` is not affected.)",
+        git_only: true,
+        allow_if: &[],
+    },
+    BashPattern {
+        trigger: "git rm ",
+        why: "`git rm` deletes tracked files from the working tree and the index.",
+        fix: "If a file must go, delete it in a reviewed change; UmaDev flags `git rm` so the removal is conscious.",
+        git_only: true,
+        allow_if: &[],
+    },
+    BashPattern {
+        trigger: "git branch -d",
+        why: "`git branch -d`/`-D` deletes a branch; `-D` force-deletes even unmerged commits, losing work.",
+        fix: "Confirm the branch is fully merged/pushed before deleting it.",
+        git_only: true,
+        allow_if: &[],
+    },
+    BashPattern {
+        trigger: "git branch --delete",
+        why: "`git branch --delete` (the long form of `-d`/`-D`) deletes a branch and can drop unmerged commits.",
+        fix: "Confirm the branch is fully merged/pushed before deleting it.",
+        git_only: true,
+        allow_if: &[],
+    },
+    BashPattern {
+        trigger: "git stash drop",
+        why: "`git stash drop` permanently discards a stashed change with no recovery.",
+        fix: "Apply or inspect the stash first (`git stash show -p`); drop only when you're sure.",
+        git_only: true,
+        allow_if: &[],
+    },
+    BashPattern {
+        trigger: "git stash clear",
+        why: "`git stash clear` deletes ALL stashed changes irreversibly.",
+        fix: "Review each stash entry before clearing; this loses every stash at once.",
+        git_only: true,
+        allow_if: &[],
+    },
+    BashPattern {
+        trigger: "git update-ref -d",
+        why: "`git update-ref -d` deletes a ref directly, bypassing the usual branch/tag safety — history can become unreachable.",
+        fix: "Delete branches/tags via `git branch`/`git tag` instead, or confirm the ref is recoverable from a reflog.",
+        git_only: true,
+        allow_if: &[],
+    },
+    BashPattern {
+        trigger: "git reflog delete",
+        why: "`git reflog delete` removes reflog entries, the last safety net for recovering rewritten/lost commits.",
+        fix: "Avoid pruning the reflog; it's what lets you undo a bad reset/rebase.",
+        git_only: true,
+        allow_if: &[],
+    },
+    BashPattern {
+        trigger: "git worktree remove",
+        why: "`git worktree remove` deletes a linked worktree and any uncommitted changes inside it.",
+        fix: "Commit or stash inside the worktree first; UmaDev flags the removal so it's conscious.",
+        git_only: true,
+        allow_if: &[],
+    },
     // dd of=/dev/...  —  raw disk write, can brick the system. Match on
     // `of=/dev/` (not `dd of=`) since flags interleave (`dd if=… of=/dev/sda`).
     BashPattern {
@@ -8151,6 +8238,56 @@ const x = 1;",
         // --force-with-lease is the safe variant — must pass.
         let d = check_dangerous_bash("git push --force-with-lease origin main");
         assert!(!d.block);
+    }
+
+    #[test]
+    fn bash_blocks_plain_vcs_history_and_network_verbs() {
+        // HIGH #2: a hook-less base (codex/opencode approvalPolicy=never) would run
+        // these straight via Bash, bypassing the trust floor — so the PRE-BASH floor
+        // must block them too. Plain `git push`/`merge`/`rm`/branch-drop/stash-drop
+        // and the long-form / plumbing history-rewriters all escalate.
+        for cmd in [
+            "git push origin main",
+            "git push",
+            "git merge feature",
+            "git rm src/old.ts",
+            "git branch -d umadev/old",
+            "git branch -D umadev/old",
+            "git branch --delete umadev/old",
+            "git stash drop",
+            "git stash clear",
+            "git update-ref -d refs/heads/x",
+            "git reflog delete HEAD@{2}",
+            "git worktree remove ../wt",
+        ] {
+            assert!(
+                check_dangerous_bash(cmd).block,
+                "pre-bash floor must block hook-less VCS verb: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_does_not_falsely_block_read_only_or_dry_run_git() {
+        // Must NOT false-positive on read-only neighbours or the inspection forms —
+        // a governor that blocks `git merge-base` / `git status` / `git log` is
+        // broken. `git push --dry-run` is an inspection and is allow-listed.
+        for cmd in [
+            "git merge-base main feature",
+            "git status",
+            "git log --oneline",
+            "git diff",
+            "git show HEAD",
+            "git branch -a",
+            "git stash list",
+            "git push --dry-run origin main",
+            "git rm-cache-no-such-flag", // not `git rm ` (no trailing space)
+        ] {
+            assert!(
+                !check_dangerous_bash(cmd).block,
+                "read-only / dry-run git must NOT be blocked: {cmd}"
+            );
+        }
     }
 
     #[test]

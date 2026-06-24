@@ -722,6 +722,27 @@ async fn run_director_loop(
             )));
         }
 
+        // MEDIUM #7: write the WorkflowState baseline, exactly like the CLI's
+        // `AgentRunner::start` does (`.umadev/workflow-state.json`, phase `research`,
+        // slug + requirement + backend). Without this a TUI-originated director build
+        // left no state on disk, so `umadev status` / `umadev continue` against a
+        // build STARTED in the chat TUI read `Missing` and bailed — the run was
+        // invisible to the CLI surfaces. Written here (after the run-lock + isolation,
+        // before the base writes anything) so the baseline reflects this run. Fail-open
+        // by contract: a disk/permission error is swallowed (`let _ =`) — a state-write
+        // bug must NEVER block an otherwise-healthy build.
+        let baseline = {
+            // `WorkflowState::new` fills `last_transition_at` (now) + `spec_version`;
+            // override the run-specific carry-through fields the CLI's `start` sets.
+            let mut s = umadev_agent::WorkflowState::new(umadev_spec::Phase::Research);
+            s.slug = options.effective_slug();
+            s.requirement.clone_from(&options.requirement);
+            s.backend.clone_from(&backend);
+            s.note = format!("Started director build (TUI) with {backend}");
+            s
+        };
+        let _ = umadev_agent::write_workflow_state(&root, &baseline);
+
         // Wave 2 (firmware): compose UmaDev's identity + craft + JIT knowledge +
         // pitfall memory once (the `/run` route is deterministic, no session needed)
         // so claude can take it NATIVELY as a system prompt via `session_for`'s
@@ -901,6 +922,29 @@ struct AgenticTurn {
     /// disguising "claimed done" as success). A normal free-text turn leaves this
     /// `false` and keeps the lighter git-diff fact line only.
     director_build: bool,
+    /// Whether a real **host CLI** is driving this turn (vs. the offline runtime).
+    /// LOW fix (tui-dispatch): the single-writer run-lock + branch isolation are a
+    /// HOST director-build concern — a `Build`-class verdict against a NON-host
+    /// brain (offline) stays on this light streaming path and must NOT grab the
+    /// workspace lock or isolate a branch (it writes nothing the lock protects). So
+    /// the lock/isolation gate below is `director_build && host_cli`, not
+    /// `director_build` alone. The source hard-gate still runs on `director_build`
+    /// (it only READS the tree to verify reality).
+    host_cli: bool,
+    /// The turn's typed [`RoutePlan`] — drives the firmware tier in
+    /// [`compose_firmware`] (HIGH #3 / MEDIUM #6): pure chat carries only the
+    /// identity, a quick edit adds the craft law, a build gets every layer. This
+    /// REPLACES the old `looks_like_work_request` keyword decision on the light
+    /// path, so "固件每路径 + 大脑判档" holds — the brain-router's class sizes the
+    /// firmware, not a hardcoded keyword list.
+    ///
+    /// `Some` on the brain-routed dispatch ([`run_routed_turn`]); `None` on the
+    /// **queued-drain** path ([`fire_agentic`]), which deliberately does NOT
+    /// re-consult the brain — [`run_agentic`] then resolves it to a deterministic
+    /// Tier-0 floor route (the same fail-open floor the router itself falls back
+    /// to), so a drained turn still gets proportional firmware without a second
+    /// base call.
+    route: Option<RoutePlan>,
     /// **UmaDev's own bounded conversation transcript** (Wave 5 / G11) — the
     /// multi-turn dialogue, oldest → newest, INCLUDING the current user turn the
     /// caller just recorded. Threaded into the request so the base sees the
@@ -932,6 +976,27 @@ fn spawn_agentic(
     tokio::spawn(run_agentic(turn, sink, route_tx))
 }
 
+/// A throwaway [`RunOptions`] used ONLY to compute a deterministic Tier-0 floor
+/// route via [`umadev_agent::route`]`(None, …)` on the queued-drain path (where no
+/// brain consult ran). The `None`-session branch of `route` never touches its
+/// `options` argument beyond carrying the workspace, so every field except
+/// `project_root` / `requirement` is a harmless placeholder — this exists purely to
+/// satisfy the function signature without re-consulting the base. Fail-open by
+/// construction: it builds, it never errors.
+fn route_floor_options(project_root: &std::path::Path, requirement: &str) -> RunOptions {
+    RunOptions {
+        project_root: project_root.to_path_buf(),
+        requirement: requirement.to_string(),
+        slug: String::new(),
+        model: String::new(),
+        backend: String::new(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: umadev_agent::TrustMode::Guarded,
+        strict_coverage: false,
+    }
+}
+
 /// The light agentic turn body — the non-spawning core of [`spawn_agentic`].
 ///
 /// Split out so the brain-routed chat dispatcher ([`run_routed_turn`]) can drive a
@@ -952,21 +1017,45 @@ async fn run_agentic(
         fallback_model,
         project_root,
         director_build,
+        host_cli,
+        route,
         conversation,
     } = turn;
     {
         let label = spec.label();
         let model = route_model_for_spec(&spec, fallback_model);
-        // Director-build (`/run`): take the single-writer run-lock for the whole
+        // Resolve the firmware route (HIGH #3 / MEDIUM #6). The brain-routed dispatch
+        // already classified the turn and passes `Some(route)`; the queued-drain path
+        // (`fire_agentic`) passes `None` — it deliberately does NOT re-consult the
+        // brain — so we fall back to the router's OWN deterministic Tier-0 floor here
+        // (`route(None, …)`), which sizes the firmware proportionally without a second
+        // base call. Fail-open by contract: `route(None, …)` never errors and ignores
+        // its `options` on the no-session path, so the throwaway `RunOptions` below is
+        // only a carrier (its non-`requirement`/`project_root` fields are unused).
+        let route = match route {
+            Some(r) => r,
+            None => {
+                umadev_agent::route(None, &route_floor_options(&project_root, &task), &task).await
+            }
+        };
+        // A workspace-mutating director build (`/run` or a chat 'build me X') that is
+        // really driven by a HOST CLI: take the single-writer run-lock for the whole
         // turn so a full product build serializes with any other workspace-mutating
         // run, exactly like the legacy pipeline does (`run_continuous_block` /
         // `run_initial_block` both hold it). The guard lives for the task's scope
         // and drops on return. Fail-open: a lock held by a DIFFERENT live run is an
         // honest terminal abort (the same `ABORT_SENTINEL` the pipeline uses); any
         // other lock IO fails open inside `acquire_for_run` to an un-owned guard, so
-        // a lock bug never blocks a legitimate build. A normal free-text turn takes
-        // NO lock (it's a single serialized chat session, not a parallel writer).
-        let _run_lock = if director_build {
+        // a lock bug never blocks a legitimate build.
+        //
+        // LOW fix (tui-dispatch): the gate is `director_build && host_cli`, NOT
+        // `director_build` alone. A `Build`-class verdict against a NON-host brain
+        // (offline) stays on THIS light streaming path — it writes nothing the lock
+        // protects, so grabbing the workspace lock / isolating a branch was pure
+        // overhead (and could spuriously serialize against a real host run). A
+        // normal free-text turn (chat / explain / quick-edit) takes NO lock either.
+        let lock_and_isolate = director_build && host_cli;
+        let _run_lock = if lock_and_isolate {
             match umadev_agent::run_lock::RunLock::acquire_for_run(&project_root) {
                 Ok(g) => Some(g),
                 Err(e) => {
@@ -981,11 +1070,11 @@ async fn run_agentic(
         } else {
             None
         };
-        // Git-as-trust (Wave 6): a director build mutates the workspace → isolate
-        // onto `umadev/<slug>` + baseline before any write (only for the
-        // workspace-mutating director path; a normal free-text turn takes no lock
-        // and is not isolated). Fail-open; idempotent.
-        if director_build {
+        // Git-as-trust (Wave 6): a HOST director build mutates the workspace →
+        // isolate onto `umadev/<slug>` + baseline before any write (only for the
+        // lock-holding host director path; a normal free-text turn AND a non-host
+        // would-be build take no lock and are not isolated). Fail-open; idempotent.
+        if lock_and_isolate {
             let slug = project_root
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -1017,6 +1106,7 @@ async fn run_agentic(
             &label,
             &project_root,
             director_build,
+            &route,
             &conversation,
             &sink,
             &route_tx,
@@ -1217,182 +1307,27 @@ fn director_source_hardgate(project_root: &std::path::Path, reply: &str) -> Opti
     }
 }
 
-/// Heuristic: does the user's latest message look like a WORK request — asking to
-/// read, inspect, explain, debug, review, change, or BUILD something — rather than
-/// pure conversation (a greeting / opinion / chit-chat)?
+/// The **reality scaffold** for an agentic turn — the part of the system prompt
+/// that is NOT firmware: it UNLOCKS tools (read/edit files, run commands — the
+/// whole point of the agentic path), hands the chat-vs-act judgement to the base
+/// itself, injects the live git state, and hard-constrains the base to verify any
+/// "what did I change" claim against the real disk/git state rather than reciting
+/// unverified session intent.
 ///
-/// Used only to decide whether to surface the team's engineering craft + the
-/// per-turn knowledge digest into the agentic prompt: a work-class turn gets them
-/// (so the base builds to the team's bar with relevant experience on hand), small
-/// talk stays light (identity only, no rules, no knowledge retrieval). The base
-/// still makes the final chat-vs-act call itself — this only gates what REFERENCE
-/// material we pre-load, so a false positive merely adds a little unused context
-/// and a false negative just means the base works without the digest. Bilingual
-/// and deliberately broad; never blocks anything.
-pub(crate) fn looks_like_work_request(text: &str) -> bool {
-    // English intent verbs / nouns (substring match after lowercasing).
-    const EN: &[&str] = &[
-        "build",
-        "create",
-        "make",
-        "add",
-        "implement",
-        "write",
-        "code",
-        "fix",
-        "debug",
-        "refactor",
-        "change",
-        "modify",
-        "update",
-        "edit",
-        "rewrite",
-        "rename",
-        "remove",
-        "delete",
-        "replace",
-        "review",
-        "audit",
-        "inspect",
-        "analyze",
-        "analyse",
-        "explain",
-        "read",
-        "look at",
-        "check",
-        "test",
-        "run",
-        "deploy",
-        "optimize",
-        "optimise",
-        "improve",
-        "design",
-        "generate",
-        "scaffold",
-        "set up",
-        "setup",
-        "configure",
-        "install",
-        "render",
-        "render the",
-        "feature",
-        "component",
-        "endpoint",
-        "api",
-        "bug",
-        "error",
-        "crash",
-        "function",
-        "module",
-        "page",
-    ];
-    // Chinese intent verbs / nouns (no case folding needed).
-    const ZH: &[&str] = &[
-        "做",
-        "建",
-        "创建",
-        "实现",
-        "写",
-        "加",
-        "新增",
-        "增加",
-        "修",
-        "修复",
-        "改",
-        "修改",
-        "更新",
-        "重构",
-        "删",
-        "删除",
-        "移除",
-        "替换",
-        "重命名",
-        "审",
-        "审查",
-        "审核",
-        "review",
-        "分析",
-        "解释",
-        "说明",
-        "读",
-        "看一下",
-        "看看",
-        "查",
-        "检查",
-        "测试",
-        "运行",
-        "跑",
-        "部署",
-        "优化",
-        "改进",
-        "设计",
-        "生成",
-        "搭建",
-        "配置",
-        "安装",
-        "渲染",
-        "功能",
-        "组件",
-        "接口",
-        "页面",
-        "报错",
-        "错误",
-        "崩溃",
-        "函数",
-        "模块",
-        "实现一个",
-        "帮我",
-        "给我",
-    ];
-    let t = text.to_lowercase();
-    if EN.iter().any(|k| t.contains(k)) {
-        return true;
-    }
-    ZH.iter().any(|k| text.contains(k))
-}
-
-/// The reality-anchored system prompt for an agentic turn. It establishes the
-/// TEAM IDENTITY (the brain is UmaDev's senior delivery team — its director —
-/// not a bare base CLI), UNLOCKS tools (read/edit files, run commands — the whole
-/// point of the agentic path) and injects the live git state, then hard-constrains
-/// the base to verify any "what did I change" claim against the real disk/git
-/// state rather than reciting unverified session intent.
+/// **Why this is split from the firmware (HIGH #3 / MEDIUM #6):** the team
+/// IDENTITY + craft/taste + JIT knowledge + pitfall memory + the repo-map slice
+/// now come from [`umadev_agent::compose_firmware`], which sizes them by the
+/// turn's typed [`RoutePlan`] (pure chat = identity only; a quick edit = + craft;
+/// a build = every layer). The light agentic path PREPENDS that route-tiered
+/// firmware, then appends THIS scaffold — so "固件每路径 + 大脑判档" holds without
+/// the old `looks_like_work_request` keyword table deciding firmware richness.
 ///
-/// `status`/`diff_stat` are the live git snapshots (either may be `None`).
-/// `work_class` is the [`looks_like_work_request`] verdict for the user's message:
-/// when `true`, the team's engineering craft (`agentic_engineering_rules`) and the
-/// `knowledge_digest` (relevant curated experience, already retrieved by the
-/// caller) are folded in so the base builds to the team's bar. When `false` (small
-/// talk), neither is injected — the prompt stays the lightweight team-identity +
-/// reality contract, so a greeting never pays for rules or knowledge. All
-/// injections are additive + fail-open: an empty `knowledge_digest` just omits
-/// that section.
-fn agentic_system_prompt(
-    status: Option<&str>,
-    diff_stat: Option<&str>,
-    work_class: bool,
-    knowledge_digest: &str,
-    director_build: bool,
-) -> String {
-    // (1) TEAM IDENTITY — always on (even small talk). Establishes WHO the brain
-    // is: UmaDev's senior delivery team / director with full agency, not a generic
-    // assistant. Reused from the agent crate so the wording lives in one place.
-    //
-    // USB model (`docs/AGENT_WIELDS_BASE_ARCHITECTURE.md`, simplified — no marker
-    // protocol): for an explicit `/run` director-build turn, swap the bare identity
-    // for the FIRMWARE (identity + the team's craft/taste), so the base builds to
-    // this team's bar with the team living inside its own head. It is NOT taught any
-    // lever/marker syntax — UmaDev's QC (honesty floor + optional review) runs on
-    // UmaDev's side after the base builds. A normal free-text turn keeps the lighter
-    // bare identity (the craft block is a full-build concern). The wording lives in
-    // the agent crate (`experts::director_with_team_tools`).
-    let mut p = if director_build {
-        umadev_agent::experts::director_with_team_tools()
-    } else {
-        String::from(umadev_agent::experts::agentic_team_identity())
-    };
-    p.push_str("\n\n");
-    p.push_str(
+/// `status`/`diff_stat` are the live git snapshots (either may be `None`). The
+/// scaffold itself is constant (no work-class branch): the firmware above already
+/// carries (or omits) the craft/knowledge by tier. Fail-open: a missing git state
+/// just renders the "clean" line; never errors.
+fn agentic_reality_scaffold(status: Option<&str>, diff_stat: Option<&str>) -> String {
+    let mut p = String::from(
         "You are running inside the project's working \
          directory with FULL tool access.\n\n\
          DECIDE FOR YOURSELF how to handle the user's latest message — that judgement is \
@@ -1412,22 +1347,6 @@ fn agentic_system_prompt(
          did not just verify it on disk, do not claim it. If you did not actually write \
          a file this turn, say so plainly.\n",
     );
-    // (2) WORK-CLASS CRAFT + KNOWLEDGE — only when the user's message looks like a
-    // work request (build / change / inspect / debug …). Small talk skips both so a
-    // greeting stays light. The engineering craft is the team's own standards/taste
-    // (framed as ability, not a compliance checklist); the knowledge digest is the
-    // team's relevant accumulated experience, already retrieved by the caller. Both
-    // are additive + fail-open (an empty digest just omits its section).
-    if work_class {
-        p.push('\n');
-        p.push_str(umadev_agent::experts::agentic_engineering_rules());
-        p.push('\n');
-        let kd = knowledge_digest.trim_end();
-        if !kd.is_empty() {
-            p.push_str(kd);
-            p.push('\n');
-        }
-    }
     match status {
         Some(s) if !s.trim().is_empty() => {
             p.push_str("\nCurrent `git status --porcelain` (the real, current working tree):\n");
@@ -1556,6 +1475,7 @@ async fn drive_agentic_stream(
     label: &str,
     project_root: &std::path::Path,
     director_build: bool,
+    route: &RoutePlan,
     conversation: &[Message],
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
@@ -1565,28 +1485,31 @@ async fn drive_agentic_stream(
     // diff. Both are `Option` (fail-open: git missing -> None -> guards no-op).
     let before = git_status_porcelain(project_root);
     let diff_stat = git_diff_stat(project_root);
-    // Team-identity injection: always carry the director/team identity; for a
-    // work-class turn (build / change / inspect …) also fold in the team's
-    // engineering craft + a SMALL, requirement-scoped knowledge digest so the base
-    // builds with the team's relevant experience on hand. Small talk stays light
-    // (identity only, no knowledge retrieval). Both gates are fail-open: the work
-    // heuristic is broad-but-harmless, and the digest is empty on any retrieval
-    // miss/disabled/no-knowledge so the turn proceeds unchanged.
-    let work_class = looks_like_work_request(task);
-    // Cap the agentic digest at 4 chunks (tight token budget) — only computed for
-    // work-class turns so a greeting never touches the knowledge index.
-    let knowledge_digest = if work_class {
-        umadev_agent::agentic_knowledge_digest(project_root, task, 4)
+    // Firmware (HIGH #3 / MEDIUM #6): the LIGHT path now injects UmaDev's firmware
+    // through the SAME `compose_firmware` the director-build path uses, sized by
+    // THIS turn's typed route — pure chat carries only the identity, a quick edit
+    // adds the craft law, a build gets every layer (identity + craft + repo-map +
+    // pitfall memory + JIT knowledge). This REPLACES the old
+    // `looks_like_work_request` keyword decision + the ad-hoc `agentic_knowledge_
+    // digest` retrieval, so "固件每路径 + 大脑判档" holds: the brain-router's class
+    // (or a deterministic Tier-0 floor on the queued-drain path) sizes the firmware,
+    // not a hardcoded keyword list. Fail-open: any retrieval failure degrades that
+    // layer to empty (in the limit, just the identity).
+    let firmware = umadev_agent::compose_firmware(project_root, route, task).await;
+    // The reality scaffold (tool-unlock + chat-vs-act judgement + live git state +
+    // the no-recitation contract) is appended AFTER the firmware. For ALL three
+    // bases the light streaming path merges `request.system` into the one prompt
+    // (`merge_prompt`), so prepending the firmware here is the light-path analogue
+    // of how the director path injects it (claude `--append-system-prompt` natively;
+    // codex/opencode front-loaded onto the directive) — the firmware always leads,
+    // the scaffold's reality contract follows. Fail-open: an empty firmware leaves
+    // just the scaffold, exactly the pre-firmware light-path behaviour.
+    let scaffold = agentic_reality_scaffold(before.as_deref(), diff_stat.as_deref());
+    let system = if firmware.trim().is_empty() {
+        scaffold
     } else {
-        String::new()
+        format!("{}\n\n{scaffold}", firmware.trim_end())
     };
-    let system = agentic_system_prompt(
-        before.as_deref(),
-        diff_stat.as_deref(),
-        work_class,
-        &knowledge_digest,
-        director_build,
-    );
 
     // Wave 5 / G11: thread UmaDev's OWN bounded conversation transcript into the
     // request, oldest → newest, so the base sees the multi-turn dialogue from
@@ -1777,6 +1700,11 @@ fn fire_agentic(
             // The queued-drain turn is always light — a fresh message classifies via
             // `run_routed_turn`; a parked one does not re-consult the brain.
             director_build: false,
+            host_cli,
+            // No brain consult on the drain → `route: None`. `run_agentic` resolves
+            // it to a deterministic Tier-0 floor route so the firmware is still sized
+            // proportionally (chat = identity only) without a second base call.
+            route: None,
             conversation,
         },
         sink.clone(),
@@ -1913,6 +1841,12 @@ async fn run_routed_turn(
                 fallback_model,
                 project_root,
                 director_build,
+                host_cli,
+                // The light path injects firmware sized by the brain-router's route
+                // (HIGH #3 / MEDIUM #6) — chat = identity only, quick-edit = + craft,
+                // a non-host would-be build = full. Move the route in (the intent
+                // card above borrowed it).
+                route: Some(route),
                 conversation,
             },
             sink,
@@ -2992,6 +2926,34 @@ mod tests {
         }
     }
 
+    /// A minimal [`RoutePlan`] of a given class for driving [`drive_agentic_stream`]
+    /// / [`AgenticTurn`] in tests — the firmware tier is what these tests exercise on
+    /// the light path (chat = identity only; a work class = + craft). Mirrors the
+    /// agent crate's own `compose_firmware` test route builder.
+    fn test_route(class: umadev_agent::RouteClass) -> RoutePlan {
+        use umadev_agent::{Budget, Depth, RouteClass, Seat, TaskKind};
+        let team = if matches!(class, RouteClass::Build) {
+            vec![Seat::FrontendEngineer, Seat::QaEngineer]
+        } else {
+            Vec::new()
+        };
+        RoutePlan {
+            class,
+            kind: TaskKind::Greenfield,
+            depth: Depth::Fast,
+            team,
+            scope: Vec::new(),
+            needs_clarify: None,
+            est_budget: Budget::for_route(class, Depth::Fast),
+            confidence: 0.6,
+        }
+    }
+
+    /// The light-path chat route (identity-only firmware tier).
+    fn chat_route() -> RoutePlan {
+        test_route(umadev_agent::RouteClass::Chat)
+    }
+
     #[test]
     fn bounded_transcript_drops_the_duplicate_current_turn_and_keeps_order() {
         // The caller records the current user turn into `conversation` BEFORE the
@@ -3125,6 +3087,7 @@ mod tests {
             "claude-code",
             tmp.path(),
             false,
+            &chat_route(),
             &conversation,
             &sink,
             &route_tx,
@@ -3160,6 +3123,7 @@ mod tests {
             "offline",
             tmp.path(),
             false,
+            &chat_route(),
             &[],
             &sink,
             &route_tx,
@@ -3327,6 +3291,7 @@ mod tests {
             "claude-code",
             tmp.path(),
             false,
+            &chat_route(),
             &[],
             &sink,
             &route_tx,
@@ -3481,6 +3446,7 @@ mod tests {
             "claude-code",
             tmp.path(),
             false,
+            &chat_route(),
             &[],
             &sink,
             &route_tx,
@@ -3499,12 +3465,14 @@ mod tests {
     // (these tests use Atomic/streaming concurrency primitives below.)
 
     #[test]
-    fn system_prompt_injects_git_state_and_unlocks_tools() {
-        // The reality-injection prompt must keep tools UNLOCKED — never re-add
-        // the chat-route tool ban — and embed the live git status plus a
-        // no-recitation contract.
+    fn scaffold_injects_git_state_and_unlocks_tools() {
+        // The reality SCAFFOLD (the non-firmware half of the light-path system
+        // prompt) must keep tools UNLOCKED — never re-add the chat-route tool ban —
+        // and embed the live git status plus a no-recitation contract. The firmware
+        // (identity / craft / knowledge) is composed SEPARATELY by `compose_firmware`
+        // and prepended in `drive_agentic_stream`.
         let status = concat!(" M crates/umadev-tui/src/lib.rs\n", "?? new.rs\n");
-        let p = agentic_system_prompt(Some(status), Some("1 file changed"), true, "", false);
+        let p = agentic_reality_scaffold(Some(status), Some("1 file changed"));
         // Tools stay unlocked (the whole point of the agentic path).
         assert!(p.contains("FULL tool access"));
         assert!(p.to_lowercase().contains("edit files"));
@@ -3518,123 +3486,105 @@ mod tests {
     }
 
     #[test]
-    fn agentic_prompt_lets_the_brain_decide_chat_vs_act() {
+    fn scaffold_lets_the_brain_decide_chat_vs_act() {
         // The unified brain-driven path: instead of UmaDev classifying the message
-        // up front, the prompt hands that judgement to the base — reply to small
+        // up front, the scaffold hands that judgement to the base — reply to small
         // talk without tools, do the work when it needs tools. This is what makes
         // a greeting not waste tool calls and a real task actually get done.
-        let p = agentic_system_prompt(None, None, false, "", false);
+        let p = agentic_reality_scaffold(None, None);
         let lower = p.to_lowercase();
         assert!(lower.contains("decide for yourself"));
         // It must cover BOTH arms: just reply to conversation, and do the work.
         assert!(lower.contains("just talking") || lower.contains("simply reply"));
         assert!(lower.contains("do not use tools") || lower.contains("small talk"));
         assert!(lower.contains("actually do it") || lower.contains("do the work"));
-    }
-
-    #[test]
-    fn agentic_prompt_carries_team_identity_in_both_classes() {
-        // The default agentic path is no longer a bare base CLI: even small talk
-        // opens with UmaDev's senior delivery-team / director identity, so the base
-        // works AS the team, not a generic assistant. Identity is always-on.
-        let chat = agentic_system_prompt(None, None, false, "", false);
-        let work = agentic_system_prompt(None, None, true, "", false);
-        for p in [&chat, &work] {
-            let lower = p.to_lowercase();
-            assert!(lower.contains("umadev"), "identity names the product");
-            assert!(
-                lower.contains("director") && lower.contains("team"),
-                "identity is the director leading a team"
-            );
-        }
-    }
-
-    #[test]
-    fn director_build_prompt_carries_the_firmware_not_a_lever_protocol() {
-        // USB model (no marker protocol): an explicit `/run` director-build turn
-        // carries the FIRMWARE — the team identity PLUS the team's craft/taste — so
-        // the base builds to this team's bar with the team inside its own head. It is
-        // taught NO marker / lever scheduling syntax.
-        let build = agentic_system_prompt(None, None, true, "", true);
-        let lower = build.to_lowercase();
-        // The identity is still there.
-        assert!(lower.contains("umadev") && lower.contains("director"));
-        // The craft block (anti-slop: no emoji icons, a real icon library, tokens).
-        assert!(build.contains("emoji"));
-        assert!(build.contains("Lucide") || build.contains("icon library"));
-        assert!(lower.contains("token"));
-        // The base is taught NO marker/lever syntax — the whole point of the
-        // simplification (the QC levers live on UmaDev's side, in director_loop).
+        // The scaffold itself carries NO firmware identity/craft — that is now the
+        // job of `compose_firmware` (route-tiered), prepended separately. The
+        // scaffold stays constant across classes (no work-class branch).
         assert!(
-            !build.contains("<<<umadev:"),
-            "no marker syntax is taught to the base"
+            !lower.contains("anti-ai-slop") && !p.contains("Lucide"),
+            "the scaffold is the reality contract only — no firmware craft block"
         );
     }
 
-    #[test]
-    fn agentic_prompt_injects_team_craft_only_for_work_class() {
-        // A work-class turn carries the team's engineering craft (anti-AI-slop:
-        // no emoji icons, design tokens, the AI-default look it avoids). Small talk
-        // does NOT — a greeting must stay light, no rules dumped on it.
-        let work = agentic_system_prompt(None, None, true, "", false);
-        let work_lower = work.to_lowercase();
-        assert!(
-            work_lower.contains("emoji"),
-            "work-class carries the icon rule"
-        );
-        assert!(
-            work_lower.contains("design token") || work_lower.contains("tokens"),
-            "work-class carries token discipline"
-        );
+    /// Drive the light path against a [`CapturingSpy`] and return the assembled
+    /// `system` prompt the base would have received (firmware + scaffold).
+    async fn captured_system_for_route(route: &RoutePlan, task: &str) -> String {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let spy = CapturingSpy {
+            seen: Arc::clone(&seen),
+        };
+        let (sink, _rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let tmp = tempfile::TempDir::new().unwrap();
+        drive_agentic_stream(
+            &spy,
+            task,
+            "m",
+            "claude-code",
+            tmp.path(),
+            matches!(route.class, umadev_agent::RouteClass::Build),
+            route,
+            &[],
+            &sink,
+            &route_tx,
+        )
+        .await;
+        let req = seen.lock().unwrap().take().expect("request captured");
+        req.system.unwrap_or_default()
+    }
 
-        let chat = agentic_system_prompt(None, None, false, "", false);
+    #[tokio::test]
+    async fn light_path_firmware_is_route_tiered_via_compose_firmware() {
+        // HIGH #3 / MEDIUM #6: the LIGHT path now injects firmware through
+        // `compose_firmware`, sized by the turn's route — NOT a keyword table.
+        //
+        // (1) A pure CHAT turn carries ONLY the always-on identity: no craft / no
+        //     anti-slop / no knowledge — a greeting stays light.
+        let chat = captured_system_for_route(&chat_route(), "你好").await;
         let chat_lower = chat.to_lowercase();
+        assert!(chat_lower.contains("umadev"), "identity is always-on");
         assert!(
-            !chat_lower.contains("emoji") && !chat_lower.contains("design token"),
-            "small talk must NOT carry the engineering craft block"
+            !chat.contains("emoji") && !chat.contains("Lucide"),
+            "a chat turn must NOT carry the engineering craft block (identity only)"
         );
+        // The reality scaffold is still appended on every light turn.
+        assert!(chat.contains("FULL tool access"));
+        assert!(chat.contains("REALITY CONTRACT"));
+
+        // (2) A BUILD-class turn (a non-host would-be build on the light path) gets
+        //     the FULL firmware: identity + the team's craft/anti-slop.
+        let build =
+            captured_system_for_route(&test_route(umadev_agent::RouteClass::Build), "做一个登录页")
+                .await;
+        let build_lower = build.to_lowercase();
+        assert!(build_lower.contains("umadev"));
+        assert!(
+            build.contains("emoji") && (build.contains("Lucide") || build.contains("icon library")),
+            "a build turn carries the team's craft (anti-AI-slop) firmware"
+        );
+        // No marker/lever syntax is ever taught to the base (USB model).
+        assert!(!build.contains("<<<umadev:"));
     }
 
-    #[test]
-    fn agentic_prompt_injects_knowledge_only_when_work_class_and_present() {
-        // The retrieved knowledge digest is folded in for a work-class turn; an
-        // empty digest just omits the section (fail-open), and a chat-class turn
-        // never carries it even if a digest is somehow passed.
-        let digest = "\n\nYOUR TEAM'S EXPERIENCE ON THIS:\n\n- `layering.md` — Layers: keep \
-                      controllers thin.\n";
-        let work = agentic_system_prompt(None, None, true, digest, false);
+    #[tokio::test]
+    async fn light_path_quick_edit_carries_craft_but_chat_does_not() {
+        // A QuickEdit (a small work turn) sits between chat and build: it carries the
+        // craft law (so a small edit still respects the visual + engineering moat)
+        // but pays for no full build ceremony. Pure chat carries neither.
+        let edit =
+            captured_system_for_route(&test_route(umadev_agent::RouteClass::QuickEdit), "改个文案")
+                .await;
         assert!(
-            work.contains("layering.md"),
-            "work-class folds in the digest"
+            edit.contains("emoji"),
+            "a quick edit carries the compact craft law"
         );
-
-        // Empty digest -> no knowledge section, but the turn still builds.
-        let work_empty = agentic_system_prompt(None, None, true, "", false);
-        assert!(!work_empty.contains("YOUR TEAM'S EXPERIENCE"));
-
-        // Chat-class never carries knowledge, even if one is handed in.
-        let chat = agentic_system_prompt(None, None, false, digest, false);
-        assert!(!chat.contains("layering.md"), "small talk omits knowledge");
-    }
-
-    #[test]
-    fn work_request_heuristic_separates_work_from_chat() {
-        // Work-class intents (EN + ZH) are detected so craft + knowledge get
-        // surfaced.
-        for s in [
-            "build me a login page",
-            "fix the crash in the parser",
-            "review this diff",
-            "帮我做一个登录系统",
-            "修复这个报错",
-            "看看 src/lib.rs",
-        ] {
-            assert!(looks_like_work_request(s), "should be work-class: {s}");
-        }
-        // Pure conversation stays chat-class (no knowledge retrieval, no rules).
-        for s in ["你好", "hi there", "thanks!", "what's your name", "哈哈"] {
-            assert!(!looks_like_work_request(s), "should be chat-class: {s}");
-        }
+        let chat = captured_system_for_route(&chat_route(), "谢谢").await;
+        assert!(
+            !chat.contains("emoji"),
+            "pure chat must NOT carry the craft law"
+        );
     }
 
     #[test]
@@ -3779,6 +3729,7 @@ mod tests {
             "claude-code",
             &path,
             false,
+            &chat_route(),
             &[],
             &sink,
             &route_tx,
@@ -3820,6 +3771,7 @@ mod tests {
             "claude-code",
             &path,
             false,
+            &chat_route(),
             &[],
             &sink,
             &route_tx,
@@ -3861,6 +3813,7 @@ mod tests {
             "claude-code",
             &path,
             false,
+            &chat_route(),
             &[],
             &sink,
             &route_tx,
@@ -3900,6 +3853,7 @@ mod tests {
             "claude-code",
             &path,
             false,
+            &chat_route(),
             &[],
             &sink,
             &route_tx,
@@ -4000,6 +3954,7 @@ mod tests {
             "claude-code",
             &path,
             true, // director_build
+            &test_route(umadev_agent::RouteClass::Build),
             &[],
             &sink,
             &route_tx,
@@ -4373,6 +4328,125 @@ mod tests {
         assert!(
             holder.lock().await.is_none(),
             "no session parked after a failed start"
+        );
+    }
+
+    /// MEDIUM #7: a director build STARTED from the chat TUI must write the same
+    /// `WorkflowState` baseline the CLI's `AgentRunner::start` does, so `umadev
+    /// status` / `umadev continue` can see + resume a build kicked off in the TUI.
+    /// The baseline is written BEFORE the base session opens, so even a turn whose
+    /// session can't start (an unknown backend → deterministic `session_for` error,
+    /// hermetic on any machine) still leaves the baseline on disk.
+    #[tokio::test]
+    async fn tui_director_build_writes_workflow_state_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, _rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let options = RunOptions {
+            project_root: tmp.path().to_path_buf(),
+            requirement: "build a kanban board".into(),
+            slug: "kanban".into(),
+            model: String::new(),
+            backend: "nonexistent-backend".into(),
+            design_system: String::new(),
+            seed_template: String::new(),
+            mode: umadev_agent::TrustMode::Guarded,
+            strict_coverage: false,
+        };
+
+        // Drive the director loop body directly (no spawn): the session start fails
+        // open AFTER the baseline write, so the loop returns cleanly.
+        run_director_loop(options, sink, route_tx, false, Vec::new(), None).await;
+
+        // The baseline is on disk and carries the run's identity — exactly what the
+        // CLI surfaces read.
+        let state =
+            umadev_agent::read_workflow_state(tmp.path()).expect("TUI build wrote a baseline");
+        assert_eq!(state.slug, "kanban");
+        assert_eq!(state.requirement, "build a kanban board");
+        assert_eq!(state.backend, "nonexistent-backend");
+        // It is a fresh run baseline (phase research, no open gate).
+        assert_eq!(state.phase, umadev_spec::Phase::Research.id());
+        assert!(state.active_gate.is_empty());
+    }
+
+    /// Drive a light agentic turn (`run_agentic`) against the OFFLINE brain in `root`
+    /// with a `Build`-class verdict, toggling `host_cli`, and report whether a
+    /// `trust.branch_isolated` note was emitted — the observable proxy for "did this
+    /// turn take the run-lock + isolate the branch".
+    async fn build_turn_isolated(root: &std::path::Path, host_cli: bool) -> bool {
+        let (sink, mut rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        run_agentic(
+            AgenticTurn {
+                task: "build me a dashboard".into(),
+                spec: BrainSpec::Offline,
+                continue_session: false,
+                session_id: None,
+                fallback_model: "offline".into(),
+                project_root: root.to_path_buf(),
+                director_build: true,
+                host_cli,
+                route: Some(test_route(umadev_agent::RouteClass::Build)),
+                conversation: Vec::new(),
+            },
+            sink,
+            route_tx,
+        )
+        .await;
+        // The isolation note (any locale) embeds the derived `umadev/<slug>` branch
+        // name — a stable, locale-independent observable for "this turn isolated".
+        let mut isolated = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.contains("umadev/") {
+                    isolated = true;
+                }
+            }
+        }
+        isolated
+    }
+
+    /// LOW fix (tui-dispatch): a `Build`-class verdict against a NON-host brain
+    /// stays on the light streaming path and must NOT take the run-lock or isolate a
+    /// branch — only a real HOST director build (which actually mutates the
+    /// workspace under the lock) does. We assert the gate by observing the
+    /// `trust.branch_isolated` note: present for a HOST build, absent for a non-host
+    /// one, against the SAME committed git repo.
+    #[tokio::test]
+    async fn non_host_build_does_not_lock_or_isolate_on_the_light_path() {
+        // A committed git repo on a normal branch — the only setup that would let
+        // `setup_run_isolation` create+switch to an isolation branch.
+        let tmp = init_git_repo();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(tmp.path())
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        std::fs::write(tmp.path().join("seed.txt"), "seed").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "seed"]);
+
+        // (1) Non-host build → NO isolation note (no lock, no branch isolation).
+        let isolated_non_host = build_turn_isolated(tmp.path(), false).await;
+        assert!(
+            !isolated_non_host,
+            "a non-host would-be build must NOT isolate / lock on the light path"
+        );
+
+        // (2) The SAME setup but driven as a HOST build DOES isolate — proving the
+        // observable is real and the gate, not the environment, is what differs.
+        // (Re-clean the tree: the non-host turn wrote nothing, so the repo is still
+        // clean on the default branch.)
+        let isolated_host = build_turn_isolated(tmp.path(), true).await;
+        assert!(
+            isolated_host,
+            "a HOST director build isolates onto umadev/<slug> as before"
         );
     }
 }
