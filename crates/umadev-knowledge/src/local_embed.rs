@@ -34,10 +34,22 @@ pub fn is_available() -> bool {
 }
 
 fn model_dir() -> Option<PathBuf> {
-    let d = std::env::var(ENV_MODEL_DIR)
+    // 1. Explicit override — set by the npm `bin/cli.js` wrapper to the bundled
+    //    `@umacloud/model-e5-small` package path under `node_modules`.
+    if let Some(d) = std::env::var(ENV_MODEL_DIR).ok().filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(d);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    // 2. Conventional local location, auto-discovered with ZERO config: drop the
+    //    three model files under `~/.umadev/embed-model` and the pure-Rust local
+    //    vector track turns on — no env, no key, no network.
+    let home = std::env::var("HOME")
         .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
         .filter(|s| !s.is_empty())?;
-    let p = PathBuf::from(d);
+    let p = PathBuf::from(home).join(".umadev").join("embed-model");
     p.is_dir().then_some(p)
 }
 
