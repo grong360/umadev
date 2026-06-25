@@ -1106,6 +1106,11 @@ pub struct App {
     /// immediately. Cleared on any other keypress.
     pub pending_quit_confirm: bool,
 
+    /// First-Esc-to-arm, second-Esc-to-interrupt while a run is in flight, so a
+    /// stray keypress can't nuke a long build. Set on the first Esc; a second Esc
+    /// within a short window actually cancels. `None` = not armed.
+    pub interrupt_armed_at: Option<std::time::Instant>,
+
     /// One-line status shown in the top bar.
     pub status: String,
     /// Spinner animation tick.
@@ -1329,6 +1334,7 @@ impl App {
             preview_server: std::sync::Arc::new(std::sync::Mutex::new(None)),
             project_root,
             pending_quit_confirm: false,
+            interrupt_armed_at: None,
             status: String::new(),
             tick: 0,
             animations: animations_enabled_default(),
@@ -1940,6 +1946,15 @@ impl App {
     #[must_use]
     pub fn is_pipeline_active(&self) -> bool {
         self.run_started && !self.finished && !self.aborted
+    }
+
+    /// `true` when the interrupt is ARMED (a first Esc landed recently) — a second
+    /// Esc within the window cancels the run. The window auto-expires so a stray
+    /// single Esc just shows the hint briefly and is forgotten.
+    #[must_use]
+    pub fn interrupt_armed(&self) -> bool {
+        self.interrupt_armed_at
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(3))
     }
 
     /// Mark the current block as **aborted**: it ended with an error before
@@ -3416,19 +3431,18 @@ impl App {
         match key {
             // ---- exit handling ----
             KeyCode::Esc => {
-                // Running → Esc INTERRUPTS the pipeline (like Claude Code); it
-                // does NOT quit the app. The event loop aborts the in-flight
-                // task and `cancel_run` resets back to a clean prompt.
-                if self.is_pipeline_active() {
-                    return Action::Cancel;
-                }
-                // An agentic execution turn (routed, not a pipeline run) is
-                // streaming in a real base subprocess. Esc must INTERRUPT it (not
-                // quit the app) — same as Ctrl-C's `agentic_in_flight` branch, so
-                // the subprocess is actually aborted via `Action::Cancel` rather
-                // than left running behind a dropped TUI.
-                if self.agentic_in_flight {
-                    return Action::Cancel;
+                // Running → Esc INTERRUPTS (like Claude Code), but require a
+                // DELIBERATE double-press so a stray keypress can't nuke a long
+                // build: the first Esc ARMS (the indicator shows "再按 Esc 中断"),
+                // a second Esc within the window actually cancels. It never quits
+                // the app while a run is in flight.
+                if self.is_pipeline_active() || self.agentic_in_flight {
+                    if self.interrupt_armed() {
+                        self.interrupt_armed_at = None;
+                        return Action::Cancel;
+                    }
+                    self.interrupt_armed_at = Some(std::time::Instant::now());
+                    return Action::None;
                 }
                 // Idle → require a SECOND Esc to actually quit, so a stray
                 // keypress (or the very Esc that just interrupted a run) can't
@@ -9571,10 +9585,13 @@ mod tests {
             requirement: "build".into(),
         });
         assert!(a.is_pipeline_active());
-        // Esc INTERRUPTS the running pipeline (like Claude Code) — a single
-        // press, and it does NOT quit the app.
-        let action = a.apply_key(KeyCode::Esc);
-        assert_eq!(action, Action::Cancel);
+        // Esc INTERRUPTS the running pipeline (like Claude Code), but a DELIBERATE
+        // double-press — the first arms, the second cancels — so a stray keypress
+        // can't nuke a long build. Neither press quits the app.
+        assert_eq!(a.apply_key(KeyCode::Esc), Action::None);
+        assert!(a.interrupt_armed(), "first Esc arms the interrupt");
+        assert!(!a.should_quit);
+        assert_eq!(a.apply_key(KeyCode::Esc), Action::Cancel);
         assert!(!a.should_quit);
     }
 
@@ -9709,10 +9726,11 @@ mod tests {
         // can interrupt it is the `agentic_in_flight` branch.
         a.agentic_in_flight = true;
         assert!(!a.is_pipeline_active());
-        // Esc INTERRUPTS the agentic subprocess (parity with Ctrl-C) and does NOT
-        // arm quit-confirm or drop the app.
-        let action = a.apply_key(KeyCode::Esc);
-        assert_eq!(action, Action::Cancel);
+        // Esc INTERRUPTS the agentic subprocess (parity with Ctrl-C) via a
+        // deliberate double-press, and does NOT arm quit-confirm or drop the app.
+        assert_eq!(a.apply_key(KeyCode::Esc), Action::None);
+        assert!(a.interrupt_armed(), "first Esc arms the interrupt");
+        assert_eq!(a.apply_key(KeyCode::Esc), Action::Cancel);
         assert!(!a.should_quit);
         assert!(
             !a.pending_quit_confirm,

@@ -43,6 +43,7 @@
 "status.aborted" = "this round was aborted"
 "status.thinking" = "thinking…"
 "status.esc_cancel" = "esc to cancel"
+"status.esc_confirm" = "esc again to interrupt"
 "mode.auto_chip" = "auto-approve (shift+Tab for manual)"
 "mode.manual_chip" = "manual review (shift+Tab for auto)"
 "mode.plan_chip" = "plan · read-only (/mode to switch)"

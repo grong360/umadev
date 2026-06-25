@@ -3269,12 +3269,15 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // visibly "works" instead of looking frozen.
     if app.thinking {
         let secs = app.thinking_elapsed_secs();
-        let elapsed = if secs > 0 {
-            format!(
-                "  ({}s · {})",
-                secs,
-                umadev_i18n::t(app.lang, "status.esc_cancel")
-            )
+        // First Esc ARMS the interrupt → the hint flips to "press Esc again to
+        // interrupt" so a stray single Esc can't cancel a long run.
+        let esc_hint = if app.interrupt_armed() {
+            umadev_i18n::t(app.lang, "status.esc_confirm")
+        } else {
+            umadev_i18n::t(app.lang, "status.esc_cancel")
+        };
+        let elapsed = if secs > 0 || app.interrupt_armed() {
+            format!("  ({secs}s · {esc_hint})")
         } else {
             String::new()
         };
@@ -4206,12 +4209,14 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
         // letting it pile up in the transcript. The spinner + phase timer in
         // `app.status` still prove motion; this just makes the wait explicit and
         // reminds the user the long phase is interruptible (ESC).
+        let esc_hint = if app.interrupt_armed() {
+            umadev_i18n::t(app.lang, "status.esc_confirm")
+        } else {
+            umadev_i18n::t(app.lang, "status.esc_cancel")
+        };
         match &app.transient_status {
-            Some(beat) => format!(
-                "{} · {beat} · {}",
-                app.status,
-                umadev_i18n::t(app.lang, "status.esc_cancel")
-            ),
+            Some(beat) => format!("{} · {beat} · {esc_hint}", app.status),
+            None if app.interrupt_armed() => format!("{} · {esc_hint}", app.status),
             None => app.status.clone(),
         }
     } else if app.finished {

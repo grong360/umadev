@@ -43,6 +43,7 @@
 "status.aborted" = "本轮已中止"
 "status.thinking" = "正在思考…"
 "status.esc_cancel" = "esc 取消"
+"status.esc_confirm" = "再按 esc 中断"
 "mode.auto_chip" = "自动过门 (shift+Tab 转手动)"
 "mode.manual_chip" = "手动审核 (shift+Tab 转自动)"
 "mode.plan_chip" = "计划模式·只读 (/mode 切换)"
