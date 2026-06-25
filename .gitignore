@@ -52,3 +52,19 @@ umadev-website/out/
 .env.*.local
 *.pem
 *.key
+
+# AI coding-tool config files — internal, not for public display (kept locally)
+CLAUDE.md
+AGENTS.md
+.claude/CLAUDE.md
+
+# Internal development-process docs — kept locally, not published
+/docs/AGENT_WIELDS_BASE_ARCHITECTURE.md
+/docs/CONTINUOUS_SESSION_ARCHITECTURE.md
+/docs/SELF_LEARNING_PITFALL_KB.md
+/docs/TOP_TIER_DESIGN.md
+/docs/plans/
+# Untracked dev scratch (never publish)
+/UMADEV.md
+/super_dev/
+/.playwright-mcp/
