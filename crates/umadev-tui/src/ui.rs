@@ -549,6 +549,40 @@ impl InlineBuilder {
         ));
     }
 
+    /// Push prose text, turning any bare `http(s)://…` run into a Link-roled span
+    /// so a raw URL the model emits reads as a (copyable) link, not flat text.
+    /// Trailing sentence punctuation is left outside the URL.
+    fn push_prose_text(&mut self, text: &str) {
+        let mut rest = text;
+        while let Some(pos) = rest.find("http") {
+            let from = &rest[pos..];
+            if from.starts_with("http://") || from.starts_with("https://") {
+                if pos > 0 {
+                    self.push_text(&rest[..pos], None);
+                }
+                let end = from.find(char::is_whitespace).unwrap_or(from.len());
+                let raw = &from[..end];
+                let url = raw.trim_end_matches(|c| {
+                    matches!(
+                        c,
+                        '.' | ',' | ')' | ']' | '}' | '!' | '?' | ';' | ':' | '"' | '\''
+                    )
+                });
+                let url = if url.is_empty() { raw } else { url };
+                self.push_text(url, Some(SynRole::Link));
+                rest = &from[url.len()..];
+            } else {
+                // "http" not followed by a real scheme — emit through it and go on.
+                let cut = pos + 4;
+                self.push_text(&rest[..cut], None);
+                rest = &rest[cut..];
+            }
+        }
+        if !rest.is_empty() {
+            self.push_text(rest, None);
+        }
+    }
+
     fn take(&mut self) -> Vec<Span<'static>> {
         std::mem::take(&mut self.spans)
     }
@@ -1286,8 +1320,13 @@ fn markdown_compile(text: &str) -> Vec<Line<'static>> {
                         SynRole::Heading,
                         heading_modifier(level),
                     ));
-                } else {
+                } else if state.link.is_some() {
+                    // Inside an explicit [text](url) — keep the link's own styling,
+                    // don't re-autolink its visible text.
                     state.inline.push_text(&t, None);
+                } else {
+                    // Prose: bare http(s) URLs become Link-roled spans.
+                    state.inline.push_prose_text(&t);
                 }
             }
             Event::Code(t) => {
@@ -3603,6 +3642,27 @@ fn prefold_line(
 /// bubble instead of a tint that stops at the text and leaves a ragged right
 /// edge. CJK-safe: padding is measured by display columns. Fail-open: `None`
 /// pads nothing and behaves exactly like the old fold.
+/// Append a styled char run onto `cur`, coalescing equal-style chars into one
+/// `Span` so the word-wrap fold doesn't emit one Span per character.
+fn emit_run(cur: &mut Vec<Span<'static>>, run: &[(char, Style)]) {
+    let Some(&(_, mut st)) = run.first() else {
+        return;
+    };
+    let mut buf = String::new();
+    for &(c, s) in run {
+        if s != st {
+            if !buf.is_empty() {
+                cur.push(Span::styled(std::mem::take(&mut buf), st));
+            }
+            st = s;
+        }
+        buf.push(c);
+    }
+    if !buf.is_empty() {
+        cur.push(Span::styled(buf, st));
+    }
+}
+
 fn prefold_line_filled(
     line: &Line<'static>,
     width: usize,
@@ -3659,27 +3719,67 @@ fn prefold_line_filled(
         }};
     }
 
+    // Flatten to (char, style) so we can wrap at WORD boundaries (a space, or
+    // either side of a wide/CJK char) instead of mid-word. A run of narrow,
+    // non-space chars is one unbreakable "word"; a space or a wide char is its own
+    // unit. An over-wide word (or a CJK run) still hard-breaks char-by-char, so a
+    // single long token can never overflow. Per-char style is preserved.
+    let mut chars: Vec<(char, Style)> = Vec::new();
     for span in &line.spans {
-        let style = span.style;
-        let clean = strip_control_chars(span.content.as_ref());
-        // Build the current span's text char-by-char so a wide glyph never
-        // straddles the fold. Accumulate into a buffer flushed whenever we wrap.
-        let mut buf = String::new();
-        for ch in clean.chars() {
-            let cw = char_width(ch);
-            if col + cw > w && col > (if started_continuation { hang } else { 0 }) {
-                // This row is full — commit the buffered text for THIS span,
-                // then start a new visual row.
-                if !buf.is_empty() {
-                    cur.push(Span::styled(std::mem::take(&mut buf), style));
+        let st = span.style;
+        for ch in strip_control_chars(span.content.as_ref()).chars() {
+            chars.push((ch, st));
+        }
+    }
+    let row_floor = |started: bool| if started { hang } else { 0 };
+    let usable_word = w.saturating_sub(hang).max(1);
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (ch, st) = chars[i];
+        if ch != ' ' && char_width(ch) == 1 {
+            // Gather a word: a run of narrow, non-space chars.
+            let start = i;
+            while i < chars.len() && chars[i].0 != ' ' && char_width(chars[i].0) == 1 {
+                i += 1;
+            }
+            let word = &chars[start..i];
+            let ww = word.len(); // all narrow → 1 col each
+            if col + ww <= w {
+                emit_run(&mut cur, word);
+                col += ww;
+            } else if ww <= usable_word && col > row_floor(started_continuation) {
+                // The whole word fits on a fresh row — wrap before it (no mid-word).
+                flush_row!();
+                emit_run(&mut cur, word);
+                col += ww;
+            } else {
+                // Over-wide word — hard-break char by char (the only safe option).
+                for &(c2, s2) in word {
+                    if col + 1 > w && col > row_floor(started_continuation) {
+                        flush_row!();
+                    }
+                    cur.push(Span::styled(c2.to_string(), s2));
+                    col += 1;
                 }
+            }
+        } else if ch == ' ' {
+            // A space: drop it when it would lead a freshly-wrapped row, else place.
+            if col + 1 > w && col > row_floor(started_continuation) {
+                flush_row!();
+            } else if !(started_continuation && col == hang) {
+                cur.push(Span::styled(" ".to_string(), st));
+                col += 1;
+            }
+            i += 1;
+        } else {
+            // A wide / CJK char — break before it if the row is full, then place.
+            let cw = char_width(ch);
+            if col + cw > w && col > row_floor(started_continuation) {
                 flush_row!();
             }
-            buf.push(ch);
+            cur.push(Span::styled(ch.to_string(), st));
             col += cw;
-        }
-        if !buf.is_empty() {
-            cur.push(Span::styled(buf, style));
+            i += 1;
         }
     }
     push_padded(&mut out, cur, col);
@@ -5766,6 +5866,47 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(back, "正在思考问题");
+    }
+
+    #[test]
+    fn prefold_wraps_at_word_boundaries_not_mid_word() {
+        // At width 12, "hello world foobar" must break between words, never inside
+        // one — each visual row is a sequence of whole words.
+        let line = Line::from(Span::raw("hello world foobar".to_string()));
+        let rows = prefold_line(&line, 12, 0, None);
+        let words = ["hello", "world", "foobar"];
+        for r in &rows {
+            assert!(line_width(r) <= 12, "row fits width 12");
+            let joined: String = r.spans.iter().map(|s| s.content.as_ref()).collect();
+            for tok in joined.split_whitespace() {
+                assert!(
+                    words.contains(&tok),
+                    "every token on a row is a WHOLE word (no mid-word split): {tok:?} in {joined:?}"
+                );
+            }
+        }
+        // Round-trips to the original words in order.
+        let back: String = rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(back, "hello world foobar");
+    }
+
+    #[test]
+    fn prefold_hard_breaks_a_word_longer_than_the_width() {
+        // A single token wider than the row still has to break (char-by-char) so it
+        // can never overflow.
+        let line = Line::from(Span::raw("supercalifragilistic".to_string())); // 20 chars
+        let rows = prefold_line(&line, 8, 0, None);
+        assert!(rows.len() >= 3, "a 20-char word at width 8 spans multiple rows");
+        for r in &rows {
+            assert!(line_width(r) <= 8, "no row overflows even mid-word");
+        }
     }
 
     #[test]
