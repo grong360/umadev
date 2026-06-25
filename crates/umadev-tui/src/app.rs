@@ -3050,77 +3050,64 @@ impl App {
                 self.mark_output();
                 match event {
                     umadev_runtime::StreamEvent::Text { delta } => {
+                        // A long reply is NEVER truncated. CJK hits any byte budget
+                        // in a few sentences (3 bytes/char), so instead of a `…` cap
+                        // we roll the live segment over into a FRESH Host message past
+                        // a soft threshold — natural segmentation that keeps the whole
+                        // reply visible and the transcript pre-folding each segment.
+                        const SEGMENT_BYTES: usize = 4000;
+                        // Hard ceiling: never let one segment grow past this even
+                        // mid-fence, so a runaway un-closed ``` can't make a segment
+                        // unbounded (the markdown renderer's fail-open still applies).
+                        const SEGMENT_BYTES_MAX: usize = 24_000;
                         self.stream_tool_batch = None;
-                        if !delta.trim().is_empty() {
-                            // **Typewriter effect**: if the previous event was
-                            // also text and the last chat message is from Host,
-                            // append this delta to it instead of pushing a new
-                            // line. This gives a ChatGPT-like streaming feel.
-                            //
-                            // A long reply is NEVER truncated. CJK hits any byte
-                            // budget in a few sentences (3 bytes/char), and the
-                            // old `…` cap silently swallowed the rest of the
-                            // answer. Instead, when the current streamed segment
-                            // grows past a soft threshold we roll over into a
-                            // FRESH Host message — natural segmentation — so the
-                            // whole reply stays visible and the transcript keeps
-                            // pre-folding each segment correctly.
-                            const SEGMENT_BYTES: usize = 4000;
-                            // Hard ceiling: never let a single segment grow past
-                            // this even mid-fence, so a runaway un-closed ``` can't
-                            // make one segment unbounded (the markdown renderer's
-                            // fail-open still applies). Comfortably above the soft
-                            // cap to span any realistic single code block.
-                            const SEGMENT_BYTES_MAX: usize = 24_000;
-                            // P5c: real content ends the reasoning block → collapse
-                            // its live placeholder to a `思考 · 4.2s` summary line.
-                            self.collapse_thinking_block();
-                            // Decide WHERE the delta goes without holding a
-                            // mutable borrow across a `self.push` (which also
-                            // borrows `self.history`): append to the live Host
-                            // segment if it still has room, else roll over to a
-                            // new segment. Returns whether we appended in place.
-                            //
-                            // Fence-safe rollover: a naive `len < 4000` cut could
-                            // land INSIDE a ```code fence```, splitting it across
-                            // two Host segments — and each segment renders markdown
-                            // independently, so the opening ``` is in segment A and
-                            // the closing ``` in segment B, scrambling BOTH. So we
-                            // only roll over at the soft cap when the live segment
-                            // has no open fence; inside a fence we keep appending
-                            // (up to the hard ceiling) until the fence closes.
-                            let append_in_place = self.stream_text_active
-                                && self.history.back().is_some_and(|m| {
-                                    if m.role != ChatRole::Host {
-                                        return false;
-                                    }
-                                    // A live Host *text* segment only — a tool
-                                    // row never absorbs streamed prose.
-                                    let MessageBody::Text(body) = &m.kind else {
-                                        return false;
-                                    };
-                                    if body.len() >= SEGMENT_BYTES_MAX {
-                                        return false;
-                                    }
-                                    body.len() < SEGMENT_BYTES || has_open_code_fence(body)
-                                });
-                            if append_in_place {
-                                if let Some(last) =
-                                    self.history.back_mut().and_then(ChatMessage::text_mut)
-                                {
-                                    last.push_str(&delta);
+                        // Decide WHERE the delta goes WITHOUT holding a mutable borrow
+                        // across `self.push`: append to the live Host segment if it
+                        // still has room, else roll over to a new one. Fence-safe: a
+                        // naive `len < 4000` cut could split a ```fence``` across two
+                        // independently-rendered segments (opening ``` in A, closing
+                        // in B → both scramble), so we only roll over at the soft cap
+                        // when there is no open fence; inside one we keep appending
+                        // (up to the hard ceiling) until it closes.
+                        let append_in_place = self.stream_text_active
+                            && self.history.back().is_some_and(|m| {
+                                if m.role != ChatRole::Host {
+                                    return false;
                                 }
-                            } else {
-                                // Either a fresh stream, or a rollover because the
-                                // current segment is full — start a new Host bubble
-                                // so the long reply continues, never truncated.
-                                // P5a: a fresh segment is a fresh body — drop the
-                                // stable-prefix cache so it never reuses the prior
-                                // segment's render against the new (smaller) body.
-                                self.reset_stream_md_cache();
-                                self.push(ChatRole::Host, delta);
-                                self.stream_text_active = true;
+                                // A live Host *text* segment only — a tool row never
+                                // absorbs streamed prose.
+                                let MessageBody::Text(body) = &m.kind else {
+                                    return false;
+                                };
+                                if body.len() >= SEGMENT_BYTES_MAX {
+                                    return false;
+                                }
+                                body.len() < SEGMENT_BYTES || has_open_code_fence(body)
+                            });
+                        if append_in_place {
+                            // **Append VERBATIM** — preserve whitespace. The base now
+                            // streams raw token deltas (`--include-partial-messages`),
+                            // so an inter-word space ' ' or a paragraph break '\n\n'
+                            // routinely arrives as its OWN delta. Dropping it (the old
+                            // `if !delta.trim().is_empty()` guard) mashed 'foo'+' '+
+                            // 'bar' into 'foobar' and collapsed blank lines. P5c:
+                            // real content ends the reasoning block.
+                            self.collapse_thinking_block();
+                            if let Some(last) =
+                                self.history.back_mut().and_then(ChatMessage::text_mut)
+                            {
+                                last.push_str(&delta);
                             }
+                        } else if !delta.trim().is_empty() {
+                            // Fresh stream / rollover — but a pure-whitespace delta
+                            // must NOT open a new (blank) Host bubble; wait for real
+                            // content. P5a: a fresh segment is a fresh body — drop the
+                            // stable-prefix cache so it never reuses the prior
+                            // segment's render against the new (smaller) body.
+                            self.collapse_thinking_block();
+                            self.reset_stream_md_cache();
+                            self.push(ChatRole::Host, delta);
+                            self.stream_text_active = true;
                         }
                     }
                     umadev_runtime::StreamEvent::ToolUse { name, detail, edit } => {

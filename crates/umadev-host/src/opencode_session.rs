@@ -719,6 +719,50 @@ pub fn translate_frame_tracked(
     }
 }
 
+/// Map opencode's lowercase tool name to the claude-shaped name the agent-side
+/// consumers match on (`Write`/`Edit`/…), so an opencode write/edit renders a diff
+/// card and enters the audit + governance trail. An unknown tool gets a
+/// capitalized first letter (consistent display; it isn't a file edit anyway).
+fn normalize_tool_name(name: &str) -> String {
+    match name {
+        "write" => "Write".to_string(),
+        "edit" => "Edit".to_string(),
+        "multiedit" => "MultiEdit".to_string(),
+        "read" => "Read".to_string(),
+        "bash" => "Bash".to_string(),
+        "grep" => "Grep".to_string(),
+        "glob" => "Glob".to_string(),
+        "list" | "ls" => "LS".to_string(),
+        "webfetch" => "WebFetch".to_string(),
+        "task" => "Task".to_string(),
+        other => {
+            let mut chars = other.chars();
+            chars.next().map_or_else(
+                || other.to_string(),
+                |first| first.to_uppercase().collect::<String>() + chars.as_str(),
+            )
+        }
+    }
+}
+
+/// Rename opencode's camelCase tool-input keys to the snake_case keys the agent
+/// reads (`filePath`→`file_path`, `oldString`→`old_string`, `newString`→
+/// `new_string`); `content` is already shared. Non-object input is returned as-is.
+fn normalize_tool_input(mut input: Value) -> Value {
+    if let Some(obj) = input.as_object_mut() {
+        for (from, to) in [
+            ("filePath", "file_path"),
+            ("oldString", "old_string"),
+            ("newString", "new_string"),
+        ] {
+            if let Some(v) = obj.remove(from) {
+                obj.entry(to.to_string()).or_insert(v);
+            }
+        }
+    }
+    input
+}
+
 /// `message.part.updated` -> `ToolCall`/`ToolResult` (for `part.type=="tool"`)
 /// or `TextDelta` (for `part.type=="text"`). Tool input/output schema:
 /// `core/src/v1/session.ts ToolPart`/`ToolState`. `text_lens` tracks how much of
@@ -737,14 +781,18 @@ fn translate_part(
     }
     match part.get("type").and_then(Value::as_str) {
         Some("tool") => {
-            let name = part
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or("tool")
-                .to_string();
+            // Normalize opencode's tool shape to the claude-shaped names + input
+            // keys the agent-side consumers (diff card, audit, governance,
+            // tool-row detail) recognize. opencode emits lowercase `write`/`edit`
+            // and camelCase `filePath`/`oldString`/`newString`; without this an
+            // opencode edit renders NO diff card and its audit/path attribution is
+            // blank (it only matches `file_path` + capitalized `Write`/`Edit`).
+            let name = normalize_tool_name(
+                part.get("tool").and_then(Value::as_str).unwrap_or("tool"),
+            );
             let state = part.get("state").cloned().unwrap_or(Value::Null);
             let status = state.get("status").and_then(Value::as_str).unwrap_or("");
-            let input = state.get("input").cloned().unwrap_or(Value::Null);
+            let input = normalize_tool_input(state.get("input").cloned().unwrap_or(Value::Null));
             match status {
                 // running = the tool actually started (input now finalized,
                 // incl. the write path) — surface as the ToolCall truth.
@@ -1166,14 +1214,33 @@ mod tests {
         assert_eq!(evs.len(), 1);
         match &evs[0] {
             SessionEvent::ToolCall { name, input } => {
-                assert_eq!(name, "write");
+                // Normalized to the claude-shape the agent's diff/audit consumers
+                // recognize: `write`→`Write`, `filePath`→`file_path`.
+                assert_eq!(name, "Write");
                 assert_eq!(
-                    input.get("filePath").and_then(Value::as_str),
+                    input.get("file_path").and_then(Value::as_str),
                     Some("src/app.tsx")
                 );
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn opencode_tool_shape_is_normalized_to_claude_shape() {
+        // An opencode edit must render a diff card + enter the audit/governance
+        // trail, which requires the claude-shaped name + snake_case input keys.
+        assert_eq!(normalize_tool_name("write"), "Write");
+        assert_eq!(normalize_tool_name("edit"), "Edit");
+        assert_eq!(normalize_tool_name("bash"), "Bash");
+        assert_eq!(normalize_tool_name("customtool"), "Customtool");
+        let n = normalize_tool_input(
+            serde_json::json!({ "filePath": "a.ts", "oldString": "x", "newString": "y" }),
+        );
+        assert_eq!(n.get("file_path").and_then(Value::as_str), Some("a.ts"));
+        assert_eq!(n.get("old_string").and_then(Value::as_str), Some("x"));
+        assert_eq!(n.get("new_string").and_then(Value::as_str), Some("y"));
+        assert!(n.get("filePath").is_none(), "camelCase key renamed away");
     }
 
     #[test]
@@ -1445,8 +1512,8 @@ mod tests {
         // and a clean idle TurnDone.
         assert!(
             got.iter().any(|e| matches!(e, SessionEvent::ToolCall { name, input }
-                if name == "write" && input.get("filePath").and_then(Value::as_str) == Some("src/x.ts"))),
-            "expected a ToolCall(write src/x.ts): {got:?}"
+                if name == "Write" && input.get("file_path").and_then(Value::as_str) == Some("src/x.ts"))),
+            "expected a ToolCall(Write src/x.ts): {got:?}"
         );
         assert!(
             got.iter()
