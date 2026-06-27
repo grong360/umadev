@@ -3135,83 +3135,17 @@ fn theme_from_known_terminal() -> Option<bool> {
 /// OSC 11 query: send the background-color query, read the RGB response,
 /// classify by BT.709 luminance. Must run in raw mode (no echo).
 fn theme_from_osc11() -> Option<bool> {
-    // Bound the blocking OSC 11 probe with a timeout via a worker thread. The probe
-    // ends at the FIRST `stdin.read()`, whose deadline is only checked BETWEEN
-    // reads — so a terminal that enables raw mode but never answers OSC 11 (conhost,
-    // dumb terms, some SSH / screen / tmux) blocks that first read FOREVER, hanging
-    // the launch before the first draw (P0). With the timeout the launch proceeds
-    // with the default theme; the worker exits as soon as ANY byte arrives (on such
-    // a terminal it may swallow the user's first keystroke after launch — a far
-    // smaller cost than an indefinite hang, and only when OSC 11 went unanswered).
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(theme_from_osc11_blocking());
-    });
-    rx.recv_timeout(Duration::from_millis(250)).ok().flatten()
-}
-
-/// The blocking OSC 11 background-color probe, run under a timeout by
-/// [`theme_from_osc11`]. Writes `OSC 11 ?` and reads the `rgb:…` reply.
-fn theme_from_osc11_blocking() -> Option<bool> {
-    use std::io::{Read, Write};
-    use std::time::Instant;
-
-    let mut stdout = std::io::stdout();
-    // OSC 11 ? = "report background color". Terminate with BEL (\x07) which
-    // more terminals accept than ST (ESC \); some respond with BEL too.
-    stdout.write_all(b"\x1b]11;?\x07").ok()?;
-    stdout.flush().ok()?;
-
-    // Read the response: `\x1b]11;rgb:RRRR/GGGG/BBBB\x07` (or ESC \).
-    // 200ms timeout — terminals respond in <50ms; non-responders (conhost,
-    // dumb terms) time out cleanly without blocking the launch.
-    let mut buf = [0u8; 64];
-    let mut filled = 0;
-    let deadline = Instant::now() + Duration::from_millis(200);
-    let mut stdin = std::io::stdin();
-    while filled < buf.len() && Instant::now() < deadline {
-        match stdin.read(&mut buf[filled..]) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                filled += n;
-                let s = String::from_utf8_lossy(&buf[..filled]);
-                if let Some(theme) = parse_osc_bg(&s) {
-                    return Some(theme);
-                }
-            }
-        }
-    }
+    // OSC 11 background-color detection is DISABLED. Reading the reply needed a stdin
+    // read off the main thread (a worker thread blocking in `read()`), which — once
+    // the event loop started — RACED crossterm's `EventStream` for stdin and split
+    // incoming mouse-wheel SGR bursts: the ESC bytes parsed as stray Esc keypresses
+    // (a FALSE "本轮已中止") and the rest leaked into the input as raw text like
+    // `[<65;126;45M` (user-reported with a screenshot after wheel-scroll was enabled).
+    // A safe, race-free probe would need a non-blocking tty read (forbidden `unsafe` /
+    // a new dep). `COLORFGBG`, the known-terminal allowlist, and default-dark cover the
+    // common cases; an OSC 11-only terminal (iTerm2 / Ghostty / WezTerm / kitty) keeps
+    // its default-dark assumption rather than risk corrupting input.
     None
-}
-
-/// Parse an OSC 11 response (e.g. `\x1b]11;rgb:1a/1b/26\x1b\\`) and classify
-/// light vs dark via ITU-R BT.709 relative luminance (same threshold Claude
-/// Code uses: > 0.5 → light).
-fn parse_osc_bg(s: &str) -> Option<bool> {
-    /// Normalize a 1–4 digit hex channel to `[0.0, 1.0]`.
-    fn norm(hex: &str) -> Option<f64> {
-        let h: String = hex.chars().take_while(char::is_ascii_hexdigit).collect();
-        if h.is_empty() || h.len() > 4 {
-            return None;
-        }
-        let len = u32::try_from(h.len()).unwrap_or(4);
-        let max = 16_u32.pow(len) - 1;
-        let v = u32::from_str_radix(&h, 16).ok()?;
-        Some(f64::from(v) / f64::from(max))
-    }
-
-    // Find "rgb:" then the three hex channels separated by '/'.
-    let rgb_idx = s.find("rgb:")?;
-    let rest = &s[rgb_idx + 4..];
-    let parts: Vec<&str> = rest.split('/').take(3).collect();
-    if parts.len() < 3 {
-        return None;
-    }
-    let r = norm(parts[0])?;
-    let g = norm(parts[1])?;
-    let b = norm(parts[2])?;
-    let luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    Some(luminance > 0.5)
 }
 
 /// Copy `text` to the system clipboard from inside the alternate screen, the way
