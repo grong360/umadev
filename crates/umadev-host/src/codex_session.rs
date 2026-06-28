@@ -146,6 +146,13 @@ pub struct CodexSession {
     stdin: Arc<Mutex<ChildStdin>>,
     /// Receiver for translated [`SessionEvent`]s produced by the reader task.
     events: mpsc::UnboundedReceiver<SessionEvent>,
+    /// A SENDER clone into the same event channel the reader owns, kept so
+    /// [`send_turn`](BaseSession::send_turn) can surface a `turn/start` JSON-RPC
+    /// error (e.g. the `-32001` overloaded surface) as a terminal
+    /// [`TurnStatus::Failed`] carrying the real error — instead of letting the turn
+    /// hang silently until the idle timeout (the API-error swallow). Fail-open: a
+    /// closed channel send is a no-op.
+    event_tx: EventTx,
     /// Map: outstanding client request id → oneshot for its JSON-RPC result.
     /// Shared with the reader task, which completes the oneshot on the matching
     /// response line.
@@ -259,12 +266,13 @@ impl CodexSession {
             Arc::clone(&approvals),
             Arc::clone(&turn_id),
             latest_usage,
-            event_tx,
+            event_tx.clone(),
         ));
 
         let mut session = Self {
             stdin,
             events: event_rx,
+            event_tx,
             pending,
             approvals,
             next_id: AtomicI64::new(1),
@@ -339,11 +347,12 @@ impl CodexSession {
             Arc::clone(&approvals),
             Arc::clone(&turn_id),
             latest_usage,
-            event_tx,
+            event_tx.clone(),
         ));
         let session = Self {
             stdin,
             events: event_rx,
+            event_tx,
             pending,
             approvals,
             next_id: AtomicI64::new(1),
@@ -399,11 +408,12 @@ impl CodexSession {
             Arc::clone(&approvals),
             Arc::clone(&turn_id),
             latest_usage,
-            event_tx,
+            event_tx.clone(),
         ));
         let session = Self {
             stdin,
             events: event_rx,
+            event_tx,
             pending,
             approvals,
             next_id: AtomicI64::new(1),
@@ -1400,9 +1410,27 @@ impl BaseSession for CodexSession {
         // `send_turn` returns at once. Fail-open: a dropped sender / missing id is
         // a silent no-op — the notification path already set the id.
         let turn_id = Arc::clone(&self.turn_id);
+        let event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            if let Ok(Ok(result)) = rx.await {
-                adopt_turn_id_into(&turn_id, &result).await;
+            match rx.await {
+                // The turn started — adopt its id (the `turn/started` notification
+                // may have raced ahead; `adopt_turn_id_into` is a no-op then).
+                Ok(Ok(result)) => adopt_turn_id_into(&turn_id, &result).await,
+                // The `turn/start` request itself FAILED with a JSON-RPC error (e.g.
+                // the `-32001` overloaded surface, or a rate limit). No `turn/completed`
+                // will ever arrive, so WITHOUT this the turn hangs silently until the
+                // idle timeout — the API-error swallow. Surface it as a terminal Failed
+                // carrying the real error so the loop renders it (fail-open: a closed
+                // channel send is a no-op).
+                Ok(Err(e)) => {
+                    let _ = event_tx.send(SessionEvent::TurnDone {
+                        status: TurnStatus::Failed(e),
+                        usage: None,
+                    });
+                }
+                // The sender was dropped → the session died; the reader's EOF path
+                // already emits a terminal Failed, so nothing to do here.
+                Err(_) => {}
             }
         });
         Ok(())
@@ -2309,6 +2337,67 @@ done
             }
         }
         assert!(done, "the turn completes from the notification stream");
+        let _ = session.end().await;
+    }
+
+    /// A fake whose `turn/start` request FAILS with a JSON-RPC error (the `-32001`
+    /// overloaded surface — codex's rate-limit / capacity error) and emits NO
+    /// `turn/completed`. WITHOUT surfacing that error the turn would hang silently
+    /// until the idle timeout (the API-error swallow). The driver must turn it into
+    /// a terminal Failed carrying the real error.
+    #[cfg(unix)]
+    const FAKE_APP_SERVER_TURN_START_ERROR: &str = r#"#!/bin/sh
+extract_id() { printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{"userAgent":"fake"}}\n' "$(extract_id "$line")" ;;
+    *'"method":"initialized"'*) : ;;
+    *'"method":"thread/start"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thr_test"}}}\n' "$(extract_id "$line")" ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":%s,"error":{"code":-32001,"message":"overloaded"}}\n' "$(extract_id "$line")" ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_start_jsonrpc_error_surfaces_as_failed_turn_not_a_silent_hang() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("codex");
+        write_fake_codex(&script, FAKE_APP_SERVER_TURN_START_ERROR);
+
+        let mut session = CodexSession::start_with_program_timeout(
+            script.to_str().unwrap(),
+            dir.path(),
+            "gpt-5-codex",
+            true,
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("handshake should succeed");
+
+        session
+            .send_turn("go".to_string())
+            .await
+            .expect("send_turn writes turn/start");
+
+        // The JSON-RPC turn-start error must arrive as a terminal Failed carrying
+        // the real error — bounded so a regression (silent hang) trips the timeout.
+        let ev = tokio::time::timeout(Duration::from_secs(5), session.next_event())
+            .await
+            .expect("a turn-start error must surface promptly, never hang");
+        match ev {
+            Some(SessionEvent::TurnDone {
+                status: TurnStatus::Failed(m),
+                ..
+            }) => assert!(
+                m.contains("-32001") || m.contains("overloaded"),
+                "the Failed turn carries the real JSON-RPC error: {m}"
+            ),
+            other => panic!("expected TurnDone(Failed) from the turn-start error, got {other:?}"),
+        }
         let _ = session.end().await;
     }
 

@@ -615,20 +615,34 @@ fn tool_result_event(block: &Value) -> Option<SessionEvent> {
 }
 
 /// A `result` envelope → the turn-done boundary.
+///
+/// claude flags an errored turn with `is_error: true` and writes the human-facing
+/// cause into the `result` string (e.g. `"API Error: Request rejected (429) · You
+/// have exceeded the 5-hour usage quota …"`). A mid-turn API error commonly arrives
+/// as `{"subtype":"success","is_error":true,"result":"API Error: …"}` — so keying
+/// the status off `subtype` ALONE mapped that to [`TurnStatus::Completed`], and the
+/// turn read as a silent, empty success (the "完成 / 本轮无文件变更" swallow) while
+/// the real cause never reached the user. We therefore honor `is_error`: a clean
+/// finish is `subtype:"success"` AND not flagged as an error; anything flagged (or
+/// an explicit error subtype) becomes a [`TurnStatus::Failed`] carrying the base's
+/// OWN error text. The soft caps (`error_max_*`) stay [`TurnStatus::Truncated`] —
+/// the turn hit a turn/budget ceiling, not an API failure, so we accept what landed.
 fn parse_result(v: &Value) -> SessionEvent {
     let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("");
+    let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
     let status = match subtype {
-        "success" => TurnStatus::Completed,
+        // A clean finish: success AND not flagged as an error.
+        "success" if !is_error => TurnStatus::Completed,
+        // Soft caps — partial work, accept it (the deterministic floor downstream
+        // is the real stop). claude flags these `is_error:true`, so this arm MUST
+        // come before the generic error fall-through below.
         "error_max_turns" | "error_max_budget_usd" | "error_max_structured_output_retries" => {
             TurnStatus::Truncated
         }
-        other => {
-            let reason = v
-                .get("result")
-                .and_then(Value::as_str)
-                .map_or_else(|| format!("base error ({other})"), str::to_string);
-            TurnStatus::Failed(reason)
-        }
+        // Either an explicit error subtype, OR `success` with `is_error:true` — a
+        // real failure. Carry the base's actual error text (the 429 / auth /
+        // overloaded message), never swallow it as a clean completion.
+        other => TurnStatus::Failed(result_error_text(v, other)),
     };
     // F3: surface the REAL per-turn token usage off the `result` line so `/usage`
     // is truthful on the DEFAULT continuous loop (claude reports it; previously
@@ -638,6 +652,28 @@ fn parse_result(v: &Value) -> SessionEvent {
         status,
         usage: parse_result_usage(v),
     }
+}
+
+/// The human-readable error text off an errored `result` envelope. Prefers the
+/// base's own `result` string (where claude writes the API error, e.g. "API Error:
+/// Request rejected (429) …") so the user sees the REAL cause; falls back to naming
+/// the `subtype` when no message text is present. Never empty → never a silent
+/// failure.
+fn result_error_text(v: &Value, subtype: &str) -> String {
+    v.get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || {
+                if subtype.is_empty() {
+                    "base error".to_string()
+                } else {
+                    format!("base error ({subtype})")
+                }
+            },
+            str::to_string,
+        )
 }
 
 /// Extract the per-turn token usage from a stream-json `result` envelope.
@@ -975,6 +1011,65 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn result_with_is_error_true_is_failed_carrying_the_real_error_text() {
+        // The rate-limit / API-error surface: claude ends the turn with
+        // `subtype:"success"` BUT `is_error:true`, and the human error in `result`.
+        // WITHOUT honoring `is_error` this read as a silent empty Completed (the
+        // "完成 / 本轮无文件变更" swallow); it must be a Failed carrying the text.
+        let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"API Error: Request rejected (429) · You have exceeded the 5-hour usage quota. It will reset at 2026-06-28."}"#;
+        match parse_stdout_line(line).as_slice() {
+            [SessionEvent::TurnDone {
+                status: TurnStatus::Failed(m),
+                ..
+            }] => {
+                assert!(m.contains("429"), "carries the base's real error: {m}");
+                assert!(m.contains("usage quota"), "carries the full message: {m}");
+            }
+            other => panic!("expected TurnDone(Failed) carrying the 429 text, got {other:?}"),
+        }
+        // An error subtype with no `result` text still fails open to a named reason.
+        match parse_stdout_line(
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#,
+        )
+        .as_slice()
+        {
+            [SessionEvent::TurnDone {
+                status: TurnStatus::Failed(m),
+                ..
+            }] => assert!(
+                m.contains("error_during_execution"),
+                "names the subtype: {m}"
+            ),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn genuinely_successful_empty_turn_stays_completed_not_a_false_failure() {
+        // A real "no changes needed" turn — success, is_error false (or absent),
+        // empty text — must NOT be turned into a failure by the is_error check.
+        let explicit = parse_stdout_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":""}"#,
+        );
+        assert_eq!(
+            explicit,
+            vec![SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: None,
+            }]
+        );
+        // is_error absent entirely (defaults false) → still a clean completion.
+        let absent = parse_stdout_line(r#"{"type":"result","subtype":"success"}"#);
+        assert_eq!(
+            absent,
+            vec![SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: None,
+            }]
+        );
     }
 
     #[test]

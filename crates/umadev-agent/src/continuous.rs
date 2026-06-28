@@ -737,7 +737,14 @@ fn finish_turn(
             PhaseResult::Done
         }
         TurnStatus::Interrupted => PhaseResult::Failed(format!("{} interrupted", phase.id())),
-        TurnStatus::Failed(reason) => PhaseResult::Failed(reason),
+        // A base-reported turn failure (an API error like a 429 rate limit, an
+        // overloaded/auth failure) carries the base's OWN error text. Run it through
+        // the actionable classifier so the run's hard-stop NAMES the fix (429 →
+        // "底座触发限流 …") while keeping the raw error — never an anonymous failure.
+        // Fail-open: an unclassifiable reason surfaces verbatim.
+        TurnStatus::Failed(reason) => PhaseResult::Failed(
+            crate::base_error::diagnose_turn_failure(&reason, &options.backend),
+        ),
     }
 }
 

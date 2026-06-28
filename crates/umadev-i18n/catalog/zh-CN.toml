@@ -424,6 +424,7 @@
 "base.fail.network.ssl" = "SSL / 证书校验失败 — 检查代理或企业证书(NODE_EXTRA_CA_CERTS)"
 "base.fail.context" = "上下文超出底座上限 — 用 /compact 压缩,或换更大上下文的模型"
 "base.fail.exited" = "底座进程已退出(code {})"
+"base.fail.turn_failed" = "底座本轮失败(无更多信息)— 请重试,或用 /model 切换模型 / 底座"
 
 # 预览 dev server / 部署(后台任务,走进程级当前语言)
 "preview.dev_starting" = "[wait] dev server 启动中,等待端口就绪…"

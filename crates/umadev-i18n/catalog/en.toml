@@ -424,6 +424,7 @@
 "base.fail.network.ssl" = "SSL / certificate verification failed — check your proxy or corporate cert (NODE_EXTRA_CA_CERTS)"
 "base.fail.context" = "Context exceeded the base limit — /compact to shrink, or switch to a larger-context model"
 "base.fail.exited" = "Base process exited (code {})"
+"base.fail.turn_failed" = "Base turn failed (no further detail) — retry, or switch model/base with /model"
 
 # Preview dev server / deploy (background tasks, use the process-wide language)
 "preview.dev_starting" = "[wait] dev server starting, waiting for the port to be ready…"

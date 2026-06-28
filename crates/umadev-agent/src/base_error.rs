@@ -135,6 +135,36 @@ pub fn actionable_message(f: &BaseFailure, backend: &str) -> String {
     }
 }
 
+/// Enrich a base-reported turn-failure `reason` (the base's OWN error text —
+/// e.g. claude's `"API Error: Request rejected (429) · You have exceeded the
+/// 5-hour usage quota …"`, codex's failed-turn `error.message`, opencode's
+/// `session.error` message) with its actionable diagnosis.
+///
+/// Unlike [`actionable_message`], which takes a pre-classified [`BaseFailure`],
+/// this takes the RAW base error as classifier evidence (so a `429` in the text
+/// → [`BaseFailure::RateLimit`] → "底座触发限流 …"), then PREPENDS the per-base
+/// actionable line and keeps the raw reason as the technical detail. It is the
+/// shared "surface a Failed turn, never swallow it" path for BOTH the `/run`
+/// drive loop and the chat turn loop.
+///
+/// **Fail-open by contract:** an unclassifiable reason (no recognized markers)
+/// keeps today's behaviour — the raw `reason` is returned verbatim, NEVER dropped,
+/// so the user always sees the base's real error. Pure; never panics.
+#[must_use]
+pub fn diagnose_turn_failure(reason: &str, backend: &str) -> String {
+    let reason = reason.trim();
+    let failure = classify(None, None, Some(reason));
+    let prefix = actionable_message(&failure, backend);
+    match (prefix.is_empty(), reason.is_empty()) {
+        // No diagnosis → keep the raw reason (today's behaviour, fail-open).
+        (true, _) => reason.to_string(),
+        // Diagnosed but no detail text → the actionable line stands alone.
+        (false, true) => prefix,
+        // Diagnosis PREPENDED, raw base error kept as the technical detail.
+        (false, false) => format!("{prefix} — {reason}"),
+    }
+}
+
 /// Pick the per-base i18n key for an auth failure. Falls back to a base-agnostic
 /// key for an unknown / empty backend id.
 fn auth_key(backend: &str) -> &'static str {
@@ -525,6 +555,30 @@ mod tests {
         assert!(m.contains("137"), "exit message names the code: {m}");
         // Unknown is empty → the mint point keeps today's generic reason.
         assert_eq!(actionable_message(&BaseFailure::Unknown, "codex"), "");
+    }
+
+    #[test]
+    fn diagnose_turn_failure_prepends_actionable_line_and_keeps_raw_reason() {
+        // A 429 in the base's own error text → RateLimit diagnosis PREPENDED, the
+        // raw error kept as the detail (the user sees both the fix and the cause).
+        let raw = "API Error: Request rejected (429) · You have exceeded the 5-hour usage quota.";
+        let out = diagnose_turn_failure(raw, "claude-code");
+        assert!(
+            out.starts_with(umadev_i18n::tl("base.fail.ratelimit")),
+            "the actionable rate-limit line is prepended: {out}"
+        );
+        assert!(out.contains("429"), "the raw base error is kept: {out}");
+        assert!(out.contains("usage quota"), "the full cause is kept: {out}");
+    }
+
+    #[test]
+    fn diagnose_turn_failure_is_fail_open_for_an_unclassifiable_reason() {
+        // No recognized markers → the raw reason is returned verbatim (NEVER
+        // swallowed), with no spurious prefix.
+        let raw = "the base did something opaque and stopped";
+        assert_eq!(diagnose_turn_failure(raw, "codex"), raw);
+        // An empty reason never panics and yields an empty string.
+        assert_eq!(diagnose_turn_failure("   ", "codex"), "");
     }
 
     #[test]

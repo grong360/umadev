@@ -2559,13 +2559,7 @@ fn enrich_base_failure(
         _ => base_msg.to_string(),
     };
     if let Some(tail) = stderr_tail {
-        let lines: Vec<&str> = tail
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect();
-        let start = lines.len().saturating_sub(3);
-        let snippet: String = lines[start..].join(" | ").chars().take(280).collect();
+        let snippet = stderr_snippet(&tail);
         if !snippet.is_empty() {
             msg = format!("{msg} — base stderr: {snippet}");
         }
@@ -2578,6 +2572,54 @@ fn enrich_base_failure(
     } else {
         format!("{prefix} — {msg}")
     }
+}
+
+/// Enrich a base-reported `TurnStatus::Failed(reason)` for the chat transcript.
+///
+/// Unlike [`enrich_base_failure`] (whose `base_msg` is UmaDev's OWN synthetic idle
+/// label), here `reason` IS the base's own error text — e.g. claude's `"API Error:
+/// Request rejected (429) · You have exceeded the 5-hour usage quota …"`. So it is
+/// fed to the classifier as evidence AND shown as the detail: the actionable
+/// diagnosis (429 → RateLimit → "底座触发限流 …") is PREPENDED via
+/// [`umadev_agent::base_error::diagnose_turn_failure`], and any stderr tail is folded
+/// in (de-duped) so a cause that only landed on stderr is never swallowed.
+///
+/// **Fail-open:** an unclassifiable reason still surfaces the RAW base error text;
+/// a totally empty reason+stderr falls back to a generic localized line — the user
+/// ALWAYS sees something, never a false "完成".
+fn enrich_base_turn_failure(reason: &str, stderr_tail: Option<String>, backend: &str) -> String {
+    // Fold a stderr tail into the base's reason so a cause that only landed on
+    // stderr is part of BOTH the classifier evidence and the shown detail (skip
+    // when the reason already carries it, to avoid doubling claude's result-vs-stderr).
+    let mut detail = reason.trim().to_string();
+    if let Some(tail) = stderr_tail {
+        let snippet = stderr_snippet(&tail);
+        if !snippet.is_empty() && !detail.contains(snippet.as_str()) {
+            detail = if detail.is_empty() {
+                format!("base stderr: {snippet}")
+            } else {
+                format!("{detail} — base stderr: {snippet}")
+            };
+        }
+    }
+    if detail.is_empty() {
+        // Nothing usable from the base at all — never swallow; show a generic line.
+        detail = umadev_i18n::tl("base.fail.turn_failed").to_string();
+    }
+    umadev_agent::base_error::diagnose_turn_failure(&detail, backend)
+}
+
+/// The last ≤3 non-empty stderr lines, joined and capped at 280 chars — a bounded
+/// tail safe to fold into a one-line failure note. Shared by the idle/EOF
+/// ([`enrich_base_failure`]) and turn-failure ([`enrich_base_turn_failure`]) paths.
+fn stderr_snippet(tail: &str) -> String {
+    let lines: Vec<&str> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(3);
+    lines[start..].join(" | ").chars().take(280).collect()
 }
 
 /// A WARM resident chat session: the live base process paired with the firmware it
@@ -2921,10 +2963,21 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     return;
                 }
                 umadev_runtime::TurnStatus::Failed(reason) => {
+                    // The base reported a REAL turn failure (an API error like a 429
+                    // rate limit, an auth / overloaded / network failure). This is the
+                    // bug fix: such a turn used to be swallowed and read as a silent
+                    // "[agentic] 完成" + "本轮无文件变更". Now: capture the base's OWN
+                    // stderr FIRST (a cause that only landed there is folded in), run
+                    // the reason through the actionable classifier (429 → "底座触发限流
+                    // …"), and surface THAT as the failure note. This branch returns
+                    // BEFORE the post-turn fact line / AgenticDone, so no false
+                    // "完成" / "无文件变更" is ever emitted for a failed turn.
+                    let tail = session.stderr_tail();
                     let _ = session.end().await;
+                    let enriched = enrich_base_turn_failure(&reason, tail, &backend);
                     let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                         "route.failed",
-                        &[&backend, &reason],
+                        &[&backend, &enriched],
                     )));
                     return;
                 }
@@ -7321,6 +7374,79 @@ mod tests {
             !saw_intent,
             "a pure chat turn emits NO intent card (chat card removed)"
         );
+    }
+
+    /// The API-error surfacing fix: a chat turn whose base reports a `Failed` status
+    /// (an API error like a 429 rate limit) must SURFACE that error — a
+    /// `RouteDecision::Failed` carrying the actionable classifier line + the base's
+    /// raw error text — and must NOT read as a clean "[agentic] 完成" (no
+    /// `AgenticDone`) nor emit a "本轮无文件变更" note. The screenshot bug, end to end
+    /// on the chat path.
+    #[tokio::test]
+    async fn chat_failed_turn_surfaces_api_error_not_a_false_done() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // The base hits a 429 mid-turn: it ends the turn with a Failed status whose
+        // message is the base's OWN error text (exactly what claude's `parse_result`
+        // now produces from an `is_error:true` result line).
+        let api_err = "API Error: Request rejected (429) · You have exceeded the 5-hour usage quota. It will reset at 2026-06-28 18:59:37.";
+        let (fake, _sent, ended) =
+            FakeChatSession::new(vec![vec![umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Failed(api_err.to_string()),
+                usage: None,
+            }]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "现在还有哪些任务没有完成",
+            holder.clone(),
+            sink.clone(),
+            route_tx,
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // The turn surfaced as a FAILURE (never a false AgenticDone / "完成").
+        match route_rx.try_recv() {
+            Ok(RouteDecision::Failed(note)) => {
+                // The base's RAW error text reaches the user (never swallowed).
+                assert!(note.contains("429"), "the raw 429 error is shown: {note}");
+                assert!(
+                    note.contains("usage quota"),
+                    "the full base error is shown: {note}"
+                );
+                // The actionable rate-limit classifier line is prepended.
+                assert!(
+                    note.contains(umadev_i18n::tl("base.fail.ratelimit")),
+                    "the rate-limit diagnosis is prepended: {note}"
+                );
+            }
+            other => panic!("expected RouteDecision::Failed, got {other:?}"),
+        }
+        // No SECOND decision (a Failed turn is terminal — no false AgenticDone too).
+        assert!(
+            route_rx.try_recv().is_err(),
+            "a failed turn emits exactly one terminal decision"
+        );
+        // The failed session was closed (not parked back as a live session).
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "a failed turn ends its session"
+        );
+        // CRUCIAL: no "本轮无文件变更 / no file changes" Note was emitted — the swallow.
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                assert!(
+                    !n.contains("无文件变更") && !n.contains("no file changes"),
+                    "a failed turn must NOT emit the no-file-changes note: {n}"
+                );
+            }
+        }
     }
 
     /// Reactive build on the resident path: the FIRST `Write` tool call flips the

@@ -670,7 +670,17 @@ async fn drive_director_loop_with_idle(
         let turn =
             match drive_one_turn(session, options, events, next_directive, idle, deadline).await {
                 Ok(t) => t,
-                Err(reason) => return DirectorLoopOutcome::Failed(reason),
+                // A base-reported turn failure (an API error like a 429 rate limit)
+                // carries the base's OWN error text. Run it through the actionable
+                // classifier so the run's terminal failure NAMES the fix while keeping
+                // the raw error — never an anonymous stop. Fail-open: an
+                // unclassifiable reason surfaces verbatim (never swallowed).
+                Err(reason) => {
+                    return DirectorLoopOutcome::Failed(crate::base_error::diagnose_turn_failure(
+                        &reason,
+                        &options.backend,
+                    ))
+                }
             };
         last_reply = turn.text.clone();
 
