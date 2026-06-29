@@ -1005,8 +1005,9 @@ async fn drive_director_loop_with_idle(
             finalize_phase_from_plan_opt(&plan, options, true);
             // Wave 4 (§L4 / G8): restore the shareable delivery on the DEFAULT
             // path — depth-gated, fail-open. A clean Build leaves a PRD /
-            // architecture / UI-UX doc (+ a proof-pack on the deliberate path).
-            director::finalize(options, events, route);
+            // architecture / UI-UX doc (+ a proof-pack on the deliberate path). This
+            // arm is reached only inside `qc.is_clean()`, so the build is clean.
+            director::finalize(options, events, route, true);
             // SIZING calibration: a clean settle on round 0 (no rework) was a LIGHT
             // actual outcome; a clean settle only AFTER bounded QC fix rounds means the
             // cheap single turn under-sized the work → HEAVY. Advisory, fail-open.
@@ -1294,8 +1295,11 @@ async fn drive_plan_steps(
     let clean = plan.steps.iter().all(|s| s.status == StepStatus::Done);
     finalize_phase_from_plan(plan, options, clean);
     // Wave 4 (§L4 / G8): a step-driven (always deliberate) build leaves the FULL
-    // shareable delivery — core docs + proof-pack + scorecard. Fail-open inside.
-    director::finalize(options, events, Some(route));
+    // shareable delivery — core docs + proof-pack + scorecard — but ONLY when the
+    // build settled clean (every step Done). MEDIUM M2: passing `clean` here stops
+    // finalize from emitting a proof-pack + delivery scorecard for an INCOMPLETE build
+    // (blocked / stranded steps), which would disguise it as success. Fail-open inside.
+    director::finalize(options, events, Some(route), clean);
     // SIZING calibration: a step-driven build is ALWAYS a deliberate route (predicted
     // HEAVY). Measure the ACTUAL heaviness by how many Build steps did real work — a
     // deliberate route that finished in <=1 real build step OVER-sized the turn (the
@@ -2599,6 +2603,32 @@ async fn drive_one_turn_with_backoff(
                 ));
             }
             IdleEvent::IdleTimedOut { exit, stderr_tail } => {
+                // MEDIUM M5 — run budget reached DURING a silent tool turn. While a tool
+                // runs, `next_event_idle` is liveness-based and only settles on a dead
+                // base or the run `deadline`, so a deadline crossing mid-tool surfaces
+                // HERE as `IdleTimedOut` (the top-of-loop budget settle only fires
+                // between waits). This is the SAME budget-reached condition as that
+                // block — NOT a hang — so settle GRACEFULLY on the work produced so far
+                // (Ok with the accumulated text) instead of returning Err, which would
+                // mark the run Failed and SKIP run_auto_qc + finalize (losing the QC +
+                // delivery purely because the deadline happened to land mid-tool rather
+                // than mid-stream).
+                if in_tool_call && std::time::Instant::now() >= deadline {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
+                        session.interrupt(),
+                    )
+                    .await;
+                    record_turn_usage(options, events, None, est_tokens);
+                    capture_turn_pitfalls(options, events, &pitfalls);
+                    events.emit(EngineEvent::Note(
+                        "team · run budget reached mid-tool — interrupted the base and \
+                         finalizing on what's built (raise UMADEV_RUN_BUDGET_SECS for a \
+                         longer run)"
+                            .to_string(),
+                    ));
+                    return Ok(TurnResult { text });
+                }
                 // Watchdog re-drive (bounded SINGLE retry): a NON-tool silent hang on a
                 // base that is STILL ALIVE (no exit captured even after the watchdog's
                 // bounded interrupt) may be a SILENTLY DROPPED stream, not a dead base —
@@ -2709,16 +2739,21 @@ async fn drive_one_turn_with_backoff(
                 // the bare mode policy. Reversible in-tree edits stay allowed so a
                 // headless build isn't wedged waiting on a human.
                 let ledger = crate::trust::TrustLedger::load(&options.project_root);
-                let decision =
-                    if requires_confirmation_with_ledger(options.mode, &action, &target, &ledger) {
-                        events.emit(EngineEvent::Note(umadev_i18n::tlf(
-                            "continuous.dangerous_action_denied",
-                            &[&action, &target],
-                        )));
-                        ApprovalDecision::Deny
-                    } else {
-                        ApprovalDecision::Allow
-                    };
+                let decision = if requires_confirmation_with_ledger(
+                    options.mode,
+                    &action,
+                    &target,
+                    &options.project_root,
+                    &ledger,
+                ) {
+                    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "continuous.dangerous_action_denied",
+                        &[&action, &target],
+                    )));
+                    ApprovalDecision::Deny
+                } else {
+                    ApprovalDecision::Allow
+                };
                 if let Err(e) = session.respond(&req_id, decision).await {
                     // LOW #2: a turn that dies on the approval round-trip still spent
                     // its tokens — record the estimate (fail-open) before bailing. No
@@ -4146,6 +4181,36 @@ mod tests {
             ),
             Ok(_) => panic!("a hung base must settle as an Err, not Ok"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_budget_reached_mid_tool_settles_gracefully_not_failed() {
+        // MEDIUM M5: when the wall-clock run budget expires DURING a silent tool turn,
+        // the turn must settle GRACEFULLY so the run still reaches run_auto_qc +
+        // finalize — exactly like a budget reached mid-STREAM. Before the fix the
+        // in-tool `IdleTimedOut` returned Err → the run was Failed and SKIPPED QC +
+        // delivery, purely because the deadline happened to land mid-tool rather than
+        // mid-stream. A near-future deadline + a base that fires a tool then hangs
+        // exercises that exact path; the loop must end as Done, not Failed.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = ToolThenHangSession { emitted: false };
+        let o = opts(tmp.path());
+        let outcome = drive_director_loop_with_idle(
+            &mut sess,
+            &o,
+            &events,
+            "GO".to_string(),
+            None,
+            None,
+            IdleBudget::new(Duration::from_millis(40), Duration::from_millis(40)),
+            std::time::Instant::now() + Duration::from_millis(140),
+        )
+        .await;
+        assert!(
+            matches!(outcome, DirectorLoopOutcome::Done { .. }),
+            "a budget reached mid-tool settles gracefully (Done), not Failed: {outcome:?}"
+        );
     }
 
     /// A real, already-exited `ExitStatus` for the "base died mid-tool" fixtures —

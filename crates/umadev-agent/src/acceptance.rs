@@ -64,11 +64,87 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             }
             collect(&p, out, depth + 1);
         } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-            if SRC_EXT.contains(&ext) {
+            if SRC_EXT.contains(&ext) && is_nontrivial_source(&p, ext) {
                 out.push(p);
             }
         }
     }
+}
+
+/// Whether a candidate source file carries REAL, substantive content — not an empty
+/// file nor a pure-comment / whitespace stub. A base that hallucinates "done" can
+/// leave a 0-byte or `// TODO` `index.js`; counting that as delivered source would let
+/// the source-present honesty hard-gate (`director::verify_source_present` +
+/// `continuous`'s HARD STOP + the `SourcePresent` acceptance) PASS on a build that
+/// produced NOTHING. So a file is counted only when it has at least one
+/// non-whitespace, non-comment token — mirroring `truncated_missing_artifacts`'
+/// `doc_present` (a non-trivial-size floor) but precise enough not to false-reject a
+/// genuinely tiny real file (`fn main(){}`). Fail-open toward the gate's intent: an
+/// unreadable / non-UTF8 file is treated as NOT real source (we cannot confirm its
+/// content), the safe answer for an honesty gate.
+fn is_nontrivial_source(p: &Path, ext: &str) -> bool {
+    match std::fs::read_to_string(p) {
+        Ok(content) => {
+            // `#` is a line comment in these languages; in CSS/SCSS a leading `#` is an
+            // id selector and in Rust `#[…]` an attribute, so `#` must NOT be treated as
+            // a comment there (else a real `#header{…}` stylesheet would mis-read as a
+            // stub).
+            let hash_comments = matches!(ext, "py" | "rb" | "ex" | "exs");
+            has_code_content(&content, hash_comments)
+        }
+        Err(_) => false,
+    }
+}
+
+/// True iff `src` has at least one substantive (non-whitespace, non-comment) line — a
+/// heuristic that distinguishes real source from a whitespace/comment-only stub. It
+/// strips `/* … */` and `<!-- … -->` block comments, then skips blank lines and `//`
+/// (and, when `hash_comments`, `#`)-prefixed line comments; any line that survives is
+/// substantive. Deliberately CONSERVATIVE: it must never mis-classify REAL code as a
+/// stub (that would fail a genuine build's source-present gate — a worse bug than the
+/// one this guards), so it treats only UNAMBIGUOUS comment forms as comments.
+/// Deterministic + dependency-free (no language parser).
+fn has_code_content(src: &str, hash_comments: bool) -> bool {
+    let stripped = strip_block_comments(src);
+    stripped.lines().any(|raw| {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("//") {
+            return false;
+        }
+        if hash_comments && line.starts_with('#') {
+            return false;
+        }
+        true
+    })
+}
+
+/// Remove `/* … */` and `<!-- … -->` block comments from `src` (crude, non-nested; an
+/// unterminated block drops to end-of-input). Every needle is ASCII so the byte
+/// offsets land on char boundaries (UTF-8 safe). Used only by [`has_code_content`].
+fn strip_block_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let slash = rest.find("/*");
+        let html = rest.find("<!--");
+        let (start, open_len, close, close_len) = match (slash, html) {
+            (Some(a), Some(b)) if a <= b => (a, 2, "*/", 2),
+            (Some(_), Some(b)) => (b, 4, "-->", 3),
+            (Some(a), None) => (a, 2, "*/", 2),
+            (None, Some(b)) => (b, 4, "-->", 3),
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        out.push_str(&rest[..start]);
+        let after = &rest[start + open_len..];
+        match after.find(close) {
+            Some(e) => rest = &after[e + close_len..],
+            None => break, // unterminated block comment → drop the remainder
+        }
+    }
+    out
 }
 
 /// Collect the project's source files (bounded: depth 8, 600 files; skips
@@ -323,5 +399,41 @@ mod tests {
         let gaps = task_acceptance_gaps(tmp.path(), "demo");
         assert_eq!(gaps.len(), 1);
         assert!(gaps[0].contains("/api/users"));
+    }
+
+    #[test]
+    fn empty_and_comment_only_stubs_do_not_count_as_source() {
+        // MEDIUM M1: a base that hallucinates "done" can leave a 0-byte or one-comment
+        // stub. Those must NOT count as delivered source (else the source-present
+        // honesty hard-gate passes on a build that produced nothing). A real tiny file
+        // DOES count.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // A 0-byte file, a whitespace-only file, and comment-only stubs across styles.
+        fs::write(tmp.path().join("src/empty.js"), "").unwrap();
+        fs::write(tmp.path().join("src/blank.ts"), "  \n\t\n").unwrap();
+        fs::write(tmp.path().join("src/todo.jsx"), "// TODO build this\n").unwrap();
+        fs::write(tmp.path().join("src/stub.css"), "/* placeholder */\n").unwrap();
+        fs::write(tmp.path().join("src/note.html"), "<!-- nothing yet -->\n").unwrap();
+        fs::write(tmp.path().join("src/hash.py"), "# placeholder\n").unwrap();
+        assert!(
+            source_files(tmp.path()).is_empty(),
+            "stubs must not be counted as real source: {:?}",
+            source_files(tmp.path())
+        );
+
+        // A genuinely tiny but REAL file is counted (no false-reject of small code) …
+        fs::write(tmp.path().join("src/main.rs"), "fn main(){}").unwrap();
+        // … as is a CSS file whose only line is an id selector (`#` is NOT a comment
+        // in CSS — it must not be mis-read as a stub) …
+        fs::write(tmp.path().join("src/app.css"), "#header{color:red}\n").unwrap();
+        // … and a Python file with a real statement after a comment line.
+        fs::write(tmp.path().join("src/run.py"), "# header\nprint(1)\n").unwrap();
+        let found = source_files(tmp.path());
+        assert_eq!(
+            found.len(),
+            3,
+            "the three real files count, the six stubs don't: {found:?}"
+        );
     }
 }

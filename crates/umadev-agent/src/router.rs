@@ -742,7 +742,7 @@ pub async fn route_via_brain(
     requirement: &str,
 ) -> RoutePlan {
     match consult_brain_oneshot(runtime, requirement).await {
-        Some(brain) => brain_to_route(&brain),
+        Some(brain) => brain_to_route(&brain, requirement),
         // Simplest possible degradation (NOT a keyword fallback): treat it as a
         // chat turn and pass it straight to the base. This path is reached only
         // after `consult_brain_oneshot` already retried a prose (non-JSON) reply
@@ -807,9 +807,8 @@ async fn triage_once(
 /// **authoritative** here (no escalate-only flooring): it decides the class, the
 /// depth (from complexity), the kind, and the implied team. An unparseable field
 /// falls back to the lightest sensible value.
-fn brain_to_route(brain: &BrainRoute) -> RoutePlan {
+fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
     let class = parse_class(&brain.class).unwrap_or(RouteClass::Chat);
-    let depth = parse_depth(&brain.complexity).unwrap_or(Depth::Fast);
     // Default kind: a mutating class (build / quick-edit / debug) whose `kind` field
     // is unparseable must NOT fall back to `Light` — `Light` convenes ZERO team, so a
     // brain that says "build, complex" but garbles `kind` would silently lose the
@@ -824,7 +823,44 @@ fn brain_to_route(brain: &BrainRoute) -> RoutePlan {
             TaskKind::Light
         }
     });
-    let team = reconcile_team(&[], kind, class, depth, &brain.needs);
+    // Depth from the brain's complexity. A garbled/missing `complexity` on a real
+    // product BUILD must NOT default to `Fast`: a Fast build is non-deliberate
+    // (`Depth::Fast.is_deliberate() == false`) AND `reconcile_team` early-returns the
+    // EMPTY team on Fast — so a brain reply `{class:build, kind:frontend_only,
+    // complexity:""}` would ship with NO UI review team and SKIP the plan+acceptance
+    // floor, while the SAME text via `/run` (`for_run` → `tier0_team` →
+    // `build_ships_ui`) gets a 3-seat UI review + the deliberate gate. Floor a
+    // PRODUCT-kind build (greenfield / frontend-only / backend-only — exactly the kinds
+    // the deterministic floor sizes to `Standard`, see `floor_class_depth`) to at least
+    // `Standard`. Light/docs/bugfix/refactor builds keep the brain's depth — a doc
+    // write or a tiny page is proportional Fast work by design (the deterministic floor
+    // keeps those Fast too), so we never over-deepen them.
+    let parsed_depth = parse_depth(&brain.complexity).unwrap_or(Depth::Fast);
+    let is_product_build = class == RouteClass::Build
+        && matches!(
+            kind,
+            TaskKind::Greenfield | TaskKind::FrontendOnly | TaskKind::BackendOnly
+        );
+    let depth = if is_product_build && parsed_depth.rank() < Depth::Standard.rank() {
+        Depth::Standard
+    } else {
+        parsed_depth
+    };
+    // Team via the SAME deterministic sizing the explicit `/run` path uses
+    // (`tier0_team`, which carries the `build_ships_ui` rescue so a Fast UI build still
+    // earns the minimal designer+frontend+QA review) — instead of
+    // `reconcile_team(&[], …)`, which early-returns EMPTY on a Fast depth and would drop
+    // the roster. A chat-surface build then gets the identical review roster as `/run`
+    // for the same input. The brain's explicit `needs` may only WIDEN it (never shrink).
+    let mut team = tier0_team(kind, class, depth, requirement);
+    let mut seen: HashSet<Seat> = team.iter().copied().collect();
+    for n in &brain.needs {
+        if let Some(s) = Seat::from_alias(n) {
+            if seen.insert(s) {
+                team.push(s);
+            }
+        }
+    }
     let scope = union_scope(&[], &brain.scope);
     let needs_clarify = build_clarify(brain);
     RoutePlan {
@@ -1194,6 +1230,35 @@ mod tests {
             "the JSON-only retry recovered the build"
         );
         assert!(!p.team.is_empty());
+    }
+
+    #[tokio::test]
+    async fn brain_build_with_blank_complexity_floors_to_deliberate_with_ui_team() {
+        // HIGH H1: a brain reply `{class:build, kind:frontend_only}` whose `complexity`
+        // is blank/garbled must NOT degrade to a Fast build with an EMPTY team that
+        // skips the plan+acceptance floor — the chat surface must get the SAME
+        // treatment `/run` gives the same input (a UI review team + the deliberate
+        // gate). The depth floors to at least Standard (deliberate) and the team is the
+        // kind-sized UI roster.
+        let brain = TriageBrain(
+            "{\"class\":\"build\",\"kind\":\"frontend_only\",\"complexity\":\"\",\"confidence\":0.7}",
+        );
+        let p = route_via_brain(&brain, "做一个落地页").await;
+        assert_eq!(p.class, RouteClass::Build);
+        assert!(
+            p.depth.is_deliberate(),
+            "a product build with blank complexity floors to a deliberate depth, got {:?}",
+            p.depth
+        );
+        assert!(
+            !p.team.is_empty(),
+            "a chat-surface UI build must convene a review team, not ship un-reviewed"
+        );
+        assert!(
+            p.team.contains(&Seat::UiuxDesigner) && p.team.contains(&Seat::FrontendEngineer),
+            "the team is the UI review roster: {:?}",
+            p.team
+        );
     }
 
     #[tokio::test]

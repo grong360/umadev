@@ -722,7 +722,13 @@ fn evaluate_tool_call(
 /// mode policy; the floor is never relaxed by a remembered rule.
 fn approval_decision(options: &RunOptions, action: &str, target: &str) -> ApprovalDecision {
     let ledger = crate::trust::TrustLedger::load(&options.project_root);
-    if requires_confirmation_with_ledger(options.mode, action, target, &ledger) {
+    if requires_confirmation_with_ledger(
+        options.mode,
+        action,
+        target,
+        &options.project_root,
+        &ledger,
+    ) {
         ApprovalDecision::Deny
     } else {
         ApprovalDecision::Allow

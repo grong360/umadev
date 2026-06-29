@@ -747,6 +747,7 @@ pub fn finalize(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: Option<&RoutePlan>,
+    clean: bool,
 ) -> FinalizeResult {
     // Only a real build with code on disk has anything to deliver. A None route
     // (legacy entry) is a no-op so existing callers are byte-for-byte unchanged.
@@ -759,6 +760,23 @@ pub fn finalize(
     // Honesty floor: nothing was built ⇒ nothing to finalize (don't scaffold docs
     // around an empty tree and call it a delivery).
     if crate::acceptance::source_files(&options.project_root).is_empty() {
+        return FinalizeResult::default();
+    }
+    // HONESTY (MEDIUM M2): finalize emits the shareable proof-pack + the delivery
+    // scorecard, which READ as "the build shipped". Producing them for an INCOMPLETE
+    // build (a blocked / stranded step, QC that never cleared) would disguise an
+    // incomplete build as success — the exact failure the spec forbids
+    // ("never disguise an incomplete build as success"). The plan-driven caller passes
+    // `clean = every step reached Done`; the single-turn caller only reaches here from
+    // inside `qc.is_clean()` (passes `true`). When NOT clean, withhold the delivery —
+    // no proof-pack, no scorecard, no retrospective docs — and surface an honest Note.
+    // Fail-open: returns the empty result, never an `Err`.
+    if !clean {
+        events.emit(EngineEvent::Note(
+            "team · delivery — withheld: the build did not settle clean (incomplete / blocked \
+             steps); no proof-pack or scorecard for an unfinished build"
+                .to_string(),
+        ));
         return FinalizeResult::default();
     }
 
@@ -1310,7 +1328,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Fast);
-        let r = finalize(&o, &ev, Some(&route));
+        let r = finalize(&o, &ev, Some(&route), true);
         assert!(!r.proof_pack, "a lean build earns no proof-pack");
         // NO scaffolded core docs — the code is the deliverable.
         for name in ["demo-prd.md", "demo-architecture.md", "demo-uiux.md"] {
@@ -1339,7 +1357,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Standard);
-        let r = finalize(&o, &ev, Some(&route));
+        let r = finalize(&o, &ev, Some(&route), true);
         assert!(r.proof_pack, "a deliberate build assembles the proof-pack");
         // A proof-pack zip landed in release/.
         let release = tmp.path().join("release");
@@ -1364,7 +1382,7 @@ mod tests {
         let ev = sink();
         let o = opts(tmp.path());
         let route = build_route(crate::router::Depth::Fast);
-        finalize(&o, &ev, Some(&route));
+        finalize(&o, &ev, Some(&route), true);
         let after = std::fs::read_to_string(&arch).unwrap();
         assert!(
             after.contains("REAL architecture written by the base"),
@@ -1378,12 +1396,12 @@ mod tests {
         // No route (legacy entry) → no-op.
         let tmp = tempfile::TempDir::new().unwrap();
         let o = opts(tmp.path());
-        assert!(!finalize(&o, &ev, None).produced_anything());
+        assert!(!finalize(&o, &ev, None, true).produced_anything());
         // A Build route but an EMPTY tree (nothing built) → no-op (don't scaffold
         // docs around a build that produced nothing).
         let route = build_route(crate::router::Depth::Standard);
         assert!(
-            !finalize(&o, &ev, Some(&route)).produced_anything(),
+            !finalize(&o, &ev, Some(&route), true).produced_anything(),
             "no source → nothing to deliver"
         );
         // A non-Build (chat/explain) route with source → no-op (nothing to ship).
@@ -1391,8 +1409,42 @@ mod tests {
         let mut chat = build_route(crate::router::Depth::Fast);
         chat.class = RouteClass::Chat;
         assert!(
-            !finalize(&o, &ev, Some(&chat)).produced_anything(),
+            !finalize(&o, &ev, Some(&chat), true).produced_anything(),
             "a chat route delivers nothing"
         );
+    }
+
+    #[test]
+    fn finalize_withholds_delivery_for_an_incomplete_build() {
+        // MEDIUM M2: a deliberate Build with real source on disk but NOT clean
+        // (blocked / stranded steps → `clean == false`) must NOT emit a proof-pack or
+        // a delivery scorecard — an incomplete build must never be disguised as
+        // success. With `clean == false` finalize produces nothing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let ev = sink();
+        let o = opts(tmp.path());
+        let route = build_route(crate::router::Depth::Standard);
+        let r = finalize(&o, &ev, Some(&route), false);
+        assert!(!r.proof_pack, "an incomplete build earns no proof-pack");
+        assert!(
+            !r.produced_anything(),
+            "an unclean build delivers nothing: {r:?}"
+        );
+        // No proof-pack zip in release/, no scaffolded core docs.
+        let release = tmp.path().join("release");
+        assert!(
+            !release.exists()
+                || std::fs::read_dir(&release)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "an incomplete build produces no release/ proof-pack"
+        );
+        for name in ["demo-prd.md", "demo-architecture.md", "demo-uiux.md"] {
+            assert!(
+                !tmp.path().join("output").join(name).is_file(),
+                "{name} must NOT be scaffolded for an incomplete build"
+            );
+        }
     }
 }

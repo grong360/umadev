@@ -79,7 +79,6 @@ const RUNTIME_LLM_SUBSTRINGS: &[&str] = &[
     "ai assistant",
     "ai chatbot",
     "ai chat",
-    "ai app",
     "ai-powered",
     "ai powered",
     "retrieval augmented",
@@ -92,7 +91,14 @@ const RUNTIME_LLM_SUBSTRINGS: &[&str] = &[
 /// (so they don't fire inside unrelated words). Each also implies the app calls a
 /// model at runtime. Provider names live in [`PROVIDER_PATTERNS`] and are checked
 /// the same way.
-const RUNTIME_LLM_WORDS: &[&str] = &["llm", "gpt", "chatgpt", "rag", "agent", "copilot", "prompt"];
+const RUNTIME_LLM_WORDS: &[&str] = &["llm", "gpt", "chatgpt", "rag", "copilot"];
+
+/// Tokens that signal a runtime LLM ONLY when an `ai` token co-occurs (MEDIUM M8).
+/// Bare `agent` / `prompt` are common in NON-AI domains — "real estate agent CRM",
+/// "travel agent booking", "prompt the user to confirm payment" — so on their own they
+/// false-flagged ordinary apps. Requiring an accompanying `ai` keeps "AI agent" /
+/// "AI prompt" while dropping the non-AI false positives.
+const RUNTIME_LLM_WORDS_AI_QUALIFIED: &[&str] = &["agent", "prompt"];
 
 /// Provider / model recognisers, in priority order (more specific first). Each
 /// entry is `(matchers, canonical_label)`: if ANY matcher hits (CJK matchers by
@@ -148,11 +154,37 @@ pub fn app_calls_llm_at_runtime(requirement: &str) -> bool {
     if RUNTIME_LLM_SUBSTRINGS.iter().any(|s| lower.contains(s)) {
         return true;
     }
+    // "ai app" / "ai apps" / "ai application" — matched at a WORD boundary (MEDIUM M8):
+    // a plain `contains("ai app")` mis-fired on "Shang(hai app)" / "Du(bai app)", so it
+    // is matched as the adjacent token pair `ai` + an `app…` token instead.
+    if has_ai_app(&lower) {
+        return true;
+    }
     if RUNTIME_LLM_WORDS.iter().any(|w| has_word(&lower, w)) {
+        return true;
+    }
+    // `agent` / `prompt` count only alongside an `ai` token (they are otherwise common
+    // in non-AI domains) — see [`RUNTIME_LLM_WORDS_AI_QUALIFIED`].
+    if has_word(&lower, "ai")
+        && RUNTIME_LLM_WORDS_AI_QUALIFIED
+            .iter()
+            .any(|w| has_word(&lower, w))
+    {
         return true;
     }
     // Naming a runtime provider/model is itself proof the app calls an LLM.
     stated_runtime_model(requirement).is_some()
+}
+
+/// Whether `lower` (already lowercased) contains the phrase "ai app" at a WORD
+/// boundary — i.e. an `ai` token immediately followed by a token starting with `app`
+/// (`app` / `apps` / `application`). This avoids the substring false-positive where
+/// "shanghai app" / "dubai app" contain "ai app" mid-word. Splits on every
+/// non-alphanumeric byte, mirroring [`has_word`].
+fn has_ai_app(lower: &str) -> bool {
+    let toks: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+    toks.windows(2)
+        .any(|w| w[0] == "ai" && w[1].starts_with("app"))
 }
 
 /// The runtime model / provider the user explicitly named for the BUILT APP, as a
@@ -275,6 +307,38 @@ mod tests {
         // …but a real token does match.
         assert!(app_calls_llm_at_runtime("add a RAG pipeline"));
         assert!(app_calls_llm_at_runtime("call the gpt model"));
+    }
+
+    #[test]
+    fn bare_agent_prompt_and_ai_app_substring_do_not_false_flag_non_ai_apps() {
+        // MEDIUM M8: bare `agent` / `prompt` are common in NON-AI domains, and a plain
+        // "ai app" substring matches inside "Shanghai app" / "Dubai app". None of these
+        // must be flagged as a runtime-LLM app (which would inject the ~1.2KB directive).
+        for req in [
+            "a real estate agent CRM",
+            "travel agent booking platform",
+            "prompt the user to confirm payment",
+            "build a Shanghai app for restaurant reviews",
+            "a Dubai app directory",
+        ] {
+            assert!(
+                !app_calls_llm_at_runtime(req),
+                "must NOT false-flag a non-AI app: {req}"
+            );
+        }
+        // …but a genuine AI signal still fires: an `ai` token alongside agent/prompt, or
+        // a real "ai app" word phrase.
+        for req in [
+            "build an AI agent for support",
+            "an AI prompt playground",
+            "ship an AI app for note-taking",
+            "an AI application for triage",
+        ] {
+            assert!(
+                app_calls_llm_at_runtime(req),
+                "a real AI signal must still fire: {req}"
+            );
+        }
     }
 
     #[test]

@@ -350,6 +350,24 @@ fn path_touches_vcs(s: &str) -> bool {
 /// ([`TrustMode::gates_auto_approve`]); it is not this per-tool-call decision.
 #[must_use]
 pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) -> bool {
+    // No workspace root at this entry → the legacy system-root heuristic for escape
+    // detection (backward-compatible for the binary / TUI callers, which pass an empty
+    // target for the git-push / deploy confirms they use this for). The run-time base
+    // gate uses [`requires_confirmation_with_ledger`], which threads the REAL root.
+    requires_confirmation_rooted(mode, command, target_path, None)
+}
+
+/// Root-aware core of [`requires_confirmation`]. When `workspace_root` is `Some`, an
+/// absolute write target is "out of tree" iff it does NOT lie under that real root
+/// (MEDIUM M4 — the precise escape check); when `None`, the legacy conservative
+/// system-root denylist decides (so the public 3-arg entry is unchanged).
+#[must_use]
+fn requires_confirmation_rooted(
+    mode: TrustMode,
+    command: &str,
+    target_path: &str,
+    workspace_root: Option<&Path>,
+) -> bool {
     // 1) Always-on irreversible floor — bypass-immune in EVERY mode (even Auto).
     if reversibility_class(command, target_path).always_escalates() {
         return true;
@@ -360,7 +378,7 @@ pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) 
     //    reversible actions below.
     let cap = capability_class(command, target_path);
     let out_of_tree_write =
-        matches!(cap, Capability::Write) && target_escapes_workspace(target_path);
+        matches!(cap, Capability::Write) && target_escapes_workspace(target_path, workspace_root);
     match mode {
         // Fully autonomous: only the hard floor (handled above) escalates.
         TrustMode::Auto => false,
@@ -388,7 +406,7 @@ pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) 
 /// absolute roots count as "system" so a temp/working project directory (e.g.
 /// `/var/folders/...`, `/private/...`) is never mis-flagged as an escape.
 #[must_use]
-fn target_escapes_workspace(target_path: &str) -> bool {
+fn target_escapes_workspace(target_path: &str, workspace_root: Option<&Path>) -> bool {
     let p = target_path.trim();
     if p.is_empty() {
         return false;
@@ -401,19 +419,64 @@ fn target_escapes_workspace(target_path: &str) -> bool {
     if p.split(['/', '\\']).any(|seg| seg == "..") {
         return true;
     }
-    // Absolute UNIX system roots that never hold a user's project workspace.
-    // (`/var`, `/private`, `/opt` are intentionally excluded — temp/working
-    // project dirs live there, so flagging them would mis-escalate in-tree work.)
-    const SYSTEM_ROOTS: &[&str] = &[
-        "/etc/", "/usr/", "/bin/", "/sbin/", "/sys/", "/proc/", "/dev/", "/boot/", "/root/",
-        "/lib/",
-    ];
-    let lower = p.to_ascii_lowercase();
-    if SYSTEM_ROOTS.iter().any(|r| lower.starts_with(r)) {
-        return true;
+    if Path::new(p).is_absolute() {
+        // MEDIUM M4 — root-aware escape detection. When we know the REAL workspace
+        // root, an absolute target is in-tree ONLY when it lies under that root; ANY
+        // other absolute path (a system dir, `/opt`, `/var`, `/Library/LaunchAgents`,
+        // another user's home) escapes and must be confirmed. The old short denylist
+        // was inverted-from-safe: it allowed everything NOT on a tiny system list, so a
+        // write to e.g. `/Library/LaunchAgents/` slipped through Guarded (the default).
+        if let Some(root) = workspace_root {
+            return !absolute_is_under(Path::new(p), root);
+        }
+        // No root available (the legacy 3-arg entry): fall back to the conservative
+        // system-root denylist — unchanged behavior for callers that can't supply a
+        // root (their targets are empty / git-push-class anyway).
+        const SYSTEM_ROOTS: &[&str] = &[
+            "/etc/", "/usr/", "/bin/", "/sbin/", "/sys/", "/proc/", "/dev/", "/boot/", "/root/",
+            "/lib/",
+        ];
+        let lower = p.to_ascii_lowercase();
+        if SYSTEM_ROOTS.iter().any(|r| lower.starts_with(r)) {
+            return true;
+        }
+        // Windows system roots.
+        return lower.starts_with("c:\\windows") || lower.starts_with("c:\\program files");
     }
-    // Windows system roots.
-    lower.starts_with("c:\\windows") || lower.starts_with("c:\\program files")
+    // A project-relative path stays in-tree (it is written relative to the run cwd =
+    // the workspace, and the checkpoint can rewind it).
+    false
+}
+
+/// Whether absolute `path` lies under absolute `root`, decided LEXICALLY (no IO — the
+/// write target may not exist yet, so `canonicalize` is unavailable). Normalizes away
+/// `.` segments and compares path components; `root`'s components must be a prefix of
+/// `path`'s. Fail-open toward the safe answer: a non-absolute root, or any case we
+/// can't positively confirm as contained, returns `false` (treated as an escape →
+/// confirm). Used only by [`target_escapes_workspace`].
+#[must_use]
+fn absolute_is_under(path: &Path, root: &Path) -> bool {
+    use std::path::Component;
+    let norm = |p: &Path| -> Vec<std::ffi::OsString> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::CurDir => None,
+                Component::Normal(s) => Some(s.to_os_string()),
+                Component::RootDir => Some(std::ffi::OsString::from("/")),
+                Component::Prefix(pre) => Some(pre.as_os_str().to_os_string()),
+                Component::ParentDir => Some(std::ffi::OsString::from("..")),
+            })
+            .collect()
+    };
+    if !root.is_absolute() {
+        return false;
+    }
+    let rp = norm(root);
+    let pp = norm(path);
+    if rp.is_empty() || pp.len() < rp.len() {
+        return false;
+    }
+    pp[..rp.len()] == rp[..]
 }
 
 /// The stable class key under which an APPROVED reversible action is remembered
@@ -426,6 +489,21 @@ fn target_escapes_workspace(target_path: &str) -> bool {
 /// an in-tree vs. out-of-tree write, or a local shell command.
 #[must_use]
 fn remembered_class(command: &str, target_path: &str) -> Option<&'static str> {
+    remembered_class_rooted(command, target_path, None)
+}
+
+/// Root-aware [`remembered_class`]: classifies a write as in/out-of-tree using the
+/// REAL workspace root when supplied (MEDIUM M4), so an out-of-tree write the legacy
+/// denylist would miss is keyed `write_out_of_tree` (not `write_in_tree`) — keeping
+/// the ledger key consistent with the root-aware gate, so a remembered IN-tree
+/// approval can never silently auto-allow an OUT-of-tree write. `None` root → the
+/// legacy heuristic (back-compat for the `command`/`target`-only ledger methods).
+#[must_use]
+fn remembered_class_rooted(
+    command: &str,
+    target_path: &str,
+    workspace_root: Option<&Path>,
+) -> Option<&'static str> {
     // Irreversible-floor actions are NEVER remembered — they always re-confirm.
     if reversibility_class(command, target_path).always_escalates() {
         return None;
@@ -434,7 +512,7 @@ fn remembered_class(command: &str, target_path: &str) -> Option<&'static str> {
         // A read is auto-allowed in every mode → nothing to remember.
         // Network is always a floor action → handled above, never reaches here.
         Capability::Read | Capability::Network => None,
-        Capability::Write => Some(if target_escapes_workspace(target_path) {
+        Capability::Write => Some(if target_escapes_workspace(target_path, workspace_root) {
             "write_out_of_tree"
         } else {
             "write_in_tree"
@@ -457,16 +535,21 @@ pub fn requires_confirmation_with_ledger(
     mode: TrustMode,
     command: &str,
     target_path: &str,
+    workspace_root: &Path,
     ledger: &TrustLedger,
 ) -> bool {
     // Floor first — a remembered rule can NEVER skip an irreversible action.
     if reversibility_class(command, target_path).always_escalates() {
         return true;
     }
-    // Reversible: if the per-mode policy would confirm it, skip the prompt only
-    // when the user has already approved this action class for THIS project.
-    if requires_confirmation(mode, command, target_path) {
-        return !ledger.remembers(command, target_path);
+    // Reversible: if the ROOT-AWARE per-mode policy would confirm it (MEDIUM M4 — an
+    // absolute write outside the REAL workspace now correctly escalates), skip the
+    // prompt only when the user has already approved this action class for THIS
+    // project. The remembered class is computed root-aware too, so a `write_in_tree`
+    // rule can't relax an out-of-tree write.
+    if requires_confirmation_rooted(mode, command, target_path, Some(workspace_root)) {
+        let key = remembered_class_rooted(command, target_path, Some(workspace_root));
+        return !key.is_some_and(|k| ledger.allow_rules.contains(k));
     }
     false
 }
@@ -481,7 +564,14 @@ pub fn requires_confirmation_with_ledger(
 /// learning never blocks the pipeline.
 pub fn remember_project_approval(project_root: &Path, command: &str, target_path: &str) -> bool {
     let mut ledger = TrustLedger::load(project_root);
-    if ledger.remember_approval(command, target_path) {
+    // Root-aware class (MEDIUM M4): record the key the root-aware gate
+    // ([`requires_confirmation_with_ledger`]) actually checks, so approving an
+    // out-of-tree write under THIS project records `write_out_of_tree` — matching the
+    // gate — rather than the legacy heuristic's possibly-wrong `write_in_tree`.
+    let Some(key) = remembered_class_rooted(command, target_path, Some(project_root)) else {
+        return false;
+    };
+    if ledger.allow_rules.insert(key.to_string()) {
         ledger.save(project_root);
         true
     } else {
@@ -562,27 +652,44 @@ pub fn capability_class(command: &str, target_path: &str) -> Capability {
 /// Read-only shell verbs whose presence keeps an action at [`Capability::Read`].
 /// Whitespace-bounded so `cat` doesn't match `category`.
 fn is_read_only_command(cmd: &str) -> bool {
+    let c = cmd.trim();
+    // MEDIUM M3: a read verb must NOT smuggle a side-effecting command past the gate by
+    // CHAINING — `echo go && ./deploy.sh` STARTS with `echo ` but actually runs
+    // `./deploy.sh`, so a `starts_with` match would classify it Read and Plan/Guarded
+    // would auto-allow the script. Any shell separator / redirection / command
+    // substitution means the line does MORE than its leading read verb, so the WHOLE
+    // line is treated as Shell (not read-only) → Plan confirms it. (Trim FIRST so a
+    // benign trailing newline isn't mistaken for an internal separator.)
+    const SEPARATORS: &[&str] = &[
+        "&&", "||", ";", "|", "&", "$(", "${", "`", "\n", "\r", ">", "<",
+    ];
+    if SEPARATORS.iter().any(|s| c.contains(s)) {
+        return false;
+    }
+    // Read-only verbs, matched against ONLY the first token/verb (exact, or the verb
+    // followed by a space — so `cat` doesn't match `category` and a read verb can't be
+    // the prefix of a different command). Whitespace-bounded by construction.
     const READ_VERBS: &[&str] = &[
-        "cat ",
-        "ls ",
-        "ls\n",
-        "grep ",
-        "rg ",
-        "find ",
-        "head ",
-        "tail ",
-        "less ",
+        "cat",
+        "ls",
+        "grep",
+        "rg",
+        "find",
+        "head",
+        "tail",
+        "less",
         "git status",
         "git log",
         "git diff",
         "git show",
         "pwd",
-        "echo ",
-        "which ",
-        "stat ",
+        "echo",
+        "which",
+        "stat",
     ];
-    let c = cmd.trim_start();
-    READ_VERBS.iter().any(|v| c == v.trim() || c.starts_with(v))
+    READ_VERBS
+        .iter()
+        .any(|v| c == *v || c.starts_with(&format!("{v} ")))
 }
 
 /// Per-capability autonomy posture: may an action of this capability run without
@@ -1213,6 +1320,7 @@ mod tests {
         // T2: an APPROVED reversible class persists + isn't re-asked for THIS
         // project. Guarded confirms an out-of-tree write; after the user approves
         // it once, the same class auto-allows.
+        let root = Path::new("/work/project");
         let (cmd, tgt) = ("", "/etc/hosts");
         let empty = TrustLedger::default();
         // Before learning: guarded would confirm.
@@ -1220,6 +1328,7 @@ mod tests {
             TrustMode::Guarded,
             cmd,
             tgt,
+            root,
             &empty
         ));
         // Learn the approval.
@@ -1231,7 +1340,7 @@ mod tests {
         assert!(led.allow_rules.contains("write_out_of_tree"));
         // After learning: not re-asked.
         assert!(
-            !requires_confirmation_with_ledger(TrustMode::Guarded, cmd, tgt, &led),
+            !requires_confirmation_with_ledger(TrustMode::Guarded, cmd, tgt, root, &led),
             "an approved class is not re-asked"
         );
         // A DIFFERENT reversible class the user did NOT approve is still asked.
@@ -1239,6 +1348,7 @@ mod tests {
             TrustMode::Plan,
             "cargo test",
             "",
+            root,
             &led
         ));
     }
@@ -1255,6 +1365,7 @@ mod tests {
             TrustMode::Guarded,
             "",
             "/etc/hosts",
+            tmp.path(),
             &back
         ));
         // No stray temp file left behind by the atomic write.
@@ -1267,6 +1378,7 @@ mod tests {
             TrustMode::Guarded,
             "",
             "/etc/hosts",
+            tmp2.path(),
             &none
         ));
     }
@@ -1295,7 +1407,13 @@ mod tests {
             led.allow_rules.insert("network".into());
             for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
                 assert!(
-                    requires_confirmation_with_ledger(mode, cmd, tgt, &led),
+                    requires_confirmation_with_ledger(
+                        mode,
+                        cmd,
+                        tgt,
+                        Path::new("/work/project"),
+                        &led
+                    ),
                     "floor {cmd:?}/{tgt:?} still confirms in {mode:?} despite forged rules"
                 );
                 assert!(
@@ -1303,6 +1421,80 @@ mod tests {
                     "floor {cmd:?}/{tgt:?} is never 'remembered'"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn chained_read_verb_does_not_smuggle_a_side_effecting_command() {
+        // MEDIUM M3: `echo go && ./deploy.sh` STARTS with a read verb but actually runs
+        // a script — it must NOT be classified Read (which would let Plan/Guarded
+        // auto-allow it). Any shell separator → the whole line is Shell.
+        for chained in [
+            "echo go && ./deploy.sh",
+            "cat x; rm -rf build",
+            "ls | sh",
+            "echo $(reboot)",
+            "echo go > /etc/hosts",
+            "grep foo bar`./deploy.sh`",
+        ] {
+            assert!(
+                !is_read_only_command(&chained.to_ascii_lowercase()),
+                "a chained/redirecting line is not read-only: {chained:?}"
+            );
+            // It must NOT be classified Read (the bug: a read verb smuggling a
+            // side-effecting command past the gate). Shell — or the stricter Network /
+            // floor — is fine; all of them confirm under Plan.
+            assert_ne!(
+                capability_class(chained, ""),
+                Capability::Read,
+                "a chained read verb must not classify as Read: {chained:?}"
+            );
+            // Plan (read-only) must therefore CONFIRM it rather than allow it.
+            assert!(
+                requires_confirmation(TrustMode::Plan, chained, ""),
+                "plan must confirm a smuggled side-effecting command: {chained:?}"
+            );
+        }
+        // A genuine bare read verb is still Read (and Plan auto-allows it).
+        for read in ["cat src/main.rs", "ls", "git status", "grep foo bar"] {
+            assert!(is_read_only_command(&read.to_ascii_lowercase()), "{read:?}");
+            assert_eq!(capability_class(read, ""), Capability::Read, "{read:?}");
+            assert!(
+                !requires_confirmation(TrustMode::Plan, read, ""),
+                "plan allows a pure read: {read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_tree_absolute_write_escalates_in_guarded_with_real_root() {
+        // MEDIUM M4: the DEFAULT (Guarded) mode must confirm an absolute write that
+        // lands OUTSIDE the real workspace root — even paths the old short denylist
+        // missed (`/Library/LaunchAgents/`, `/opt/`, `/var/`, another user's home).
+        let root = Path::new("/Users/me/project");
+        let ledger = TrustLedger::default();
+        for outside in [
+            "/Library/LaunchAgents/evil.plist",
+            "/opt/boot/x",
+            "/var/root/x",
+            "/Users/other/.ssh/authorized_keys",
+            "/private/etc/cron.d/x",
+        ] {
+            assert!(
+                requires_confirmation_with_ledger(TrustMode::Guarded, "", outside, root, &ledger),
+                "guarded (default) must confirm an out-of-tree write: {outside}"
+            );
+        }
+        // An in-tree write (relative, or absolute UNDER the real root) stays automatic.
+        for inside in [
+            "src/app.tsx",
+            "/Users/me/project/src/app.tsx",
+            "/Users/me/project/output/demo-prd.md",
+        ] {
+            assert!(
+                !requires_confirmation_with_ledger(TrustMode::Guarded, "", inside, root, &ledger),
+                "an in-tree write must stay automatic in guarded: {inside}"
+            );
         }
     }
 

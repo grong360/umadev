@@ -705,6 +705,23 @@ fn has_heavy_signal(q: &str) -> bool {
         "上传",
         "实时",
         "推送",
+        // E-commerce / marketplace — accounts + payments + inventory + persistence by
+        // nature, so NEVER a light build no matter how casually phrased ("做一个简单的
+        // 购物网站"). M6: the heavy list previously lacked commerce nouns, so a
+        //商城 / 购物 / shop / store slipped onto the Light path (skipping research /
+        // docs / both confirm gates / delivery for a product that needs all of them).
+        "电商",
+        "商城",
+        "购物",
+        "购物车",
+        "网店",
+        "店铺",
+        "商店",
+        "下单",
+        "库存",
+        "商品",
+        "卖家",
+        "买家",
         "auth",
         "login",
         "signup",
@@ -738,6 +755,15 @@ fn has_heavy_signal(q: &str) -> bool {
         "multi-module",
         "enterprise",
         "scalable",
+        // E-commerce / marketplace (en).
+        "ecommerce",
+        "e-commerce",
+        "shop",
+        "store",
+        "storefront",
+        "marketplace",
+        "shopping cart",
+        "inventory",
     ])
 }
 
@@ -1244,6 +1270,33 @@ mod tests {
     fn defaults_to_greenfield() {
         assert_eq!(classify("做一个待办事项应用"), TaskKind::Greenfield);
         assert_eq!(classify("帮我做个 SaaS 产品"), TaskKind::Greenfield);
+    }
+
+    #[test]
+    fn an_explicitly_simple_ecommerce_build_is_not_downgraded_to_light() {
+        // MEDIUM M6: a commerce build needs accounts + payments + inventory +
+        // persistence, so even when phrased as "simple" it must NOT take the Light path
+        // (which skips research / docs / both confirm gates / delivery). The heavy
+        // signal now carries commerce nouns, so the smallness words are vetoed.
+        for r in [
+            "做一个简单的电商网站",
+            "做一个简易的购物商城",
+            "做一个简单的网上商店单页",
+            "a simple ecommerce site",
+            "build a simple online store",
+            "just a simple shopping cart app",
+            "a small marketplace demo",
+        ] {
+            assert_ne!(
+                classify(r),
+                TaskKind::Light,
+                "a commerce build must not downgrade to Light: {r}"
+            );
+            assert!(
+                !is_lean_build(r),
+                "a commerce build is not a lean fast-path build: {r}"
+            );
+        }
     }
 
     #[test]
