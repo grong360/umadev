@@ -261,7 +261,7 @@ pub fn for_run(requirement: &str) -> RoutePlan {
         if matches!(r.depth, Depth::Fast) && r.team.is_empty() {
             // keep Fast (proportional) but give it a build team
         }
-        r.team = tier0_team(r.kind, RouteClass::Build, r.depth);
+        r.team = tier0_team(r.kind, RouteClass::Build, r.depth, requirement);
         r.est_budget = Budget::for_route(RouteClass::Build, r.depth);
     }
     r
@@ -307,7 +307,7 @@ fn tier0(requirement: &str) -> RoutePlan {
     // over-commits: an ambiguous "看看这个" stays Explain, not Build, and the brain
     // (Tier-1) may escalate it — but a keyword-flagged real build starts at Build.
     let (class, depth) = floor_class_depth(kind, is_work, requirement);
-    let team = tier0_team(kind, class, depth);
+    let team = tier0_team(kind, class, depth, requirement);
     let scope = path_hints_from_text(requirement);
     RoutePlan {
         class,
@@ -395,7 +395,13 @@ fn floor_class_depth(kind: TaskKind, is_work: bool, requirement: &str) -> (Route
         // single-writer edit, no plan). Both are Fast — proportional, no heavy
         // process. (Tier-1's brain refines this when it's available.)
         TaskKind::Light => {
-            if is_create_request(requirement) {
+            // A doc artifact (README / changelog / a single markdown doc) is a quick
+            // file write, NOT a product build — keep it on the QuickEdit path (a fast
+            // single-writer turn, no plan synthesis, no team) even though it
+            // "creates" a file. Only a NON-doc create (a tiny UI page / app) becomes a
+            // fast Build, which gets the short visible plan and the minimal UI review
+            // when it actually ships UI (see `build_ships_ui`).
+            if is_create_request(requirement) && !crate::planner::is_doc_task(requirement) {
                 (RouteClass::Build, Depth::Fast)
             } else {
                 (RouteClass::QuickEdit, Depth::Fast)
@@ -404,22 +410,30 @@ fn floor_class_depth(kind: TaskKind, is_work: bool, requirement: &str) -> (Route
     }
 }
 
-/// Tier-0 team for a (kind, class, depth). Reuses the planner's complexity sense:
-/// a fast/light turn convenes NO team; a standard/deep build convenes the seats the
-/// kind needs. Deterministic; the brain may widen it during reconciliation.
-fn tier0_team(kind: TaskKind, class: RouteClass, depth: Depth) -> Vec<Seat> {
+/// Tier-0 team for a (kind, class, depth, requirement). Reuses the planner's
+/// complexity sense: a fast/light turn convenes NO team; a standard/deep build
+/// convenes the seats the kind needs. Deterministic; the brain may widen it during
+/// reconciliation.
+fn tier0_team(kind: TaskKind, class: RouteClass, depth: Depth, requirement: &str) -> Vec<Seat> {
     // Pure conversation / read-only explanation → no team (it's overhead there).
     if matches!(class, RouteClass::Chat | RouteClass::Explain) {
         return Vec::new();
     }
-    // A real BUILD ALWAYS convenes a team — even a Fast one. A chat-built page is
-    // still a delivery and its UI/quality must be reviewed (the audit caught a Fast
-    // build convening ZERO critics → a landing page shipped un-reviewed). A Fast
-    // build gets a MINIMAL review team (designer + frontend + QA, the UI-quality
-    // core); a deliberate build gets the full kind-sized roster.
     if matches!(class, RouteClass::Build) {
         if depth == Depth::Fast {
-            return vec![Seat::UiuxDesigner, Seat::FrontendEngineer, Seat::QaEngineer];
+            // A Fast build earns the MINIMAL UI review core (designer + frontend + QA)
+            // ONLY when it actually ships a user-facing UI surface — a chat-built page
+            // IS a delivery and its UI/quality must be reviewed (the audit caught a
+            // Fast build convening ZERO critics → a landing page shipped un-reviewed).
+            // A Fast build that ships NO UI — a README / changelog / doc, a small
+            // script, a tiny non-UI change — is NOT a UI delivery and convenes NO team:
+            // reviewing a README with a designer + frontend + QA is pure token waste
+            // (the user-reported "generating a README runs a full review" case). The
+            // full kind-sized roster stays on a deliberate build below.
+            if build_ships_ui(kind, requirement) {
+                return vec![Seat::UiuxDesigner, Seat::FrontendEngineer, Seat::QaEngineer];
+            }
+            return Vec::new();
         }
         return Seat::team_for_kind(kind);
     }
@@ -429,6 +443,23 @@ fn tier0_team(kind: TaskKind, class: RouteClass, depth: Depth) -> Vec<Seat> {
         return Vec::new();
     }
     Seat::team_for_kind(kind)
+}
+
+/// Whether a Fast BUILD actually ships a user-facing UI surface — the signal that
+/// decides if it earns the minimal UI review core ([`tier0_team`]). The UI-bearing
+/// kinds (`Greenfield` / `FrontendOnly`) always do; a `Light` build does ONLY when it
+/// names a frontend surface AND is not a documentation artifact (a README / changelog
+/// / doc ships no UI). Everything else (a backend / script build, a bugfix, a refactor,
+/// a docs task) ships no UI and convenes no review team on the Fast path. Deterministic.
+fn build_ships_ui(kind: TaskKind, requirement: &str) -> bool {
+    match kind {
+        TaskKind::Greenfield | TaskKind::FrontendOnly => true,
+        TaskKind::Light => {
+            crate::planner::mentions_ui_surface(requirement)
+                && !crate::planner::is_doc_task(requirement)
+        }
+        TaskKind::BackendOnly | TaskKind::Bugfix | TaskKind::Refactor | TaskKind::DocsOnly => false,
+    }
 }
 
 /// A deterministic confidence for the Tier-0 verdict: high at the clear poles
@@ -1199,6 +1230,79 @@ mod tests {
             p.class,
             RouteClass::Build,
             "a create request must be a Build"
+        );
+    }
+
+    #[tokio::test]
+    async fn doc_request_is_a_light_quick_edit_with_no_team() {
+        // The user-reported case: "generate a README" must NOT route to a heavyweight
+        // build with a review team. A doc artifact is a quick file write — QuickEdit
+        // (no plan synth, no team), and the lean QC short-circuit fires.
+        for r in [
+            "生成一个 README.md",
+            "帮我写个 README 文件",
+            "generate a README.md for this repo",
+            "生成更新日志",
+        ] {
+            let p = route(None, &opts(), r).await;
+            assert_eq!(p.depth, Depth::Fast, "a doc is fast: {r}");
+            assert!(
+                matches!(p.class, RouteClass::QuickEdit),
+                "a doc artifact is a QuickEdit, not a Build: {r} (got {:?})",
+                p.class
+            );
+            assert!(p.team.is_empty(), "a doc convenes NO review team: {r}");
+        }
+    }
+
+    #[test]
+    fn run_on_a_doc_forces_build_but_still_convenes_no_team() {
+        // `/run` always forces a Build (the explicit-run contract), but the SIZING must
+        // still scale a doc down: a Fast doc build ships no UI, so it convenes NO review
+        // team — belt against a mis-classification exploding into a full review.
+        for r in [
+            "生成一个 README.md",
+            "/run 生成 README",
+            "write a CHANGELOG file",
+        ] {
+            let p = for_run(r);
+            assert_eq!(p.class, RouteClass::Build, "/run forces Build: {r}");
+            assert!(
+                p.team.is_empty(),
+                "a doc build convenes NO review team even under /run: {r} (team {:?})",
+                p.team
+            );
+        }
+    }
+
+    #[test]
+    fn ui_light_build_keeps_its_minimal_review_team() {
+        // The guardrail must NOT regress: a genuine (small) UI page still earns the
+        // minimal UI review core (designer + frontend + QA) — only non-UI docs/scripts
+        // lose the team.
+        let p = for_run("做一个简单的待办单页应用,纯前端,添加/删除");
+        assert_eq!(p.class, RouteClass::Build);
+        assert!(
+            p.team.contains(&Seat::FrontendEngineer) && p.team.contains(&Seat::UiuxDesigner),
+            "a UI page keeps the minimal UI review team (got {:?})",
+            p.team
+        );
+    }
+
+    #[test]
+    fn genuine_full_build_still_convenes_the_full_team() {
+        // The heavyweight path is INTACT: a real product build convenes the full
+        // kind-sized roster (the review/quality machinery the task must not degrade).
+        let p = for_run("做一个完整的电商网站,带账号、商品、购物车、支付和后台管理");
+        assert_eq!(p.class, RouteClass::Build);
+        assert!(
+            p.depth.is_deliberate(),
+            "a real product is a deliberate build"
+        );
+        assert!(
+            p.team.len() >= 5,
+            "a greenfield product convenes the full roster (got {:?})",
+            p.team
         );
     }
 

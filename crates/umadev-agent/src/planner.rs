@@ -254,6 +254,75 @@ fn mentions_frontend(q: &str) -> bool {
     FE.iter().any(|n| q.contains(n))
 }
 
+/// Whether `requirement` names a user-facing UI surface (a frontend page /
+/// component / style). Public wrapper over the internal frontend-token check so the
+/// router can decide whether a lean `Light` build actually ships UI (and thus
+/// warrants the minimal UI review) or is a non-UI doc / script (which does not).
+#[must_use]
+pub fn mentions_ui_surface(requirement: &str) -> bool {
+    mentions_frontend(&requirement.to_lowercase())
+}
+
+/// Whether `requirement` asks to produce a LIGHT documentation artifact — a README,
+/// a changelog, a license, a contributing guide, a usage / install note, or a single
+/// markdown doc. A doc FILE is a write-one-file task, NOT a product build, so it
+/// takes the leanest path (no team, no pipeline, no review loop) — the user-reported
+/// "generating a README runs a full review" case. This is deliberately DISTINCT from
+/// [`TaskKind::DocsOnly`], which is a heavyweight PLANNING doc (a PRD / 需求文档 /
+/// 技术方案 / 调研报告 that legitimately earns a PM + architect + designer doc-review):
+/// a README is just a file. Callers still veto on [`has_heavy_signal`] so "a
+/// readme-generator SaaS platform" (a real product that merely mentions a readme) is
+/// never downgraded. Deterministic + fail-open.
+#[must_use]
+pub fn is_doc_task(requirement: &str) -> bool {
+    is_doc_artifact(&requirement.to_lowercase())
+}
+
+/// The doc-artifact token check over an already-lowercased string — the shared body
+/// of [`is_doc_task`] and [`classify`]'s doc step (so the latter reuses its own
+/// lowercased `q` without re-allocating).
+fn is_doc_artifact(q: &str) -> bool {
+    let has = |needles: &[&str]| needles.iter().any(|n| q.contains(n));
+    has(&[
+        // Canonical repo doc files (en).
+        "readme",
+        "read me",
+        "changelog",
+        "change log",
+        "license",
+        "licence",
+        "contributing",
+        "code of conduct",
+        "docstring",
+        "doc string",
+        // Canonical repo doc files / usage docs (zh).
+        "更新日志",
+        "变更日志",
+        "更新记录",
+        "许可证",
+        "开源协议",
+        "贡献指南",
+        "行为准则",
+        "使用说明",
+        "使用文档",
+        "使用手册",
+        "说明文档",
+        "安装说明",
+        "安装文档",
+        "操作手册",
+        "用户手册",
+        "用户指南",
+        "用户文档",
+        // A single markdown doc, explicitly.
+        "markdown 文档",
+        "markdown文档",
+        "一个 markdown",
+        "一个markdown",
+        "一个 md 文件",
+        "个 md 文件",
+    ])
+}
+
 /// `true` when the requirement names a backend / server / data surface — shared
 /// with [`classify`].
 fn mentions_backend(q: &str) -> bool {
@@ -375,6 +444,20 @@ pub fn classify(requirement: &str) -> TaskKind {
         "bump the version",
         "typo",
     ]) {
+        return TaskKind::Light;
+    }
+
+    // 4.5. Light documentation artifact — a README / changelog / license /
+    //      contributing guide / usage doc / a single markdown doc. A doc FILE is a
+    //      write-one-file task, NOT a product build, so it takes the LEANEST path
+    //      (Light): no team, no pipeline, no review loop. THIS is the root fix for the
+    //      user-reported "generating a README runs a full review" case — without it a
+    //      README matches no narrower needle and falls through to the heavyweight
+    //      `Greenfield` default below. Guarded by `!has_heavy_signal` so a docs
+    //      PLATFORM / a product that merely mentions a doc is never downgraded; a
+    //      heavyweight PLANNING doc (PRD / 需求文档 / 技术方案) already matched DocsOnly
+    //      above and keeps its full doc-review.
+    if is_doc_artifact(&q) && !has_heavy_signal(&q) {
         return TaskKind::Light;
     }
 
@@ -907,6 +990,71 @@ mod tests {
     fn classifies_docs_only() {
         assert_eq!(classify("先写需求文档"), TaskKind::DocsOnly);
         assert_eq!(classify("写个方案给我看看"), TaskKind::DocsOnly);
+    }
+
+    #[test]
+    fn classifies_doc_artifacts_as_light() {
+        // The user-reported case: generating a README / changelog / license / usage
+        // doc is a write-one-file task — the LEANEST path (Light), NOT a Greenfield
+        // product build. Before this fix a README matched no narrower needle and fell
+        // through to the heavyweight `Greenfield` default → a full review team.
+        for r in [
+            "生成一个 README.md",
+            "帮我写个 README",
+            "generate a README.md for this project",
+            "write a readme",
+            "生成更新日志",
+            "update the changelog", // "update" + "changelog" → doc artifact (Light)
+            "加一个 LICENSE 文件",
+            "写一份使用说明文档",
+            "生成安装说明",
+            "create a CONTRIBUTING guide",
+            "写一个 markdown 文档介绍用法",
+        ] {
+            assert_eq!(
+                classify(r),
+                TaskKind::Light,
+                "doc artifact should be Light: {r}"
+            );
+            // A Light doc is on the lean tier → the QC short-circuit fires and the
+            // heavy firmware framing is skipped (the single gate the cost reduction
+            // keys off — see `director_loop::run_auto_qc` / `experts`).
+            assert!(is_lean_build(r), "a doc artifact is a lean build: {r}");
+        }
+    }
+
+    #[test]
+    fn doc_artifact_does_not_downgrade_a_product_or_planning_doc() {
+        // A real product that merely MENTIONS a readme (a readme-generator platform)
+        // is vetoed by the heavy signal → never the lean Light path.
+        assert_ne!(
+            classify("做一个 readme 生成器 SaaS 平台,带账号和数据库"),
+            TaskKind::Light,
+        );
+        // A heavyweight PLANNING doc (PRD / 需求文档 / 技术方案) stays DocsOnly and keeps
+        // its full PM + architect + designer doc-review — only a light README-class
+        // artifact is downgraded to Light.
+        assert_eq!(classify("先写需求文档"), TaskKind::DocsOnly);
+        assert_eq!(classify("写个技术方案"), TaskKind::DocsOnly);
+        // And the lean README path convenes NO team at any stage.
+        assert!(crate::critics::Seat::team_for_kind(TaskKind::Light).is_empty());
+        assert!(crate::critics::quality_team_for_kind(TaskKind::Light).is_empty());
+        assert!(crate::critics::docs_team_for_kind(TaskKind::Light).is_empty());
+    }
+
+    #[test]
+    fn doc_and_ui_surface_helpers() {
+        // `is_doc_task` recognises doc artifacts, not products.
+        assert!(is_doc_task("生成一个 README.md"));
+        assert!(is_doc_task("write a CHANGELOG"));
+        assert!(!is_doc_task("做一个待办应用"));
+        assert!(!is_doc_task("修复登录 bug"));
+        // `mentions_ui_surface` recognises a frontend surface (so a Light UI page keeps
+        // its review) but not a doc / script.
+        assert!(mentions_ui_surface("做一个简单的待办单页应用,纯前端"));
+        assert!(mentions_ui_surface("a small landing page"));
+        assert!(!mentions_ui_surface("生成一个 README.md"));
+        assert!(!mentions_ui_surface("写个脚本统计行数"));
     }
 
     #[test]

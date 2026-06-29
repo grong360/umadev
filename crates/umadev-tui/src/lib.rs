@@ -3203,8 +3203,16 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
             strict_coverage: umadev_agent::strict_coverage_from_env(),
         };
         // Size the QC team from the reactive build route (the same behaviour-derived
-        // `Build`/`Fast` route the intent card showed when the write was detected).
-        let qc_route = reactive_build_route();
+        // `Build`/`Fast` route the intent card showed when the write was detected),
+        // scaled DOWN for a doc write: a README / changelog / single doc is NOT a UI
+        // delivery, so it convenes NO review team. This is the belt-and-suspenders for
+        // the user-reported "generating a README runs a full review" case — even if a
+        // doc phrasing ever slipped the lean QC short-circuit (`run_auto_qc` keys off
+        // `is_lean_build(requirement)`), an empty team can fork nothing.
+        let mut qc_route = reactive_build_route();
+        if umadev_agent::planner::is_doc_task(&text) {
+            qc_route.team = Vec::new();
+        }
         let sink_dyn: Arc<dyn EventSink> = sink.clone();
         let qc_reply = umadev_agent::run_post_build_qc(
             session.as_mut(),
