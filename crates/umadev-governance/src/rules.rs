@@ -268,6 +268,25 @@ pub fn scan_content_with_policy(
     scan_content_with_context(file_path, content, policy, ProjectContext::unknown())
 }
 
+/// Run one rule fail-open: if `check` PANICS on adversarial input (an out-of-
+/// bounds slice, an unchecked index, a bad UTF-8 boundary…), catch the unwind
+/// and return [`Decision::pass`] instead of crashing the host.
+///
+/// The whole fail-open guarantee otherwise rests on each of the ~110 `check_*`
+/// fns being individually panic-free; this is the backstop that makes a single
+/// future buggy rule unable to take down the host (governance is fail-open *by
+/// contract*). `AssertUnwindSafe` is sound here: the closure only borrows two
+/// immutable `&str`s and calls a pure fn — there is no shared mutable state that
+/// could be observed in a torn condition after the unwind.
+fn run_check_guarded(
+    check: fn(&str, &str) -> Decision,
+    file_path: &str,
+    content: &str,
+) -> Decision {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(file_path, content)))
+        .unwrap_or_else(|_| Decision::pass())
+}
+
 /// Same as [`scan_content_with_policy`] but also honours a [`ProjectContext`].
 ///
 /// The universal "always wrong" floor (emoji, hardcoded colors, swallowed
@@ -418,7 +437,7 @@ pub fn scan_content_with_context(
         if skip_surface && is_server_surface_rule(check) {
             continue;
         }
-        let d = check(file_path, content);
+        let d = run_check_guarded(check, file_path, content);
         if d.block {
             // Policy can disable this clause.
             if policy.is_disabled(&d.clause) {
@@ -574,7 +593,7 @@ pub fn sast_scan_file(file_path: &str, content: &str, ctx: ProjectContext) -> Ve
         if skip_surface && is_server_surface_rule(*check) {
             continue;
         }
-        let d = check(file_path, content);
+        let d = run_check_guarded(*check, file_path, content);
         if !d.block {
             continue;
         }
@@ -714,9 +733,32 @@ fn emoji_regex() -> &'static Regex {
     })
 }
 
+/// `true` for typographic / technical glyphs that fall inside the emoji regex's
+/// code-point ranges but are legitimate symbols, NOT emoji-as-functional-icons,
+/// so they must not trip UD-CODE-001:
+/// - `⌈ ⌉ ⌊ ⌋` (U+2308..U+230B) ceiling / floor brackets
+/// - `⌘` (U+2318) place-of-interest / command key
+/// - `✓ ✔ ✕ ✖ ✗ ✘` (U+2713..U+2718) check / cross / multiply dingbats
+///
+/// Note: the colourful emoji check marks (`✅` U+2705, `❌` U+274C) are NOT in
+/// this set — those remain blocked.
+fn is_typographic_symbol(ch: char) -> bool {
+    matches!(ch as u32, 0x2308..=0x230B | 0x2318 | 0x2713..=0x2718)
+}
+
 fn hex_color_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"#[0-9a-fA-F]{3,8}\b").expect("hex regex is well-formed"))
+    // EXACT CSS hex-color lengths only: 3, 4, 6, or 8 hex digits. The old
+    // `{3,8}` matched 5- and 7-digit runs (never valid colors) and greedily
+    // over-ran into longer id fragments, bouncing legit output into rework.
+    // The trailing `\b` stops a partial match inside a longer token
+    // (`#section-2`, a git SHA). A non-word LEFT boundary + the anchor filter
+    // live in `check_color_tokens` (the `regex` crate has no look-behind), so a
+    // fragment href (`href="#abc"`) is not flagged as a color.
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)#(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{4}|[0-9a-f]{3})\b")
+            .expect("hex regex is well-formed")
+    })
 }
 
 fn rgb_regex() -> &'static Regex {
@@ -727,6 +769,61 @@ fn rgb_regex() -> &'static Regex {
 fn hsl_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\bhsla?\s*\(").expect("hsl regex is well-formed"))
+}
+
+/// Modern CSS color functions that are NOT plausible JS identifiers, so they
+/// are safe to flag in any UI source (incl. styled-components / CSS-in-JS):
+/// `oklch()`, `oklab()`, `color-mix()`. The shorter, JS-collision-prone names
+/// (`lab()`/`lch()`/`hwb()`) are gated to stylesheets in [`css_color_value_regex`].
+fn modern_color_fn_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:oklch|oklab|color-mix)\s*\(")
+            .expect("modern color regex is well-formed")
+    })
+}
+
+/// Stylesheet-only color detection (css / scss / sass): a curated set of
+/// chromatic CSS *named* colors used as a color-property value (`color: red`,
+/// `background: blue`, `border-color: green`...), plus the short modern color
+/// functions (`lab()`/`lch()`/`hwb()`) whose names could collide with a JS
+/// identifier. Gated to real stylesheets so `{ background: red }` in a JS/TS
+/// object (where `red` is a variable) is never a false positive. White / black /
+/// transparent / `currentColor` are intentionally absent (neutral, like the hex
+/// allow-list).
+fn css_color_value_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?ix)
+            (?:
+                \b(?: color | background(?:-color)? | border(?:-color)?
+                    | outline(?:-color)? | fill | stroke | caret-color
+                    | accent-color | text-decoration-color | column-rule-color
+                    | stop-color | flood-color )
+                \s* : \s*
+                (?: red|blue|green|yellow|orange|purple|pink|violet|indigo|magenta
+                  | cyan|teal|lime|maroon|navy|olive|aqua|fuchsia|crimson|gold|coral
+                  | salmon|turquoise|tomato|orchid|plum|brown|gray|grey|silver
+                  | lavender|khaki|beige|gainsboro|tan )
+                \b
+              |
+                \b(?: lab | lch | hwb ) \s* \(
+            )
+            ",
+        )
+        .expect("css color value regex is well-formed")
+    })
+}
+
+/// `true` when the text immediately before a `#hex` match is an HTML/JSX
+/// attribute-value opener (`="`, `='`, or a backtick), i.e. the hex is the
+/// value of an `href`/`to`/anchor attribute (`href="#abc"`) — a fragment, not a
+/// color. A real hardcoded color is written as a CSS value (`color:#abc`,
+/// `color: '#abc'`) or is 6/8 digits (handled unconditionally by the caller).
+fn is_attr_value_fragment(prefix: &str) -> bool {
+    let mut it = prefix.chars().rev();
+    matches!((it.next(), it.next()), (Some('"' | '\'' | '`'), Some('=')))
 }
 
 fn extension_of(file_path: &str) -> String {
@@ -754,7 +851,14 @@ pub fn check_emoji(file_path: &str, content: &str) -> Decision {
     // `without_comments` is the correct (broader) view here.
     let tz = crate::tokenizer::Tokenized::new(content);
     let scan_text = tz.without_comments(content);
-    if !emoji_regex().is_match(&scan_text) {
+    // Each regex match is a single char (the class matches one code point). A
+    // match that is ONLY a legit typographic/technical glyph (⌘, ⌈⌉⌊⌋, ✓/✔)
+    // is not an emoji-as-icon and must not block.
+    let has_emoji = emoji_regex()
+        .find_iter(&scan_text)
+        .flat_map(|m| m.as_str().chars())
+        .any(|c| !is_typographic_symbol(c));
+    if !has_emoji {
         return Decision::pass();
     }
     let reason = format!(
@@ -786,10 +890,26 @@ pub fn check_color_tokens(file_path: &str, content: &str) -> Decision {
     // comment (`/* placeholder #fff */`) is documentation, not a violation.
     let tz = crate::tokenizer::Tokenized::new(content);
     let scan_text = tz.without_comments(content);
+    let is_stylesheet = matches!(ext.as_str(), "css" | "scss" | "sass");
     let mut violations: Vec<String> = Vec::new();
     for m in hex_color_regex().find_iter(&scan_text) {
         let token = m.as_str().to_ascii_lowercase();
         if COLOR_ALLOWED.contains(&token.as_str()) {
+            continue;
+        }
+        // Non-word LEFT boundary: a `#hex` glued to a word char (`id#abc`) or
+        // an HTML numeric entity (`&#123;`) is not a color literal.
+        let prefix = &scan_text[..m.start()];
+        if let Some(p) = prefix.chars().next_back() {
+            if p.is_alphanumeric() || p == '_' || p == '&' {
+                continue;
+            }
+        }
+        // A SHORT (3/4-digit) hex that is an HTML/JSX attribute value
+        // (`href="#abc"`) is a fragment/anchor, not a color. 6/8-digit hexes are
+        // unambiguous colors (e.g. SVG `fill="#ff0000"`) and stay flagged.
+        let hex_digits = token.len().saturating_sub(1);
+        if (hex_digits == 3 || hex_digits == 4) && is_attr_value_fragment(prefix) {
             continue;
         }
         if !violations.contains(&token) {
@@ -804,6 +924,32 @@ pub fn check_color_tokens(file_path: &str, content: &str) -> Decision {
     }
     if hsl_regex().is_match(&scan_text) && !violations.contains(&"hsl()/hsla()".to_string()) {
         violations.push("hsl()/hsla()".to_string());
+    }
+    // Modern color functions (oklch/oklab/color-mix) — bypass the hex/rgb/hsl
+    // detector entirely, so add them explicitly. Safe in any UI source.
+    if let Some(m) = modern_color_fn_regex().find(&scan_text) {
+        let label = format!(
+            "{}()",
+            m.as_str()
+                .trim_end_matches(['(', ' ', '\t'])
+                .to_ascii_lowercase()
+        );
+        if !violations.contains(&label) {
+            violations.push(label);
+        }
+    }
+    // Named colors + the JS-collision-prone short functions (lab/lch/hwb) are
+    // detected only in a real stylesheet, where `property: red` is unambiguous.
+    if is_stylesheet {
+        if let Some(m) = css_color_value_regex().find(&scan_text) {
+            let label = format!(
+                "hardcoded color '{}'",
+                m.as_str().split_whitespace().collect::<Vec<_>>().join(" ")
+            );
+            if !violations.contains(&label) {
+                violations.push(label);
+            }
+        }
     }
 
     if violations.is_empty() {
@@ -834,6 +980,18 @@ pub fn check_color_tokens(file_path: &str, content: &str) -> Decision {
 pub fn check_ai_slop(file_path: &str, content: &str) -> Decision {
     let ext = extension_of(file_path);
     if !UI_CODE_EXTS.contains(&ext.as_str()) {
+        return Decision::pass();
+    }
+    // Test / fixture / mock / story files legitimately carry the very patterns
+    // this rule flags — `example.com` (RFC-2606 reserved), `console.log(`, fake
+    // emails, placeholder copy — as test data. Exempt them exactly like
+    // [`check_color_tokens`] does (same `COLOR_EXEMPT_FRAGMENTS`), so legit
+    // fixtures don't bounce into rework.
+    let lower_path = file_path.to_ascii_lowercase();
+    if COLOR_EXEMPT_FRAGMENTS
+        .iter()
+        .any(|frag| lower_path.contains(frag))
+    {
         return Decision::pass();
     }
 
@@ -8019,6 +8177,195 @@ const x = 1;",
         let d = check_ai_slop("src/utils.ts", "console.log('debugging here');");
         assert!(d.block);
         assert!(d.reason.contains("console.log"));
+    }
+
+    // --- M7: color rule false-positives + bypasses --------------------------
+
+    #[test]
+    fn color_does_not_flag_href_anchor_fragment() {
+        // (a) FALSE POSITIVE: a JSX/HTML anchor href="#abc" is a fragment, NOT
+        // a color literal — it must not bounce legit output into rework.
+        for frag in ["#abc", "#def", "#fed"] {
+            let src = format!("<a href=\"{frag}\">link</a>");
+            assert!(
+                !check_color_tokens("src/Nav.tsx", &src).block,
+                "anchor {frag} must not be flagged as a color"
+            );
+        }
+        // Single-quoted + react-router <Link to="#sec"> form too.
+        assert!(!check_color_tokens("src/Nav.tsx", "<a href='#abc'>x</a>").block);
+        assert!(!check_color_tokens("src/Nav.tsx", "<Link to=\"#abc\">x</Link>").block);
+    }
+
+    #[test]
+    fn color_does_not_flag_non_color_hex_lengths() {
+        // (a) FALSE POSITIVE: 5- and 7-digit runs are never valid CSS colors;
+        // the old `{3,8}` matched them. They must pass now.
+        for noncolor in ["#12345", "#1234567"] {
+            let src = format!("const id = '{noncolor}';");
+            assert!(
+                !check_color_tokens("src/X.tsx", &src).block,
+                "{noncolor} is not a color length and must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn color_does_not_flag_html_numeric_entity() {
+        // `&#123;` is an HTML numeric entity, not a `#123` color literal.
+        assert!(!check_color_tokens("src/X.tsx", "<span>&#123;</span>").block);
+    }
+
+    #[test]
+    fn color_still_flags_svg_fill_attribute_hex() {
+        // A 6-digit hex as an attribute value IS a real hardcoded color.
+        assert!(check_color_tokens("src/Icon.tsx", "<path fill=\"#ff0000\" />").block);
+    }
+
+    #[test]
+    fn color_blocks_named_color_in_stylesheet() {
+        // (b) BYPASS: named colors as a CSS color-property value were undetected.
+        let d = check_color_tokens("src/styles.css", ".btn { color: red }");
+        assert!(d.block);
+        assert_eq!(d.clause, "UD-CODE-002");
+        for css in [
+            "a { background: blue }",
+            "div { border-color: green }",
+            ".x { fill: crimson }",
+        ] {
+            assert!(
+                check_color_tokens("src/styles.scss", css).block,
+                "expected block for {css}"
+            );
+        }
+    }
+
+    #[test]
+    fn color_named_color_not_flagged_in_js_object() {
+        // `red` as a JS variable in an object must NOT be flagged — named-color
+        // detection is stylesheet-only to avoid this false positive.
+        assert!(!check_color_tokens("src/Card.tsx", "const s = { background: red };").block);
+        // ...and a plain word that merely contains a color name is never flagged.
+        assert!(!check_color_tokens("src/styles.css", ".x { content: 'colored border' }").block);
+    }
+
+    #[test]
+    fn color_blocks_modern_color_functions() {
+        // (b) BYPASS: oklch()/lab()/lch()/hwb()/color-mix() evaded entirely.
+        // oklch / color-mix are flagged anywhere (incl. CSS-in-JS).
+        assert!(check_color_tokens("src/Card.tsx", "const c = oklch(0.7 0.1 200)").block);
+        assert!(
+            check_color_tokens(
+                "src/styles.css",
+                ".x { color: color-mix(in srgb, red, blue) }"
+            )
+            .block
+        );
+        // lab/lch/hwb are flagged in stylesheets (where they can't be a JS fn).
+        for css in [
+            ".x { color: lab(50% 40 59) }",
+            ".x { color: lch(52% 72 56) }",
+            ".x { color: hwb(194 0% 0%) }",
+        ] {
+            assert!(
+                check_color_tokens("src/styles.css", css).block,
+                "expected block for {css}"
+            );
+        }
+    }
+
+    #[test]
+    fn color_short_lab_fn_not_flagged_in_js() {
+        // A short `lab(` name could be a JS identifier — only flag it in a
+        // stylesheet, never in .ts/.tsx.
+        assert!(!check_color_tokens("src/m.ts", "const x = lab(point);").block);
+    }
+
+    // --- M9: catch_unwind backstop ------------------------------------------
+
+    #[test]
+    fn panicking_check_fails_open_to_pass() {
+        // The fail-open guarantee must survive a buggy/panicking rule: a check
+        // that panics on adversarial input yields Decision::pass(), never an
+        // unwind into the host.
+        fn boom(_file: &str, _content: &str) -> Decision {
+            panic!("adversarial input: deliberate out-of-bounds slice");
+        }
+        // Silence the default panic hook so the deliberate panic doesn't spam
+        // test stderr; restore it immediately after.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let d = run_check_guarded(boom, "src/x.tsx", "anything");
+        std::panic::set_hook(prev);
+        assert_eq!(d, Decision::pass(), "panicking check must fail open");
+        assert!(!d.block);
+    }
+
+    #[test]
+    fn guarded_check_passes_through_normal_decision() {
+        // Sanity: a well-behaved check's Decision is returned unchanged.
+        let blocked = run_check_guarded(check_emoji, "src/B.tsx", "<button>🚀</button>");
+        assert!(blocked.block);
+        assert_eq!(blocked.clause, "UD-CODE-001");
+        let clean = run_check_guarded(check_emoji, "src/B.tsx", "<button>ok</button>");
+        assert!(!clean.block);
+    }
+
+    // --- Low: emoji typographic-symbol false-positives ----------------------
+
+    #[test]
+    fn emoji_allows_typographic_symbols() {
+        // ⌘ command key, ⌈⌉⌊⌋ ceiling/floor, ✓/✔ check marks are legit symbols,
+        // not emoji-as-icons.
+        for src in [
+            "<kbd>⌘K</kbd>",
+            "<span>⌈x⌉ and ⌊y⌋</span>",
+            "<li>✓ done</li>",
+            "<li>✔ shipped</li>",
+            "<span>✗ failed ✘</span>",
+        ] {
+            assert!(
+                !check_emoji("src/Doc.tsx", src).block,
+                "typographic glyphs in {src:?} must not be flagged as emoji"
+            );
+        }
+    }
+
+    #[test]
+    fn emoji_still_blocks_colourful_check_mark() {
+        // ✅ (U+2705) and ❌ (U+274C) are colourful emoji, still blocked — only
+        // the monochrome dingbats ✓/✔ are excused.
+        assert!(check_emoji("src/Status.tsx", "<Icon>✅</Icon>").block);
+        assert!(check_emoji("src/Status.tsx", "<Icon>❌</Icon>").block);
+    }
+
+    #[test]
+    fn emoji_blocks_when_mixed_with_typographic() {
+        // A real emoji alongside a tolerated glyph must still block.
+        assert!(check_emoji("src/Mix.tsx", "<span>✓ ok 🚀 go</span>").block);
+    }
+
+    // --- Low: AI-slop test/fixture path exemption ---------------------------
+
+    #[test]
+    fn slop_exempts_test_and_fixture_paths() {
+        // example.com / console.log / fake email are legit test data in
+        // test/fixture/mock/story files — exempt them like the color rule does.
+        for path in [
+            "src/__tests__/Api.test.tsx",
+            "src/Api.spec.ts",
+            "src/fixtures/sample.ts",
+            "src/mocks/handlers.ts",
+            "src/Button.stories.tsx",
+        ] {
+            let d = check_ai_slop(
+                path,
+                "fetch('https://example.com/api'); console.log('x'); const e='test@test.com';",
+            );
+            assert!(!d.block, "expected slop exemption for {path}");
+        }
+        // Non-test source still flags (regression guard).
+        assert!(check_ai_slop("src/Api.tsx", "fetch('https://example.com/api')").block);
     }
 
     #[test]

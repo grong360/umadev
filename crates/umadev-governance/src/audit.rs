@@ -56,6 +56,23 @@ fn rotate_if_needed(path: &Path) {
     if meta.len() < cap {
         return;
     }
+    // A bare stat-then-rename is a cross-PROCESS TOCTOU: every hook is its own
+    // process, so two can both observe the over-cap file and both rotate,
+    // double-shifting archives and pruning real records early (lost evidence).
+    // Serialize rotation with a best-effort exclusive lock file and re-check the
+    // size after acquiring it (rename-if-still-needed) so exactly ONE rotation
+    // happens. Fail-open throughout: if we can't take the lock we just skip
+    // rotating (a peer will, or the next append will); a stale lock left by a
+    // crashed process is stolen so rotation can never wedge the host.
+    let Some(_lock) = acquire_rotate_lock(path) else {
+        return;
+    };
+    // Re-check under the lock: a peer may have already rotated this file out.
+    match fs::metadata(path) {
+        Ok(m) if m.len() >= cap => {}
+        // Gone or now under cap → already rotated; do nothing (idempotent).
+        _ => return,
+    }
     // Shift archives: .{MAX-1} is dropped, .{n} → .{n+1}, then current → .1.
     // Walk from the oldest kept slot downward so we don't overwrite an
     // archive we still need to shift.
@@ -74,6 +91,67 @@ fn rotate_if_needed(path: &Path) {
         let drop_n = MAX_ARCHIVES + 1;
         let beyond = archive_path(path, drop_n);
         let _ = fs::remove_file(&beyond);
+    }
+}
+
+/// Seconds after which a rotation lock left by a crashed process is treated as
+/// stale and stolen — rotation must never wedge the host (fail-open).
+const ROTATE_LOCK_STALE_SECS: u64 = 30;
+
+/// RAII guard removing the rotation lock file on drop.
+struct RotateLock {
+    path: PathBuf,
+}
+
+impl Drop for RotateLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// `<dir>/.<audit-file>.lock` — a hidden sibling of the audit file (the leading
+/// dot keeps it from being mistaken for a `.jsonl.N` archive).
+fn rotate_lock_path(path: &Path) -> PathBuf {
+    let base = path
+        .file_name()
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    path.with_file_name(format!(".{base}.lock"))
+}
+
+/// Best-effort cross-process rotation lock via atomic exclusive file creation
+/// (`O_CREAT|O_EXCL`, atomic on POSIX and Windows). Returns `Some(guard)` when
+/// we now hold the lock, `None` when a peer holds a FRESH one (caller skips
+/// rotating). A lock older than [`ROTATE_LOCK_STALE_SECS`] is stolen so a
+/// crashed holder can't wedge rotation forever. Any unexpected error → `None`
+/// (fail-open: don't rotate rather than risk blocking).
+fn acquire_rotate_lock(path: &Path) -> Option<RotateLock> {
+    let lock_path = rotate_lock_path(path);
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(_) => Some(RotateLock { path: lock_path }),
+        Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let stale = fs::metadata(&lock_path)
+                .and_then(|m| m.modified())
+                .map_or(true, |t| {
+                    t.elapsed()
+                        .map_or(true, |d| d.as_secs() >= ROTATE_LOCK_STALE_SECS)
+                });
+            if !stale {
+                return None;
+            }
+            // Steal the stale lock, then re-create it exclusively for us.
+            let _ = fs::remove_file(&lock_path);
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+                .ok()
+                .map(|_| RotateLock { path: lock_path })
+        }
+        Err(_) => None,
     }
 }
 
@@ -522,6 +600,64 @@ mod tests {
             files.len(),
             writers * per_writer,
             "no record dropped or duplicated under concurrency"
+        );
+        std::env::remove_var("UMADEV_AUDIT_MAX_BYTES");
+    }
+
+    #[test]
+    fn concurrent_rotation_rotates_exactly_once() {
+        // Two concurrent hook PROCESSES could both observe an over-cap file and
+        // both rotate (stat-then-rename TOCTOU), double-shifting archives and
+        // pruning real records early. With the rotation lock + re-check, many
+        // racing rotations collapse to exactly ONE: the original payload lands
+        // in a single archive, is never double-shifted into .2, and is not lost.
+        let _guard = ROTATE_TEST_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::env::set_var("UMADEV_AUDIT_MAX_BYTES", "16");
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("tool-calls.jsonl");
+        let original = "ORIGINAL-AUDIT-RECORDS-PAYLOAD"; // > 16 bytes
+        fs::write(&live, original).unwrap();
+
+        let live = std::sync::Arc::new(live);
+        let racers = 16;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(racers));
+        let mut handles = Vec::new();
+        for _ in 0..racers {
+            let live = std::sync::Arc::clone(&live);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                rotate_if_needed(&live);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The original payload was rotated EXACTLY once.
+        let mut copies = 0;
+        for n in 1..=MAX_ARCHIVES {
+            if let Ok(body) = fs::read_to_string(archive_path(&live, n)) {
+                if body.contains(original) {
+                    copies += 1;
+                }
+            }
+        }
+        assert_eq!(
+            copies, 1,
+            "original must rotate exactly once — no loss, no double-rotate"
+        );
+        assert!(
+            !archive_path(&live, 2).exists(),
+            "must not premature-shift into .2 under concurrency"
+        );
+        assert!(
+            !rotate_lock_path(&live).exists(),
+            "rotation lock must be released after rotation"
         );
         std::env::remove_var("UMADEV_AUDIT_MAX_BYTES");
     }
