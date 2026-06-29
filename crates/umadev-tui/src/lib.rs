@@ -2890,9 +2890,14 @@ fn spawn_chat_session_preload(
 ///   (for a reactively-promoted build), and sends the terminal `AgenticDone`.
 ///
 /// **Fail-open by contract:** a session that can't open, a `send_turn` that fails,
-/// or a session that dies mid-drain is an honest terminal `Failed` — the holder is
-/// cleared so the NEXT turn re-opens a fresh session. It never panics, and the
-/// conversation transcript UmaDev holds re-primes a fresh session after a loss.
+/// or a base that ACTUALLY died mid-drain is an honest terminal `Failed` — the holder
+/// is cleared so the NEXT turn re-opens a fresh session, and the conversation
+/// transcript UmaDev holds re-primes it after the loss. But a *transient* failure
+/// (an idle-hang / a `TurnStatus::Failed` 429-overloaded-network blip) on a base
+/// whose process is still ALIVE (`try_exit_status()` is `None`) PARKS the live
+/// session back as `Primed` instead of tearing it down — the failure is still
+/// surfaced, but the next follow-up reuses the bare resident session (no repo-map
+/// re-scan, no full-transcript replay). It never panics.
 async fn drive_chat_session_turn(turn: ChatSessionTurn) {
     let ChatSessionTurn {
         text,
@@ -3015,8 +3020,9 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 // `UMADEV_IDLE_TIMEOUT_SECS` knob the user would raise).
                 let tail = session.stderr_tail();
                 let exit = session.try_exit_status();
+                // Abort the hung turn — a control request, it does NOT kill the base —
+                // then decide park-vs-teardown by the base's liveness.
                 let _ = session.interrupt().await;
-                let _ = session.end().await;
                 let reason = enrich_base_failure(
                     &umadev_i18n::tlf(
                         "base.fail.idle",
@@ -3026,6 +3032,18 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     tail,
                     &backend,
                 );
+                // Transient idle blip on a STILL-ALIVE base (a slow/quiet base, a
+                // network stall): don't tear the session down. `interrupt()` settled the
+                // hung turn, so PARK it back as `Primed` (exactly like the
+                // Esc/Interrupted arm below) — the next follow-up then reuses it BARE (no
+                // repo-map re-scan, no full-transcript replay — the "重头开始" feeling).
+                // Only `end()` when the base ACTUALLY died (a real exit status). The
+                // failure is surfaced to the user either way.
+                if exit.is_none() {
+                    *chat_session.lock().await = Some(ResidentChat::Primed(session));
+                } else {
+                    let _ = session.end().await;
+                }
                 let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                     "route.failed",
                     &[&backend, &reason],
@@ -3130,8 +3148,20 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     // BEFORE the post-turn fact line / AgenticDone, so no false
                     // "完成" / "无文件变更" is ever emitted for a failed turn.
                     let tail = session.stderr_tail();
-                    let _ = session.end().await;
+                    let exit = session.try_exit_status();
                     let enriched = enrich_base_turn_failure(&reason, tail, &backend);
+                    // A turn that FAILED (429 / overloaded / transient network) but left
+                    // the base process ALIVE is a recoverable blip — the `TurnDone` already
+                    // settled this turn, so PARK the session back as `Primed` (no teardown)
+                    // so the next follow-up reuses it BARE instead of lazily re-opening
+                    // (which would re-scan the repo-map + replay the full transcript — the
+                    // "重头开始" feeling). Only `end()` when the base ACTUALLY died (a real
+                    // exit status). The failure is surfaced to the user either way.
+                    if exit.is_none() {
+                        *chat_session.lock().await = Some(ResidentChat::Primed(session));
+                    } else {
+                        let _ = session.end().await;
+                    }
                     let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                         "route.failed",
                         &[&backend, &enriched],
@@ -7451,6 +7481,11 @@ mod tests {
         /// [`BaseSession::session_id`] (`None` by default → mirrors opencode / a base
         /// with no captured id). Set via [`Self::with_id`] to test the capture path.
         id: Option<String>,
+        /// The exit status [`BaseSession::try_exit_status`] reports. `None` by
+        /// default → the base process is still ALIVE (the resident-session common
+        /// case); `Some(_)` via [`Self::with_exit_status`] → the base has DIED, so a
+        /// transient-failure path tears the session down instead of parking it.
+        exit_status: Option<std::process::ExitStatus>,
     }
 
     impl FakeChatSession {
@@ -7470,6 +7505,7 @@ mod tests {
                     sent: Arc::clone(&sent),
                     ended: Arc::clone(&ended),
                     id: None,
+                    exit_status: None,
                 },
                 sent,
                 ended,
@@ -7480,6 +7516,14 @@ mod tests {
         /// it — exercises the per-turn id-capture path (claude / codex behaviour).
         fn with_id(mut self, id: &str) -> Self {
             self.id = Some(id.to_string());
+            self
+        }
+
+        /// Mark the fake's base process as DEAD: [`BaseSession::try_exit_status`]
+        /// then reports `Some(status)`, so a transient-failure path treats it as a
+        /// genuine teardown (end + re-open) rather than a recoverable park.
+        fn with_exit_status(mut self, status: std::process::ExitStatus) -> Self {
+            self.exit_status = Some(status);
             self
         }
     }
@@ -7519,6 +7563,9 @@ mod tests {
         }
         fn session_id(&self) -> Option<&str> {
             self.id.as_deref()
+        }
+        fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+            self.exit_status
         }
     }
 
@@ -7726,6 +7773,180 @@ mod tests {
             chat_session,
             sink,
             route_tx,
+        }
+    }
+
+    /// Fix A: a base-reported `TurnStatus::Failed` (a 429 / overloaded blip) on a
+    /// base whose PROCESS is still alive must NOT tear the session down — it parks it
+    /// back as `Primed` so the next follow-up reuses the BARE resident session (no
+    /// re-open → no repo-map re-scan, no full-transcript replay). The failure is still
+    /// surfaced. A scripted SECOND turn then proves the parked session is reused: it
+    /// completes on the same fake (a dropped session would force a real `session_for`
+    /// re-open, which fails in tests).
+    #[tokio::test]
+    async fn chat_failed_turn_on_live_base_parks_and_next_turn_reuses() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Turn 1: the base reports a FAILED turn (429) but stays alive. Turn 2: a
+        // clean reply — only reachable if turn 1 PARKED (not dropped) the session.
+        let (fake, sent, ended) = FakeChatSession::new(vec![
+            vec![umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Failed(
+                    "API Error: Request rejected (429) — usage limit".into(),
+                ),
+                usage: None,
+            }],
+            vec![
+                umadev_runtime::SessionEvent::TextDelta("recovered".into()),
+                umadev_runtime::SessionEvent::TurnDone {
+                    status: umadev_runtime::TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+        ]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "hello",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // The transient failure is still surfaced to the user.
+        match route_rx.try_recv() {
+            Ok(RouteDecision::Failed(reason)) => assert!(
+                reason.contains("429"),
+                "the base turn-failure reason is still surfaced: {reason}"
+            ),
+            other => panic!("expected a Failed decision, got {other:?}"),
+        }
+        // The LIVE session was PARKED back (holder Some) and never end()-ed.
+        assert!(
+            holder.lock().await.is_some(),
+            "a transient turn-failure on a live base must PARK the session, not drop it"
+        );
+        assert!(
+            !ended.load(std::sync::atomic::Ordering::SeqCst),
+            "the live session must NOT be end()-ed on a recoverable turn failure"
+        );
+
+        // Turn 2 reuses the parked session (a dropped session would force a real
+        // re-open here and fail). Two bare directives hit the ONE fake.
+        drive_chat_session_turn(chat_turn(
+            "are you back?",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        assert!(
+            matches!(route_rx.try_recv(), Ok(RouteDecision::AgenticDone { .. })),
+            "the next turn must complete on the reused parked session"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "both turns drove the ONE resident session (no re-open)"
+        );
+    }
+
+    /// Fix A: a `TurnStatus::Failed` whose base process ACTUALLY died
+    /// (`try_exit_status` is `Some`) is a genuine teardown — the session is end()-ed
+    /// and the holder cleared so the next turn re-opens fresh.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn chat_failed_turn_on_dead_base_ends_and_clears_holder() {
+        use std::os::unix::process::ExitStatusExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // A failed turn AND a base process that exited → not recoverable.
+        let (fake, _sent, ended) =
+            FakeChatSession::new(vec![vec![umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Failed("fatal: base crashed".into()),
+                usage: None,
+            }]]);
+        let fake = fake.with_exit_status(std::process::ExitStatus::from_raw(256)); // exit code 1
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "hello",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        assert!(
+            matches!(route_rx.try_recv(), Ok(RouteDecision::Failed(_))),
+            "the failure is surfaced"
+        );
+        // A genuinely-dead base IS torn down + the holder cleared (fresh re-open next).
+        assert!(
+            holder.lock().await.is_none(),
+            "a dead base must be end()-ed and the holder cleared for a fresh re-open"
+        );
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "a dead base's session must be end()-ed"
+        );
+    }
+
+    /// Fix A: an idle hang on a base whose process is still alive parks the session
+    /// (after interrupting the hung turn) instead of tearing it down — same recovery
+    /// as the turn-failure path, so the next follow-up reuses the bare session.
+    #[tokio::test]
+    async fn chat_idle_hang_on_live_base_parks_session() {
+        let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+        let prior = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        // HangingChatSession stays ALIVE (try_exit_status defaults to None).
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(HangingChatSession)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "explain this code",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // The idle settle is still surfaced as a failure.
+        assert!(
+            matches!(route_rx.try_recv(), Ok(RouteDecision::Failed(_))),
+            "the idle settle is surfaced"
+        );
+        // The still-alive base is PARKED back for the next turn, not dropped.
+        assert!(
+            holder.lock().await.is_some(),
+            "an idle hang on a still-alive base must PARK the session for the next turn"
+        );
+
+        match prior {
+            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
         }
     }
 
@@ -7957,10 +8178,17 @@ mod tests {
             route_rx.try_recv().is_err(),
             "a failed turn emits exactly one terminal decision"
         );
-        // The failed session was closed (not parked back as a live session).
+        // The failure was surfaced, but the base PROCESS is still alive
+        // (try_exit_status None), so the session is PARKED back as `Primed` for the
+        // next turn (Fix A: a recoverable 429 blip no longer tears the resident
+        // session down + forces a re-scan/re-open) — NOT end()-ed.
         assert!(
-            ended.load(std::sync::atomic::Ordering::SeqCst),
-            "a failed turn ends its session"
+            !ended.load(std::sync::atomic::Ordering::SeqCst),
+            "a recoverable failure on a LIVE base parks the session, it does not end it"
+        );
+        assert!(
+            holder.lock().await.is_some(),
+            "the live session is parked back for reuse after a surfaced failure"
         );
         // CRUCIAL: no "本轮无文件变更 / no file changes" Note was emitted — the swallow.
         while let Ok(ev) = engine_rx.try_recv() {

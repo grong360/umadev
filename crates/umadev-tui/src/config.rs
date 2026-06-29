@@ -182,7 +182,14 @@ pub fn save_to(config: &UserConfig, path: &std::path::Path) -> std::io::Result<P
     // and load_from silently falls back to Default on a parse error (so a partial
     // write would silently wipe every setting). Rename within the same dir is
     // atomic on POSIX/Windows.
-    let tmp = path.with_extension("toml.tmp");
+    //
+    // PID-qualify the temp name (`config.toml.tmp-<pid>`): the GLOBAL
+    // `~/.umadev/config.toml` is shared across every umadev process, so a FIXED
+    // temp path lets two processes saving config at once write the same temp file
+    // and clobber each other's partial bytes before the rename. A per-PID temp
+    // gives each process its own staging file (matching `persist_chat`'s
+    // `{id}.json.tmp-{pid}`); the rename onto the shared target stays atomic.
+    let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
     fs::write(&tmp, body)?;
     fs::rename(&tmp, path)?;
     Ok(path.to_path_buf())
@@ -230,6 +237,28 @@ mod tests {
         let cfg = load_from(&path);
         // Fail-soft: corrupt config doesn't crash; the picker just shows up again.
         assert!(!cfg.has_backend());
+    }
+
+    #[test]
+    fn save_to_uses_pid_qualified_temp_name() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        // Occupy the OLD fixed temp path with a directory so a write to it would
+        // fail. If save_to still staged through `config.toml.tmp` it would error;
+        // the PID-qualified temp (`config.toml.tmp-<pid>`) sidesteps the obstacle.
+        let fixed_tmp = path.with_extension("toml.tmp");
+        fs::create_dir(&fixed_tmp).unwrap();
+
+        let cfg = UserConfig {
+            backend: Some("claude-code".into()),
+            ..Default::default()
+        };
+        // Succeeds despite the occupied fixed temp path → the temp name is
+        // PID-qualified, not the fixed `config.toml.tmp`.
+        save_to(&cfg, &path).expect("PID-qualified temp must avoid the occupied fixed name");
+        assert_eq!(load_from(&path), cfg);
+        // The fixed-name obstacle is untouched — confirming it was never used.
+        assert!(fixed_tmp.is_dir());
     }
 
     #[test]

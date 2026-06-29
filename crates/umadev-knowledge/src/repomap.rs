@@ -863,11 +863,96 @@ fn truncate_sig(sig: &str, max: usize) -> String {
 /// Cache directory for the repo map, relative to the project root.
 pub const REPOMAP_CACHE_DIR: &str = ".umadev/repomap-cache";
 
+/// One in-process memo entry: the resolved index plus the cheap freshness keys.
+struct MemoEntry {
+    /// The resolved [`SymbolIndex`] for a root (scope-independent — scope is
+    /// applied later in [`render_map`], so the index is the same across scopes).
+    index: SymbolIndex,
+    /// When this entry was last validated against a full scan. The memo is
+    /// trusted only for [`MEMO_TTL`] after this instant — a fixed (not sliding)
+    /// window, so rapid repeat calls can never extend trust past the TTL and
+    /// mask a change indefinitely.
+    validated_at: std::time::Instant,
+    /// The root directory's OWN mtime at validation — a single cheap `stat`,
+    /// NOT a recursive walk. A bump (a direct child added / removed / renamed)
+    /// invalidates the memo immediately even inside the TTL. Captured AFTER the
+    /// scan so the cache write under `.umadev/` is already accounted for.
+    /// `None` when the root is unreadable (then the TTL alone governs).
+    root_mtime: Option<std::time::SystemTime>,
+}
+
+/// How long an in-process memo entry is trusted before the next call re-verifies
+/// with a full scan. Short by design: it only elides the walk on rapid
+/// successive opens (e.g. several firmware composes within a turn), never masks a
+/// real change for long. Kept below the repo-map cache test's ~1.1s edit gap so a
+/// genuine edit always re-scans.
+const MEMO_TTL: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// The process-wide repo-map memo, keyed by canonical root path. Fail-open: a
+/// poisoned lock simply takes the full scan path.
+fn memo_table() -> &'static std::sync::Mutex<HashMap<PathBuf, MemoEntry>> {
+    static TABLE: OnceLock<std::sync::Mutex<HashMap<PathBuf, MemoEntry>>> = OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// One cheap `stat` of the root directory's own mtime (NOT a recursive walk).
+/// Fail-open to `None` on any error.
+fn dir_mtime(root: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(root).ok()?.modified().ok()
+}
+
+/// Resolve the index for `root`, with a cheap in-process fast-path on top of the
+/// authoritative on-disk-cached scan ([`load_or_scan_full`]).
+///
+/// A warm (re-)open in the SAME process within [`MEMO_TTL`] AND with the root
+/// dir's own mtime unchanged returns the memoized index WITHOUT the full
+/// recursive directory walk + per-file `metadata()` stat that `code_files` +
+/// `mtime_signature` would cost on every call. Bounded staleness: once the TTL
+/// elapses (or the root dir bumps) the next call falls through to the full scan,
+/// so a real file change still refreshes. Fail-open throughout: a poisoned lock
+/// or a missing entry just takes the full scan.
+fn load_or_scan(root: &Path) -> SymbolIndex {
+    let memo_key = root.to_path_buf();
+    let now = std::time::Instant::now();
+
+    // Fast-path: a still-fresh memo for this root short-circuits the walk+stat.
+    // Valid iff inside the TTL AND the root dir's own mtime is unchanged.
+    if let Ok(table) = memo_table().lock() {
+        if let Some(entry) = table.get(&memo_key) {
+            if entry.root_mtime == dir_mtime(root)
+                && now.duration_since(entry.validated_at) < MEMO_TTL
+            {
+                return entry.index.clone();
+            }
+        }
+    }
+
+    // Slow path: the authoritative on-disk-cached full scan. A real change (the
+    // TTL elapsed or the dir bumped) always lands here, so correctness holds.
+    let index = load_or_scan_full(root);
+
+    // Refresh the memo for the next rapid re-open. Capture the root mtime AFTER
+    // the scan: writing the cache under `.umadev/` may itself bump it, so a
+    // follow-up call's cheap re-stat must compare against the post-write value.
+    // Fail-open: a poisoned lock just skips the memo (next call simply re-walks).
+    if let Ok(mut table) = memo_table().lock() {
+        table.insert(
+            memo_key,
+            MemoEntry {
+                index: index.clone(),
+                validated_at: now,
+                root_mtime: dir_mtime(root),
+            },
+        );
+    }
+    index
+}
+
 /// Load the cached index if its mtime signature still matches the repo, else
 /// scan fresh and refresh the cache. All cache I/O is fail-open: any error
 /// (no dir, corrupt file, write failure) falls through to a live scan and never
 /// surfaces an error.
-fn load_or_scan(root: &Path) -> SymbolIndex {
+fn load_or_scan_full(root: &Path) -> SymbolIndex {
     let files = code_files(root);
     if files.is_empty() {
         return SymbolIndex::default();
@@ -903,6 +988,12 @@ fn load_or_scan(root: &Path) -> SymbolIndex {
 pub fn invalidate_cache(root: &Path) {
     let sig_path = root.join(REPOMAP_CACHE_DIR).join("signature.txt");
     let _ = std::fs::remove_file(sig_path);
+    // Also drop the in-process fast-path memo, else the next call would return
+    // the still-fresh memoized index instead of truly re-scanning. Fail-open: a
+    // poisoned lock leaves the memo (the TTL still expires it shortly).
+    if let Ok(mut table) = memo_table().lock() {
+        table.remove(root);
+    }
 }
 
 /// A deterministic mtime+size signature of the code files: one line per file,
@@ -1464,6 +1555,55 @@ mod tests {
         assert_eq!(third.symbol_count(), 2, "changed file should be re-scanned");
         let sig3 = fs::read_to_string(&sig_path).unwrap();
         assert_ne!(sig1, sig3, "signature should change after edit");
+    }
+
+    // --- (5b) in-process fast-path memo (Fix A2) ----------------------------
+
+    #[test]
+    fn fast_path_memo_short_circuits_full_scan_within_ttl() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.rs", "pub fn one() {}\n");
+
+        // First call: a full scan that populates BOTH the on-disk cache and the
+        // in-process memo.
+        let _ = symbol_index(root);
+        let sig_path = root.join(REPOMAP_CACHE_DIR).join("signature.txt");
+        assert!(sig_path.exists(), "first scan writes the on-disk signature");
+
+        // Delete the on-disk signature DIRECTLY (not via `invalidate_cache`,
+        // which also clears the in-process memo). Removing a file deep under
+        // `.umadev/` does not bump the root dir's own mtime, so the memo stays
+        // fresh.
+        fs::remove_file(&sig_path).unwrap();
+
+        // Immediate re-call (within MEMO_TTL): the in-process fast-path returns
+        // the memoized index WITHOUT the full walk — so it never reaches the
+        // on-disk scan and the signature is NOT rewritten. (A full re-walk would
+        // miss the on-disk sig and rewrite it.) This observes "no re-walk".
+        let _ = symbol_index(root);
+        assert!(
+            !sig_path.exists(),
+            "fast-path memo must short-circuit the full scan within the TTL"
+        );
+    }
+
+    #[test]
+    fn fast_path_memo_rescans_after_ttl_on_change() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.rs", "pub fn one() {}\n");
+        assert_eq!(symbol_index(root).symbol_count(), 1);
+
+        // Past the TTL the memo is stale, so the next call re-verifies with a
+        // full scan and picks up the edit — correctness still holds.
+        std::thread::sleep(MEMO_TTL + std::time::Duration::from_millis(300));
+        write(root, "a.rs", "pub fn one() {}\npub fn two() {}\n");
+        assert_eq!(
+            symbol_index(root).symbol_count(),
+            2,
+            "a real change after the TTL is re-scanned"
+        );
     }
 
     #[test]
