@@ -151,6 +151,21 @@ fn handshake_timeout() -> Duration {
         .map_or_else(|| Duration::from_secs(30), Duration::from_secs)
 }
 
+/// How long [`fork`](CodexSession::fork) waits for the app-server's `thread/fork`
+/// REPLY before deciding the method is unsupported and falling back to a
+/// read-only resume. A real fork replies in well under a second; this only bounds
+/// a server that SILENTLY IGNORES the method (no result, no error) — without the
+/// bound `fork()` awaits the response forever. Kept short (independent of
+/// [`handshake_timeout`], which still budgets the resume fallback) so the critic
+/// degrades fast; tunable via `UMADEV_CODEX_FORK_PROBE_SECS`.
+fn fork_probe_timeout() -> Duration {
+    std::env::var("UMADEV_CODEX_FORK_PROBE_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or_else(|| Duration::from_secs(10), Duration::from_secs)
+}
+
 /// How long [`interrupt`](CodexSession::interrupt) waits for the turn id to be
 /// assigned (by the `turn/started` notification) before giving up, so an ESC that
 /// races the turn-start handshake is honored rather than silently dropped (F5).
@@ -175,8 +190,17 @@ type TurnId = Arc<Mutex<Option<String>>>;
 /// `TurnDone` so `/usage` is truthful on the DEFAULT loop. `None` until the base
 /// reports usage → the consumer estimates instead (fail-open).
 type LatestUsage = Arc<Mutex<Option<Usage>>>;
-/// Sender half for translated session events.
-type EventTx = mpsc::UnboundedSender<SessionEvent>;
+/// Bound on the translated-event channel. Matches the claude / opencode drivers
+/// (both cap at 256) so a flooding base can't grow the queue without limit.
+const EVENT_CHANNEL_CAP: usize = 256;
+
+/// Sender half for translated session events. **Bounded** (see
+/// [`EVENT_CHANNEL_CAP`]); the reader task multiplexes JSON-RPC RESPONSES and
+/// events on one stdout loop, so it uses non-blocking `try_send` (NOT an awaited
+/// send): a full event queue must never stall the reader, or an in-flight
+/// `request()`'s response could be wedged behind it. A dropped event under that
+/// (rare) backpressure is fail-open — the consumer is already behind.
+type EventTx = mpsc::Sender<SessionEvent>;
 
 /// A long-lived `codex app-server` session.
 ///
@@ -189,7 +213,7 @@ pub struct CodexSession {
     /// Child stdin, shared with control methods (writes are line-framed JSON).
     stdin: Arc<Mutex<ChildStdin>>,
     /// Receiver for translated [`SessionEvent`]s produced by the reader task.
-    events: mpsc::UnboundedReceiver<SessionEvent>,
+    events: mpsc::Receiver<SessionEvent>,
     /// A SENDER clone into the same event channel the reader owns, kept so
     /// [`send_turn`](BaseSession::send_turn) can surface a `turn/start` JSON-RPC
     /// error (e.g. the `-32001` overloaded surface) as a terminal
@@ -300,7 +324,7 @@ impl CodexSession {
         let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
         let turn_id: TurnId = Arc::new(Mutex::new(None));
         let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
 
         // Reader task: the single owner of stdout. Splits every line into
         // response / server-request / notification (see `reader_loop`).
@@ -384,7 +408,7 @@ impl CodexSession {
         let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
         let turn_id: TurnId = Arc::new(Mutex::new(None));
         let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         tokio::spawn(reader_loop(
             stdout,
             Arc::clone(&pending),
@@ -445,7 +469,7 @@ impl CodexSession {
         let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
         let turn_id: TurnId = Arc::new(Mutex::new(None));
         let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         tokio::spawn(reader_loop(
             stdout,
             Arc::clone(&pending),
@@ -873,21 +897,34 @@ async fn reader_loop(
     latest_usage: LatestUsage,
     event_tx: EventTx,
 ) {
-    let mut reader = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
-        dispatch_line(
-            &line,
-            &pending,
-            &approvals,
-            &turn_id,
-            &latest_usage,
-            &event_tx,
-        )
-        .await;
+    // Read raw bytes per line and decode LOSSY: `next_line` returns `Err` on a
+    // single invalid UTF-8 byte, and the old `while let Ok(Some)` treated that as
+    // EOF — discarding the rest of the stream AND emitting a spurious terminal
+    // "stdout closed" failure. `read_until('\n')` + `from_utf8_lossy` tolerates a
+    // bad byte (one non-JSON line is dropped by `dispatch_line`, not the stream).
+    let mut reader = BufReader::new(stdout);
+    let mut line_buf = Vec::new();
+    loop {
+        line_buf.clear();
+        match reader.read_until(b'\n', &mut line_buf).await {
+            Ok(0) | Err(_) => break, // EOF or a read error → the app-server is gone
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&line_buf);
+                dispatch_line(
+                    line.trim_end_matches(['\r', '\n']),
+                    &pending,
+                    &approvals,
+                    &turn_id,
+                    &latest_usage,
+                    &event_tx,
+                )
+                .await;
+            }
+        }
     }
     // EOF or a read error → the app-server is gone. Tell any in-flight turn it
     // failed (fail-open) and wake every pending request so no caller hangs.
-    let _ = event_tx.send(SessionEvent::TurnDone {
+    let _ = event_tx.try_send(SessionEvent::TurnDone {
         status: TurnStatus::Failed("codex app-server stdout closed".to_string()),
         usage: None,
     });
@@ -957,7 +994,17 @@ async fn dispatch_line(
 
 /// Route a response line (`{id, result|error}`) to its waiting oneshot.
 async fn complete_response(v: &Value, pending: &PendingMap) {
-    let Some(id) = v.get("id").and_then(Value::as_i64) else {
+    let Some(raw_id) = v.get("id") else {
+        return;
+    };
+    // We always register i64 ids, but a JSON-RPC peer is free to echo the id in
+    // STRING form (`"42"`). `as_i64` alone silently dropped that response and
+    // wedged the waiting request forever. Normalise via the same `json_id_key`
+    // the approval path uses, then recover the i64 we registered under.
+    let Some(id) = raw_id
+        .as_i64()
+        .or_else(|| json_id_key(raw_id).parse::<i64>().ok())
+    else {
         return;
     };
     let Some(tx) = pending.lock().await.remove(&id) else {
@@ -987,7 +1034,7 @@ async fn handle_server_request(v: &Value, approvals: &ApprovalMap, event_tx: &Ev
     let params = v.get("params").cloned().unwrap_or(Value::Null);
     let (action, target) = approval_action_target(method, &params);
     approvals.lock().await.insert(req_id.clone(), raw_id);
-    let _ = event_tx.send(SessionEvent::NeedApproval {
+    let _ = event_tx.try_send(SessionEvent::NeedApproval {
         req_id,
         action,
         target,
@@ -1170,7 +1217,7 @@ fn emit_text_delta(params: &Value, event_tx: &EventTx) {
         return;
     };
     if !delta.is_empty() {
-        let _ = event_tx.send(SessionEvent::TextDelta(delta.to_string()));
+        let _ = event_tx.try_send(SessionEvent::TextDelta(delta.to_string()));
     }
 }
 
@@ -1203,7 +1250,7 @@ fn emit_item(item: &Value, event_tx: &EventTx) {
 /// Translate a completed `commandExecution` item → Bash `ToolCall` + result.
 fn emit_command_execution(item: &Value, event_tx: &EventTx) {
     let command = command_of(item);
-    let _ = event_tx.send(SessionEvent::ToolCall {
+    let _ = event_tx.try_send(SessionEvent::ToolCall {
         name: "Bash".to_string(),
         input: json!({ "command": command }),
     });
@@ -1217,7 +1264,7 @@ fn emit_command_execution(item: &Value, event_tx: &EventTx) {
         .get("aggregatedOutput")
         .and_then(Value::as_str)
         .unwrap_or(status);
-    let _ = event_tx.send(SessionEvent::ToolResult {
+    let _ = event_tx.try_send(SessionEvent::ToolResult {
         ok: status != "failed" && status != "declined" && exit_ok,
         summary: truncate(summary, 200),
     });
@@ -1249,12 +1296,12 @@ fn emit_file_change(item: &Value, event_tx: &EventTx) {
     } else {
         json!({ "file_path": path, "content": added })
     };
-    let _ = event_tx.send(SessionEvent::ToolCall {
+    let _ = event_tx.try_send(SessionEvent::ToolCall {
         name: name.to_string(),
         input,
     });
     let status = item.get("status").and_then(Value::as_str).unwrap_or("");
-    let _ = event_tx.send(SessionEvent::ToolResult {
+    let _ = event_tx.try_send(SessionEvent::ToolResult {
         ok: status != "failed" && status != "declined",
         summary: truncate(&path, 200),
     });
@@ -1379,7 +1426,7 @@ async fn emit_turn_done(
         let streamed = guard.take();
         inline.or(streamed)
     };
-    let _ = event_tx.send(SessionEvent::TurnDone {
+    let _ = event_tx.try_send(SessionEvent::TurnDone {
         status: map_turn_status(status, params),
         usage,
     });
@@ -1439,14 +1486,22 @@ impl BaseSession for CodexSession {
         // base doesn't support `thread/fork`, fall back to resuming the main
         // thread id directly — still read-only + on its own server, so still
         // isolated. Either way the critic runs on a SEPARATE read-only process.
-        let fork_thread_id = match self
-            .request("thread/fork", &thread_fork_params(&self.thread_id))
-            .await
+        // BOUND the fork request: `request()` awaits the oneshot UNBOUNDED, and the
+        // "unsupported → resume" fallback assumes a JSON-RPC *error reply*. An
+        // app-server that SILENTLY IGNORES `thread/fork` (no result, no error) would
+        // hang `fork()` forever. Time-bound it so an elapse is treated exactly like
+        // "unsupported" → the read-only resume fallback (fail-open, still isolated).
+        let fork_thread_id = match tokio::time::timeout(
+            fork_probe_timeout(),
+            self.request("thread/fork", &thread_fork_params(&self.thread_id)),
+        )
+        .await
         {
-            Ok(result) => extract_thread_id(&result).unwrap_or_else(|_| self.thread_id.clone()),
-            // `thread/fork` unsupported / errored → resume the main thread
-            // read-only instead (fail-open, still isolated + non-writing).
-            Err(_) => self.thread_id.clone(),
+            Ok(Ok(result)) => extract_thread_id(&result).unwrap_or_else(|_| self.thread_id.clone()),
+            // `thread/fork` unsupported / errored / silently ignored (elapsed) →
+            // resume the main thread read-only instead (fail-open, still isolated
+            // + non-writing).
+            Ok(Err(_)) | Err(_) => self.thread_id.clone(),
         };
         let s = Self::start_fork(
             &self.program,
@@ -1499,7 +1554,7 @@ impl BaseSession for CodexSession {
                 // carrying the real error so the loop renders it (fail-open: a closed
                 // channel send is a no-op).
                 Ok(Err(e)) => {
-                    let _ = event_tx.send(SessionEvent::TurnDone {
+                    let _ = event_tx.try_send(SessionEvent::TurnDone {
                         status: TurnStatus::Failed(e),
                         usage: None,
                     });
@@ -1611,8 +1666,8 @@ mod tests {
     }
 
     /// A throwaway event channel pair for the pure translators.
-    fn chan() -> (EventTx, mpsc::UnboundedReceiver<SessionEvent>) {
-        mpsc::unbounded_channel()
+    fn chan() -> (EventTx, mpsc::Receiver<SessionEvent>) {
+        mpsc::channel(EVENT_CHANNEL_CAP)
     }
 
     // ---------- pure-unit coverage (cross-platform, no subprocess) ----------
@@ -1819,6 +1874,31 @@ mod tests {
     fn json_id_key_handles_number_and_string() {
         assert_eq!(json_id_key(&json!(42)), "42");
         assert_eq!(json_id_key(&json!("abc")), "abc");
+    }
+
+    // Low: a peer that echoes our (numeric) request id back in STRING form
+    // (`"7"`) must still correlate. The old `as_i64` dropped it → the waiting
+    // request wedged. `complete_response` now normalises via `json_id_key`.
+    #[tokio::test]
+    async fn complete_response_correlates_a_string_form_id() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(7, tx);
+
+        // Response carries the id as the STRING "7", not the number 7.
+        let resp = json!({ "id": "7", "result": { "ok": true } });
+        complete_response(&resp, &pending).await;
+
+        let got = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("the oneshot must be completed, not left hanging")
+            .expect("sender not dropped")
+            .expect("a result payload");
+        assert_eq!(got, json!({ "ok": true }));
+        assert!(
+            pending.lock().await.is_empty(),
+            "the pending entry must be consumed"
+        );
     }
 
     #[test]
@@ -2436,6 +2516,72 @@ done
             Some(TurnStatus::Completed),
             "turn/completed → TurnDone"
         );
+        let _ = session.end().await;
+    }
+
+    /// A fake app-server that replies to initialize / thread/start / thread/resume
+    /// but SILENTLY IGNORES `thread/fork` (no result, no error) — the bug trigger.
+    #[cfg(unix)]
+    const FAKE_APP_SERVER_IGNORES_FORK: &str = r#"#!/bin/sh
+extract_id() { printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"thread/fork"'*) : ;;
+    *'"method":"initialize"'*)
+      printf '{"id":%s,"result":{"userAgent":"fake"}}\n' "$(extract_id "$line")" ;;
+    *'"method":"initialized"'*) : ;;
+    *'"method":"thread/start"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thr_test","sessionId":"thr_test"}}}\n' "$(extract_id "$line")" ;;
+    *'"method":"thread/resume"'*)
+      printf '{"id":%s,"result":{"thread":{"id":"thr_test","sessionId":"thr_test"}}}\n' "$(extract_id "$line")" ;;
+  esac
+done
+"#;
+
+    /// Serialises the one test that mutates the process-global fork-probe env so a
+    /// concurrent test can't observe it.
+    #[cfg(unix)]
+    static FORK_PROBE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    // M5: `fork()` asks the app-server to `thread/fork`. If the server SILENTLY
+    // ignores that method, the old UNBOUNDED `request()` await hung fork() forever.
+    // The bounded fork probe must elapse → fall back to the read-only resume, so
+    // fork() returns a working session promptly. Only the fork-probe budget is made
+    // tiny; the resume fallback keeps the full handshake budget (robust under load).
+    // The outer timeout turns a regression (hang) into a clean FAIL.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fork_falls_back_to_resume_when_thread_fork_is_silently_ignored() {
+        let _env = FORK_PROBE_ENV_LOCK.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("codex");
+        write_fake_codex(&script, FAKE_APP_SERVER_IGNORES_FORK);
+
+        let mut session = CodexSession::start_with_program_timeout(
+            script.to_str().unwrap(),
+            dir.path(),
+            "gpt-5-codex",
+            true,
+            Duration::from_secs(120),
+        )
+        .await
+        .expect("main handshake should succeed");
+
+        // Make ONLY the fork probe tiny — the resume fallback still uses the
+        // generous default handshake budget so it can't flake under load.
+        std::env::set_var("UMADEV_CODEX_FORK_PROBE_SECS", "1");
+        let started = std::time::Instant::now();
+        let forked = tokio::time::timeout(Duration::from_secs(60), session.fork()).await;
+        std::env::remove_var("UMADEV_CODEX_FORK_PROBE_SECS");
+
+        let mut forked = forked
+            .expect("fork() must NOT hang on a silently-ignored thread/fork")
+            .expect("fork() must fall back to a read-only resume");
+        assert!(
+            started.elapsed() < Duration::from_secs(45),
+            "fork should fall back after the ~1s probe, not hang"
+        );
+        let _ = forked.end().await;
         let _ = session.end().await;
     }
 

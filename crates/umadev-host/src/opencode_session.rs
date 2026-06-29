@@ -1054,13 +1054,45 @@ fn translate_status(props: &Value, session_id: &str) -> Vec<SessionEvent> {
 /// hanging).
 async fn read_listening_url(stdout: ChildStdout, timeout: Duration) -> Result<String, String> {
     let read = async {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Some(url) = parse_listening_url(&line) {
-                return Ok(url);
+        // Read raw bytes per line (lossy decode) so one odd byte in the announce
+        // banner can't abort the scrape, and so the SAME reader can be handed to
+        // the lifetime drain below.
+        let mut reader = BufReader::new(stdout);
+        let mut line_buf = Vec::new();
+        loop {
+            line_buf.clear();
+            match reader.read_until(b'\n', &mut line_buf).await {
+                Ok(0) => {
+                    return Err(
+                        "opencode serve exited before announcing a listen address".to_string()
+                    );
+                }
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&line_buf);
+                    if let Some(url) = parse_listening_url(&line) {
+                        // M8: the server is LONG-LIVED. If we drop its stdout reader
+                        // here, anything it later logs to stdout fills the ~64 KiB
+                        // pipe buffer and the next write EPIPE/SIGPIPE-kills the
+                        // server mid-run (stderr is already drained on its own task).
+                        // Keep draining stdout in the background for the session's
+                        // lifetime; the drain ends at EOF when the child is killed
+                        // (kill_on_drop), so it never leaks.
+                        tokio::spawn(async move {
+                            let mut sink = [0u8; 8192];
+                            while let Ok(n) =
+                                tokio::io::AsyncReadExt::read(&mut reader, &mut sink).await
+                            {
+                                if n == 0 {
+                                    break; // EOF — the server exited
+                                }
+                            }
+                        });
+                        return Ok(url);
+                    }
+                }
+                Err(e) => return Err(format!("opencode serve stdout read error: {e}")),
             }
         }
-        Err("opencode serve exited before announcing a listen address".to_string())
     };
     match tokio::time::timeout(timeout, read).await {
         Ok(res) => res,
@@ -2035,5 +2067,68 @@ mod tests {
             matches!(res, Err(SessionError::Start(_))),
             "a serve that never announces must fail-open as Start error"
         );
+    }
+
+    // M8: after scraping the listening URL, the LONG-LIVED server's stdout must
+    // keep being drained — otherwise anything it later logs fills the ~64 KiB pipe
+    // buffer and the next write EPIPE/SIGPIPE-kills the server mid-run. The fake
+    // announces the URL, FLOODS >64 KiB to stdout, then touches a sentinel; the
+    // sentinel only lands once the flood write completes, which REQUIRES our
+    // background drain (without it the child blocks on a full pipe forever).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_listening_url_keeps_draining_stdout_for_the_session_lifetime() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let sentinel = dir.path().join("drained.flag");
+        let script = dir.path().join("flood-serve");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 echo 'opencode server listening on http://127.0.0.1:1'\n\
+                 i=0\n\
+                 while [ $i -lt 200 ]; do printf '%01000d\\n' 0; i=$((i+1)); done\n\
+                 : > '{}'\n\
+                 sleep 5\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (prog, lead) = spawn_parts(script.to_str().unwrap());
+        let mut cmd = Command::new(prog);
+        cmd.args(&lead);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null());
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        // Generous scrape budget: a `/bin/sh` fake's spawn + first echo can be
+        // arbitrarily slow under heavy parallel test load (same reason the sibling
+        // serve tests use a large budget) — the thing under test is the lifetime
+        // drain, not the announce latency.
+        let url = read_listening_url(stdout, Duration::from_secs(30))
+            .await
+            .expect("should scrape the announce line");
+        assert_eq!(url, "http://127.0.0.1:1");
+
+        // The >64 KiB flood + sentinel only complete if our drain keeps the pipe
+        // clear; poll (generously, for load) for the flag.
+        let mut drained = false;
+        for _ in 0..300 {
+            if sentinel.exists() {
+                drained = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            drained,
+            "stdout was not drained for the session lifetime — the server blocked on a full pipe"
+        );
+        let _ = child.start_kill();
     }
 }

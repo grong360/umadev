@@ -362,6 +362,62 @@ fn truncate_on_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..idx]
 }
 
+/// Hard cap on stderr captured from a single-shot base subprocess. A base that
+/// floods stderr can't make us buffer unboundedly — the continuous-session
+/// drivers use a bounded `StderrTail` ring for the same reason; this is the
+/// single-shot equivalent. 256 KiB matches the stdout cap in [`run_subprocess`].
+const STDERR_CAPTURE_CAP: usize = 262_144;
+
+/// Bounded grace for draining a child's stderr AFTER it has exited (and for
+/// reaping the concurrent stdin writer). The child is already gone, so this only
+/// flushes an already-closing pipe — but a GRANDCHILD that inherited the stderr
+/// write fd (e.g. a dev/MCP server the base spawned) can hold the pipe open
+/// forever, so the post-exit stderr read MUST itself be time-bounded or
+/// `complete()` / `probe()` / `consult()` would hang, defeating the per-call
+/// timeout. Fail-open: on elapse we abandon stderr (the exit status + stdout are
+/// authoritative) and abort the leaked reader so it can't linger.
+const STDERR_FLUSH_GRACE: Duration = Duration::from_secs(2);
+
+/// Spawn a task that drains a child's stderr into a byte buffer, bounded by
+/// [`STDERR_CAPTURE_CAP`] so a flooding base can't grow it without limit. The
+/// caller reaps it via [`reap_bounded`] under [`STDERR_FLUSH_GRACE`] (a leaked
+/// grandchild fd can hold the pipe open past the child's own exit — H1).
+fn spawn_stderr_capture(
+    stderr: Option<tokio::process::ChildStderr>,
+) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut se) = stderr {
+            let mut chunk = [0u8; 8192];
+            // Read until EOF, a read error, or the cap — whichever comes first.
+            // A bare `read_to_end` here is the bug: a grandchild holding the pipe
+            // open makes it never EOF, and there is no size bound.
+            while buf.len() < STDERR_CAPTURE_CAP {
+                match se.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+        }
+        buf
+    })
+}
+
+/// Reap a best-effort background task (the stderr capture / the concurrent stdin
+/// writer) under [`STDERR_FLUSH_GRACE`], aborting it on overrun so it can never
+/// leak. The child is already being torn down when this is called, so it
+/// normally returns instantly; the bound exists only so a leaked grandchild fd
+/// (stderr) can't wedge the call forever.
+async fn reap_bounded<T>(mut task: tokio::task::JoinHandle<T>) -> Option<T> {
+    if let Ok(joined) = tokio::time::timeout(STDERR_FLUSH_GRACE, &mut task).await {
+        joined.ok()
+    } else {
+        // Overran the grace (a leaked grandchild fd) — abort so it can't linger.
+        task.abort();
+        None
+    }
+}
+
 /// Drain a spawned child's stdout+stderr to EOF AND wait for its exit, bounded
 /// by BOTH a per-call hard ceiling AND a per-byte idle watchdog.
 ///
@@ -403,16 +459,7 @@ async fn drain_and_wait(
     // it independently keeps the stdout idle measurement honest. (Same shape as
     // `run_subprocess_streaming`.) The task ends when stderr closes — which the
     // kill below guarantees on every error path, so it is never orphaned.
-    let stderr_task = {
-        let se = child.stderr.take();
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(mut se) = se {
-                let _ = se.read_to_end(&mut buf).await;
-            }
-            buf
-        })
-    };
+    let stderr_task = spawn_stderr_capture(child.stderr.take());
 
     // Same env + default + collapse semantics as the streaming path.
     let idle_timeout = std::cmp::min(
@@ -504,7 +551,11 @@ async fn drain_and_wait(
         }
     };
 
-    let stderr_buf = stderr_task.await.unwrap_or_default();
+    // H1: the child has exited, but a grandchild that inherited the stderr write
+    // fd can hold the pipe open so this read never EOFs. Reap under a bounded
+    // flush grace so a leaked fd can't hang the call forever — the exit status +
+    // stdout are already in hand.
+    let stderr_buf = reap_bounded(stderr_task).await.unwrap_or_default();
     Ok((status, stdout_buf, stderr_buf))
 }
 
@@ -860,33 +911,48 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
         }
     })?;
 
-    if matches!(call.channel, PromptChannel::Stdin) {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(call.prompt.as_bytes())
-                .await
-                .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
-            // CRITICAL: `shutdown` flushes and closes the write half. Without it,
-            // a plain `write_all` + drop can leave the bytes unflushed in tokio's
-            // pipe writer, so the child reads an EMPTY stdin and bails (codex
-            // 0.141: "No prompt provided via stdin" → exit 1). shutdown both
-            // flushes the buffered prompt AND signals EOF.
-            let _ = stdin.shutdown().await;
-        }
+    // M4: write the prompt CONCURRENTLY with draining stdout, not before it. A
+    // `write_all` that fully completes before any stdout read DEADLOCKS when the
+    // prompt exceeds the OS pipe buffer (~64 KiB) AND the base emits output
+    // before consuming all of stdin (codex's stdin channel): the base blocks
+    // writing stdout (its pipe full, we aren't reading yet) so it stops reading
+    // stdin, so our write blocks — and `drain_and_wait`'s ceiling hasn't started.
+    // Spawning the writer lets stdout drain while the prompt streams in.
+    let stdin_writer = if matches!(call.channel, PromptChannel::Stdin) {
+        child.stdin.take().map(|mut stdin| {
+            let prompt = call.prompt.as_bytes().to_vec();
+            tokio::spawn(async move {
+                // Best-effort: a base that exits early closes its stdin read end
+                // (EPIPE) — `drain_and_wait` surfaces the real outcome, not this.
+                // `shutdown` flushes the buffered prompt AND signals EOF (without
+                // it a plain write + drop can leave bytes unflushed, so the base
+                // reads an EMPTY stdin and bails, e.g. codex "No prompt provided
+                // via stdin" → exit 1).
+                if stdin.write_all(&prompt).await.is_ok() {
+                    let _ = stdin.shutdown().await;
+                }
+            })
+        })
     } else {
         // Arg channel: the prompt is a CLI arg, so we never write stdin. But
         // the pipe is still open — take and drop it so the child sees EOF
         // immediately instead of blocking on an idle stdin (some CLIs peek
         // stdin in non-interactive mode and would otherwise hang to timeout).
         drop(child.stdin.take());
-    }
+        None
+    };
 
     // Drain both pipes AND wait for exit under ONE deadline (see
     // `drain_and_wait`): the reads themselves must be bounded, or a child that
     // emits output then hangs with its stdout pipe open blocks forever and
     // defeats the timeout.
-    let (status, stdout_buf, stderr_buf) =
-        drain_and_wait(&mut child, call.timeout, call.program).await?;
+    let drained = drain_and_wait(&mut child, call.timeout, call.program).await;
+    // Reap the writer (the child is now dead/exited, so it returns at once) —
+    // before propagating any drain error, so the task can never leak.
+    if let Some(writer) = stdin_writer {
+        let _ = reap_bounded(writer).await;
+    }
+    let (status, stdout_buf, stderr_buf) = drained?;
 
     if !status.success() {
         let code = status.code().unwrap_or(-1);
@@ -1063,35 +1129,33 @@ pub(crate) async fn run_subprocess_streaming(
         }
     })?;
 
-    if matches!(call.channel, PromptChannel::Stdin) {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(call.prompt.as_bytes())
-                .await
-                .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
-            // Flush + close the write half (see `run_subprocess`): a bare
-            // write_all + drop can leave the prompt unflushed, starving the child.
-            let _ = stdin.shutdown().await;
-        }
+    // M4: write the prompt CONCURRENTLY with streaming stdout (see
+    // `run_subprocess`) — a >64 KiB prompt that fully writes before any stdout
+    // read deadlocks a base that emits before draining all of stdin. Spawning
+    // the writer lets the stdout loop below drain while the prompt streams in.
+    let stdin_writer = if matches!(call.channel, PromptChannel::Stdin) {
+        child.stdin.take().map(|mut stdin| {
+            let prompt = call.prompt.as_bytes().to_vec();
+            tokio::spawn(async move {
+                // Flush + close the write half (a bare write + drop can leave the
+                // prompt unflushed, starving the child); best-effort on EPIPE.
+                if stdin.write_all(&prompt).await.is_ok() {
+                    let _ = stdin.shutdown().await;
+                }
+            })
+        })
     } else {
         // Arg channel: the prompt is a CLI arg, so we never write stdin. Drop the
         // pipe so the child sees EOF immediately — otherwise a CLI that peeks
         // stdin in non-interactive `stream-json` mode blocks until the idle
         // watchdog kills it (the same defence `run_subprocess` already has).
         drop(child.stdin.take());
-    }
-
-    // Read stderr in a separate task so it doesn't block stdout streaming.
-    let stderr_task = {
-        let se = child.stderr.take();
-        tokio::spawn(async move {
-            let mut buf = Vec::new();
-            if let Some(mut se) = se {
-                let _ = se.read_to_end(&mut buf).await;
-            }
-            buf
-        })
+        None
     };
+
+    // Read stderr in a separate task so it doesn't block stdout streaming,
+    // bounded by `STDERR_CAPTURE_CAP` (a flooding base can't grow it unboundedly).
+    let stderr_task = spawn_stderr_capture(child.stderr.take());
 
     // Stream stdout line by line.
     // **Watchdog**: once the stream is live, a per-line idle timeout (not the
@@ -1132,7 +1196,14 @@ pub(crate) async fn run_subprocess_streaming(
     // wait is bounded by `idle_timeout` (still also capped by the hard ceiling),
     // restoring the mid-stream-hang protection.
     if let Some(stdout) = child.stdout.take() {
-        let mut reader = BufReader::new(stdout).lines();
+        // Read raw bytes per line and decode LOSSY (not `.lines()`/`next_line`):
+        // `next_line` returns `Err` on a single invalid UTF-8 byte, which the old
+        // `while let Ok(Some)` treated as end-of-stream — discarding the rest of a
+        // long stream-json turn AND emitting a spurious "ended unexpectedly". A
+        // `read_until('\n')` + `from_utf8_lossy` tolerates the bad byte (mirrors
+        // `pump_sse`'s decode) and keeps streaming.
+        let mut reader = BufReader::new(stdout);
+        let mut line_buf = Vec::new();
         let mut seen_first_line = false;
         loop {
             let remaining = call.timeout.saturating_sub(started.elapsed());
@@ -1154,13 +1225,16 @@ pub(crate) async fn run_subprocess_streaming(
             } else {
                 remaining
             };
-            match tokio::time::timeout(wait, reader.next_line()).await {
-                Ok(Ok(Some(line))) => {
+            line_buf.clear();
+            match tokio::time::timeout(wait, reader.read_until(b'\n', &mut line_buf)).await {
+                Ok(Ok(0)) => break, // EOF — stdout closed
+                Ok(Ok(_)) => {
                     seen_first_line = true;
+                    let line = String::from_utf8_lossy(&line_buf);
+                    let line = line.trim_end_matches(['\r', '\n']).to_string();
                     on_line(&line);
                     all_lines.push(line);
                 }
-                Ok(Ok(None)) => break, // EOF — stdout closed
                 Ok(Err(e)) => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
@@ -1197,12 +1271,35 @@ pub(crate) async fn run_subprocess_streaming(
         }
     }
 
-    let status = match child.wait().await {
-        Ok(s) => s,
-        Err(e) => return Err(format!("`{}` failed: {e}", call.program)),
+    // H2: bound the exit wait by the remaining hard ceiling (asymmetric with the
+    // single-shot `drain_and_wait`, which already does this). A base that closes
+    // stdout then lingers in teardown — or a grandchild that keeps the process
+    // group busy — would otherwise hang here past `call.timeout` forever.
+    let remaining = call.timeout.saturating_sub(started.elapsed());
+    let status = match tokio::time::timeout(remaining, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("`{}` failed: {e}", call.program)),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            if let Some(writer) = stdin_writer {
+                let _ = reap_bounded(writer).await;
+            }
+            return Err(format!(
+                "`{}` timed out after {}s",
+                call.program,
+                call.timeout.as_secs()
+            ));
+        }
     };
 
-    let stderr_buf = stderr_task.await.unwrap_or_default();
+    // Reap the concurrent stdin writer (the child has exited, so it returns at
+    // once) and the stderr capture under the bounded flush grace (H1 mirror — a
+    // leaked grandchild stderr fd must not hang us).
+    if let Some(writer) = stdin_writer {
+        let _ = reap_bounded(writer).await;
+    }
+    let stderr_buf = reap_bounded(stderr_task).await.unwrap_or_default();
 
     if !status.success() {
         let code = status.code().unwrap_or(-1);
@@ -2434,6 +2531,77 @@ mod tests {
         assert!(out.stdout.contains("hello world"));
     }
 
+    // H1: the child exits 0, but a GRANDCHILD it backgrounded inherited the
+    // stderr write fd and holds it open. The old final `stderr_task.await` was an
+    // unbounded `read_to_end` that never EOFs in that case → `complete()` hung
+    // forever. The bounded flush-grace reap must return the call (with the stdout
+    // we did get) within ~`STDERR_FLUSH_GRACE`, NOT wait out the grandchild.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_returns_when_grandchild_holds_stderr_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let started = Instant::now();
+        // `sleep 30 >/dev/null &` keeps the grandchild's stdout off the pipe (so
+        // stdout EOFs and `child.wait` returns) but leaves it holding the inherited
+        // STDERR write end for 30s; the parent prints to stdout then exits 0. The
+        // bounded reap returns in ~`STDERR_FLUSH_GRACE`; the OLD unbounded
+        // `read_to_end` would block ~30s — a wide, load-proof separation.
+        let out = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &[
+                "-c".into(),
+                "echo hello; sleep 30 >/dev/null & exit 0".into(),
+            ],
+            prompt: "",
+            channel: PromptChannel::Stdin,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(60),
+            env: &[],
+        })
+        .await
+        .expect("a clean exit must return even while a grandchild holds stderr open");
+        assert!(out.stdout.contains("hello"));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the post-exit stderr drain must be bounded by the flush grace, not the \
+             grandchild's 30s hold"
+        );
+    }
+
+    // M4: a Stdin-channel base that emits >64 KiB on stdout BEFORE it drains all of
+    // a >64 KiB prompt would DEADLOCK if the prompt is written in full before
+    // stdout draining begins (both pipes wedge at the ~64 KiB buffer and the
+    // ceiling is never entered — `write_all` has no timeout). Writing the prompt
+    // CONCURRENTLY with draining clears both. The outer timeout turns a regression
+    // into a clean FAIL instead of an infinite hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_large_prompt_does_not_deadlock_when_base_floods_stdout_first() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Flood ~100 KiB to stdout, THEN drain stdin, THEN print DONE.
+        let body = "i=0; while [ $i -lt 100 ]; do printf '%01000d\\n' 0; i=$((i+1)); \
+                    done; cat >/dev/null; printf 'DONE\\n'";
+        let prompt = "x".repeat(100_000); // > the ~64 KiB stdin pipe buffer
+        let args = ["-c".to_string(), body.to_string()];
+        let call = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &args,
+            prompt: &prompt,
+            channel: PromptChannel::Stdin,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(30),
+            env: &[],
+        });
+        let out = tokio::time::timeout(Duration::from_secs(15), call)
+            .await
+            .expect("must not deadlock: the prompt write has to run concurrently with draining")
+            .expect("the subprocess itself should succeed");
+        assert!(
+            out.stdout.contains("DONE"),
+            "the base consumed the whole prompt and finished"
+        );
+    }
+
     // ---- run_subprocess_streaming: first-line grace watchdog ----
 
     /// Async-safe lock serialising the streaming tests that mutate the
@@ -2652,6 +2820,85 @@ mod tests {
         assert!(
             out.stdout.contains("second line"),
             "the post-pause line must survive — the idle default did not kill it"
+        );
+    }
+
+    // H2: the streaming path's exit wait used to be an UNBOUNDED `child.wait()`. A
+    // base that closes stdout (so the read loop EOFs) but then LINGERS in teardown
+    // would hang the call past `call.timeout` forever. The bounded wait must kill +
+    // return a `timed out` error at the ceiling. The outer timeout makes a
+    // regression a clean FAIL, not an infinite hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_bounded_wait_kills_base_that_closes_stdout_then_lingers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = write_sh_fake(
+            tmp.path(),
+            "close-stdout-then-linger",
+            // Emit a line, CLOSE stdout (exec 1>&-), then sleep well past the ceiling.
+            "#!/bin/sh\ncat >/dev/null 2>&1\nprintf 'line\\n'\nexec 1>&-\nsleep 30\n",
+        );
+        let started = Instant::now();
+        let call = run_subprocess_streaming(
+            SubprocessCall {
+                program: script.to_str().unwrap(),
+                args: &[],
+                prompt: "",
+                channel: PromptChannel::Stdin,
+                timeout: Duration::from_secs(2),
+                workspace: tmp.path(),
+                env: &[],
+            },
+            &|_line: &str| {},
+        );
+        let err = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect("the bounded exit wait must fire — not hang on the lingering base")
+            .unwrap_err();
+        assert!(
+            err.contains("timed out"),
+            "expected a ceiling timeout, got: {err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(8));
+    }
+
+    // Lossy per-line decode (streaming): a single invalid UTF-8 byte mid-stream
+    // must NOT abort the stream. `next_line()` returned `Err` on bad UTF-8 and the
+    // old `while let Ok(Some)` treated that as EOF — dropping every later line. The
+    // `read_until` + `from_utf8_lossy` rewrite keeps reading, so the line AFTER the
+    // bad byte still arrives.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_invalid_utf8_byte_does_not_truncate_the_stream() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = write_sh_fake(
+            tmp.path(),
+            "bad-utf8-midstream",
+            // first line, then a raw 0xFF byte + newline (invalid UTF-8), then a
+            // line that MUST still be read.
+            "#!/bin/sh\ncat >/dev/null 2>&1\nprintf 'first\\n'\nprintf '\\377\\n'\nprintf 'second\\n'\n",
+        );
+        let out = run_subprocess_streaming(
+            SubprocessCall {
+                program: script.to_str().unwrap(),
+                args: &[],
+                prompt: "",
+                channel: PromptChannel::Stdin,
+                timeout: Duration::from_secs(10),
+                workspace: tmp.path(),
+                env: &[],
+            },
+            &|_line: &str| {},
+        )
+        .await
+        .expect("a bad UTF-8 byte must not fail the call");
+        assert!(
+            out.stdout.contains("first"),
+            "the pre-bad-byte line survives"
+        );
+        assert!(
+            out.stdout.contains("second"),
+            "the line AFTER the invalid byte must still be read (stream not truncated)"
         );
     }
 }

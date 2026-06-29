@@ -330,11 +330,25 @@ impl BaseSession for ClaudeSession {
 /// died / the session ended) emit a terminal `Failed` so a crash mid-turn
 /// surfaces as `TurnDone{Failed}` rather than a silent hang.
 async fn pump_stdout(stdout: ChildStdout, tx: mpsc::Sender<SessionEvent>) {
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        for ev in parse_stdout_line(&line) {
-            if tx.send(ev).await.is_err() {
-                return; // consumer dropped → stop
+    // Read raw bytes per line and decode LOSSY: `next_line` returns `Err` on a
+    // single invalid UTF-8 byte, and the old `while let Ok(Some)` treated that as
+    // end-of-stream — discarding the rest of the NDJSON turn AND emitting a
+    // spurious "base session ended unexpectedly". `read_until('\n')` +
+    // `from_utf8_lossy` tolerates a bad byte (a non-JSON line is ignored by
+    // `parse_stdout_line`, not the whole stream).
+    let mut reader = BufReader::new(stdout);
+    let mut line_buf = Vec::new();
+    loop {
+        line_buf.clear();
+        match reader.read_until(b'\n', &mut line_buf).await {
+            Ok(0) | Err(_) => break, // EOF or read error → the base process is gone
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&line_buf);
+                for ev in parse_stdout_line(line.trim_end_matches(['\r', '\n'])) {
+                    if tx.send(ev).await.is_err() {
+                        return; // consumer dropped → stop
+                    }
+                }
             }
         }
     }
