@@ -59,11 +59,22 @@ const KNOWN_MODEL_DIMS: &[(&str, usize)] = &[
 
 /// Resolve the effective embedding dimension, in priority order:
 /// 1. `UMADEV_EMBED_DIM` env override (explicit user pin),
-/// 2. the known dimension for [`active_model`] (if it's a recognised model),
-/// 3. [`EMBED_DIM`] (1536, the small-model default).
+/// 2. the bundled LOCAL backend's real width when it is the active vector
+///    source (`vector-local` + a usable model on disk),
+/// 3. the known dimension for [`active_model`] (if it's a recognised model),
+/// 4. [`EMBED_DIM`] (1536, the small-model default).
 ///
 /// Returning the env override first lets a user force a non-standard dim
 /// even for an unknown model.
+///
+/// Step 2 is the H3 fix: the bundled local model (e5-small, 384-dim) is tried
+/// FIRST at embed time (see [`embed_query`] / [`embed_batch`]), so on a default
+/// install the vectors are 384-long — but the HTTP-model default is 1536. If
+/// `active_dim()` reported 1536 here, the dim-invalidation guard
+/// (`build_vector_store_if_enabled`) would discard the local store on every
+/// rebuild (store dim 384 != 1536), and a store mistakenly tagged 1536 would
+/// reject every 384-long query. Consulting the local backend's real dimension
+/// keeps the whole pipeline on the width the active embedder actually emits.
 #[must_use]
 pub fn active_dim() -> usize {
     if let Ok(v) = std::env::var("UMADEV_EMBED_DIM") {
@@ -73,7 +84,24 @@ pub fn active_dim() -> usize {
             }
         }
     }
+    #[cfg(feature = "vector-local")]
+    {
+        // The local backend is consulted first at embed time, so when it is
+        // usable its real width is what the store actually contains.
+        if let Some(d) = crate::local_embed::local_dim() {
+            return d;
+        }
+    }
     expected_dim_for_model(active_model()).unwrap_or(EMBED_DIM)
+}
+
+/// The embedding dimension a store should be tagged with for a freshly built
+/// set of `entries`: the width of the FIRST embedded vector (the real width
+/// the active backend produced), or [`active_dim`] when there is nothing to
+/// measure. This keeps `store.dim()` aligned with the vectors it holds so
+/// `search` accepts queries of the same (real) width. See [`VectorStore::from_embedded`].
+fn store_dim(entries: &[(u32, String, String, u64, Vec<f32>)]) -> usize {
+    entries.first().map_or_else(active_dim, |e| e.4.len())
 }
 
 /// The documented dimension for a known embedding model, or `None` when the
@@ -317,6 +345,14 @@ impl VectorStore {
     /// body_hash, vec) tuples. Used by the index builder after embedding.
     #[must_use]
     pub fn from_embedded(model: &str, entries: Vec<(u32, String, String, u64, Vec<f32>)>) -> Self {
+        // H3 fix: tag the store with the ACTUAL embedding width produced
+        // (`vec[0].len()`), NOT `active_dim()`. The active backend (e.g. the
+        // bundled 384-dim local model) can emit a different width than the
+        // HTTP-model default — baking the 1536 default into a store of 384-long
+        // vectors made `search` reject every query on the length mismatch,
+        // silently disabling the marketed local semantic layer. Fall back to
+        // `active_dim()` only when there is no vector to measure.
+        let dim = store_dim(&entries);
         let vectors = entries
             .into_iter()
             .map(|(chunk_idx, path, section, body_hash, vec)| StoredVector {
@@ -329,7 +365,7 @@ impl VectorStore {
             .collect();
         Self {
             model: model.to_string(),
-            dim: active_dim(),
+            dim,
             vectors,
         }
     }
@@ -339,7 +375,8 @@ impl VectorStore {
     /// the private [`StoredVector`] type.
     pub fn replace(&mut self, model: &str, entries: Vec<(u32, String, String, u64, Vec<f32>)>) {
         self.model = model.to_string();
-        self.dim = active_dim();
+        // H3 fix: see [`from_embedded`] — dim follows the real vector width.
+        self.dim = store_dim(&entries);
         self.vectors = entries
             .into_iter()
             .map(|(chunk_idx, path, section, body_hash, vec)| StoredVector {
@@ -368,7 +405,10 @@ impl VectorStore {
 }
 
 /// Cosine similarity between two equal-length vectors. Returns 0.0 when
-/// either vector has zero magnitude (avoids NaN).
+/// either vector has zero magnitude (avoids NaN) OR when the result is not
+/// finite — a corrupt vector carrying a `NaN`/`inf` component would otherwise
+/// poison the ranking (a `NaN` score sorts arbitrarily, an `inf` always wins),
+/// so a non-finite score is clamped to 0.0 / treated as "no similarity".
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -376,7 +416,12 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if mag_a == 0.0 || mag_b == 0.0 {
         return 0.0;
     }
-    dot / (mag_a * mag_b)
+    let score = dot / (mag_a * mag_b);
+    if score.is_finite() {
+        score
+    } else {
+        0.0
+    }
 }
 
 /// On-disk path for the cached vector store.
@@ -654,6 +699,85 @@ mod tests {
     }
 
     #[test]
+    fn cosine_non_finite_component_scores_zero() {
+        // A corrupt vector carrying NaN/inf must not poison the ranking: cosine
+        // returns 0.0 rather than a NaN (sorts arbitrarily) or inf (always wins).
+        let good = vec![1.0f32, 0.0, 0.0];
+        let nan = vec![f32::NAN, 0.0, 0.0];
+        let inf = vec![f32::INFINITY, 0.0, 0.0];
+        assert!(cosine(&nan, &good).abs() < 1e-9, "NaN component -> 0.0");
+        assert!(cosine(&inf, &good).abs() < 1e-9, "inf component -> 0.0");
+        assert!(cosine(&good, &good).is_finite());
+    }
+
+    #[test]
+    fn store_dim_follows_actual_vector_width_not_model_default() {
+        // H3 regression: the bundled local backend emits 384-dim vectors while
+        // the HTTP-model default (`active_dim()`) is 1536. A store built from
+        // 384-long vectors must be tagged dim=384 (the REAL width) so `search`
+        // accepts a 384-long query and returns hits — not silently reject every
+        // query on a 384 != 1536 length mismatch (which dead-ended the marketed
+        // local semantic layer on every default install).
+        let dim = 384usize;
+        let mut v0 = vec![0.0f32; dim];
+        v0[0] = 1.0;
+        let mut v1 = vec![0.0f32; dim];
+        v1[1] = 1.0;
+        let store = VectorStore::from_embedded(
+            "text-embedding-3-small", // default model => active_dim() == 1536
+            vec![
+                (0, "a".into(), "s".into(), 0, v0.clone()),
+                (1, "b".into(), "s".into(), 0, v1),
+            ],
+        );
+        assert_eq!(
+            store.dim(),
+            dim,
+            "store dim must follow the real vector width, not active_dim()"
+        );
+        let hits = store.search(&v0, 5);
+        assert!(
+            !hits.is_empty(),
+            "a 384-dim query must be accepted and return hits"
+        );
+        assert_eq!(hits[0].0, "a", "the identical vector ranks first");
+        let hits_idx = store.search_with_idx(&v0, 5);
+        assert_eq!(
+            hits_idx.len(),
+            2,
+            "search_with_idx must also accept 384-dim"
+        );
+        assert_eq!(hits_idx[0].0, 0);
+    }
+
+    #[test]
+    fn replace_dim_follows_actual_vector_width() {
+        // Same H3 invariant for the in-place `replace` path the index builder uses.
+        let dim = 384usize;
+        let mut q = vec![0.0f32; dim];
+        q[3] = 1.0;
+        let mut store = VectorStore::disabled();
+        store.replace(
+            "text-embedding-3-small",
+            vec![(0, "a".into(), "s".into(), 0, q.clone())],
+        );
+        assert_eq!(store.dim(), dim, "replace must tag the real vector width");
+        assert!(
+            !store.search(&q, 3).is_empty(),
+            "search must accept the replaced store's real width"
+        );
+    }
+
+    #[test]
+    fn from_embedded_empty_falls_back_to_active_dim() {
+        // No vectors to measure => dim follows active_dim() (and `.first()` on
+        // an empty entry list must not panic).
+        let store = VectorStore::from_embedded("text-embedding-3-small", Vec::new());
+        assert_eq!(store.dim(), active_dim());
+        assert!(store.is_empty());
+    }
+
+    #[test]
     fn search_ranks_by_similarity() {
         let store = VectorStore {
             model: "test".into(),
@@ -792,6 +916,10 @@ mod tests {
 
     #[test]
     fn is_enabled_false_without_env() {
+        // Neutralise any installed local model + hold the env lock, so
+        // is_enabled() reflects purely "no HTTP key" (under `vector-local` an
+        // installed ~/.umadev model would otherwise make it true).
+        let _no_local = crate::testsupport::without_local_model();
         // Clear any API key vars so is_enabled() reflects "no key". These
         // constants only exist under the `vector` feature; without it,
         // is_enabled() is compile-time false regardless.
@@ -809,7 +937,9 @@ mod tests {
 
     #[tokio::test]
     async fn embed_query_returns_none_without_key() {
-        // No API key → None regardless of feature (fail-open to BM25).
+        // No API key AND no local backend → None (fail-open to BM25). Neutralise
+        // any installed local model so this holds under `vector-local` too.
+        let _no_local = crate::testsupport::without_local_model();
         #[cfg(feature = "vector")]
         {
             std::env::remove_var(ENV_KEY);
@@ -820,6 +950,7 @@ mod tests {
 
     #[tokio::test]
     async fn embed_batch_empty_returns_empty() {
+        let _no_local = crate::testsupport::without_local_model();
         #[cfg(feature = "vector")]
         {
             std::env::remove_var(ENV_KEY);
@@ -845,10 +976,16 @@ mod tests {
     }
 
     // NOTE: these assertions read/write the process-global UMADEV_EMBED_DIM
-    // env var, so they must live in ONE test (run serially) — two parallel
-    // #[test]s mutating the same env var race and flake.
+    // env var, so they must run serially — two parallel #[test]s mutating the
+    // same env var race and flake. The env lock + local-backend neutralisation
+    // make this deterministic regardless of a model installed at
+    // ~/.umadev/embed-model (which would otherwise drive active_dim() to the
+    // LOCAL width under the `vector-local` feature).
     #[test]
     fn active_dim_default_and_override() {
+        // Hold the env lock + neutralise any installed local model so the
+        // model-default branch is what's exercised here.
+        let _no_local = crate::testsupport::without_local_model();
         // Clean slate.
         std::env::remove_var("UMADEV_EMBED_DIM");
         std::env::remove_var("UMADEV_EMBED_MODEL");
@@ -860,5 +997,30 @@ mod tests {
         std::env::set_var("UMADEV_EMBED_DIM", "0");
         assert_eq!(active_dim(), 1536, "invalid dim falls back");
         std::env::remove_var("UMADEV_EMBED_DIM");
+    }
+
+    // H3: with the bundled local backend usable, active_dim() must adopt its
+    // REAL width (e5-small = 384), NOT the 1536 HTTP-model default — else the
+    // store + dim-invalidation guard disagree and the local layer dead-ends.
+    // Only meaningful when the local backend is compiled in.
+    #[cfg(feature = "vector-local")]
+    #[test]
+    fn active_dim_adopts_local_backend_width() {
+        let _env = crate::testsupport::env_guard();
+        let prev = std::env::var("UMADEV_EMBED_MODEL_DIR").ok();
+        std::env::remove_var("UMADEV_EMBED_DIM");
+        std::env::remove_var("UMADEV_EMBED_MODEL");
+        // A fake model dir advertising hidden_size 384 (the three files only
+        // need to EXIST for is_available()).
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"hidden_size":384}"#).unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), b"").unwrap();
+        std::env::set_var("UMADEV_EMBED_MODEL_DIR", dir.path());
+        assert_eq!(active_dim(), 384, "active_dim must follow the local width");
+        match prev {
+            Some(v) => std::env::set_var("UMADEV_EMBED_MODEL_DIR", v),
+            None => std::env::remove_var("UMADEV_EMBED_MODEL_DIR"),
+        }
     }
 }

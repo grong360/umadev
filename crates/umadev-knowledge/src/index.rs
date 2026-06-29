@@ -28,6 +28,16 @@ use crate::vector;
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
 
+/// Schema version of the on-disk BM25 cache. The corpus signature keys on file
+/// CONTENT (machine-independent), but content alone doesn't capture a change to
+/// the TOKENIZER / chunker / index layout: after such an upgrade the cached
+/// `bm25.bin` is silently stale until a source file happens to change. Bumping
+/// this constant invalidates every cache built by an older schema (the version
+/// is folded into [`corpus_signature`], so an old `.sig` can no longer match).
+/// Bump it whenever `tokenizer::tokenize`, the chunker, or the `Bm25Index`
+/// layout changes in a way that alters indexed tokens.
+const INDEX_SCHEMA_VERSION: u32 = 1;
+
 /// One inverted-index entry: the term, and the chunks that contain it with
 /// per-chunk term frequency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +122,32 @@ impl Bm25Index {
         }
     }
 
+    /// Validate the index's internal cross-references: every `term_map`
+    /// posting index points at a real `Posting`, and every posting's
+    /// `(chunk_idx, _)` points at a real `Chunk`.
+    ///
+    /// serde validates the SHAPE of a deserialised `bm25.bin`, NOT its internal
+    /// consistency — a corrupt-but-shape-valid cache could carry an index past
+    /// `postings.len()` / `chunks.len()` that would OOB-panic in `search`,
+    /// violating the crate's fail-open contract (retrieval must never panic into
+    /// the engine). The cache loader runs this check and DISCARDS + rebuilds an
+    /// inconsistent cache instead of querying it. An empty index is consistent.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        let n_postings = self.postings.len();
+        let n_chunks = self.chunks.len();
+        if self
+            .term_map
+            .iter()
+            .any(|(_, idx)| *idx as usize >= n_postings)
+        {
+            return false;
+        }
+        self.postings
+            .iter()
+            .all(|p| p.docs.iter().all(|(c, _)| (*c as usize) < n_chunks))
+    }
+
     /// HashMap view of `term_map` for query-time lookup. Cheap to build.
     fn term_index(&self) -> HashMap<&str, u32> {
         self.term_map
@@ -158,7 +194,11 @@ impl Bm25Index {
         // an exact identifier). Uses the same BM25 +1-smoothed IDF as `search`.
         let idf_of = |tok: &str| -> Option<f64> {
             let pidx = *term_idx.get(tok)?;
-            let df = self.postings[pidx as usize].docs.len() as f64;
+            // Checked indexing: a corrupt (but shape-valid) cache could carry an
+            // out-of-range posting index. Bounds-check rather than panic — the
+            // crate is fail-open by contract (an absent posting just yields None,
+            // and the token is then kept like any out-of-corpus token).
+            let df = self.postings.get(pidx as usize)?.docs.len() as f64;
             Some(((n - df + 0.5) / (df + 0.5) + 1.0).ln())
         };
         // Median IDF over the tokens that ARE in the corpus — the per-query
@@ -226,7 +266,14 @@ impl Bm25Index {
             let Some(&pidx) = term_idx.get(term.as_str()) else {
                 continue; // term not in corpus
             };
-            let posting = &self.postings[pidx as usize];
+            // Checked indexing (fail-open): a corrupt-but-shape-valid cache could
+            // carry a `term_map` index past `postings` (or a posting whose
+            // `chunk_idx` is past `chunks`). serde validates shape, not internal
+            // consistency, so a bad index would otherwise panic here — violating
+            // the crate's never-panic-into-the-engine contract. Skip instead.
+            let Some(posting) = self.postings.get(pidx as usize) else {
+                continue;
+            };
             let df = posting.docs.len() as f64;
             // IDF with BM25's +1 smoothing (never negative).
             let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
@@ -236,7 +283,10 @@ impl Bm25Index {
                 // (`bm25_len`), excluding the appended CJK-trigram tokens — so a
                 // chunk rich in trigrams is not falsely treated as "long" and
                 // down-weighted in the bigram channel.
-                let dl = self.chunks[ci].bm25_len() as f64;
+                let Some(chunk) = self.chunks.get(ci) else {
+                    continue; // stale/corrupt chunk_idx — skip, never panic
+                };
+                let dl = chunk.bm25_len() as f64;
                 // Standard BM25: tf*(k1+1) / (tf + k1*(1 - b + b*dl/avgdl)).
                 let denom = f64::from(tf) + K1 * (1.0 - B + B * (dl / self.avg_doc_len.max(1.0)));
                 let tf_component = (f64::from(tf) * (K1 + 1.0)) / denom;
@@ -389,7 +439,12 @@ pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]
             let idx_path = index_path(project_root);
             if let Ok(bytes) = std::fs::read(&idx_path) {
                 if let Ok(index) = serde_json::from_slice::<Bm25Index>(&bytes) {
-                    return index;
+                    // Only trust a cache whose cross-references are in range — a
+                    // corrupt-but-shape-valid blob would otherwise OOB-panic in
+                    // `search`. An inconsistent cache falls through to a rebuild.
+                    if index.is_consistent() {
+                        return index;
+                    }
                 }
             }
         }
@@ -461,11 +516,14 @@ fn corpus_signature(paths: &[PathBuf], knowledge_dirs: &[PathBuf]) -> String {
         })
         .collect();
     entries.sort();
-    entries
+    // Fold in the schema version so a tokenizer/chunker/layout upgrade
+    // invalidates every older cache even when no source file changed.
+    let body = entries
         .iter()
         .map(|(p, h)| format!("{p}\t{h}"))
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    format!("schema=v{INDEX_SCHEMA_VERSION}\n{body}")
 }
 
 /// Maximum number of `.md` files the index will scan. A guard against a
@@ -1183,10 +1241,118 @@ B: {sb}"
         assert_eq!(a, b, "search_terms must equal search for the same query");
     }
 
+    #[test]
+    fn is_consistent_accepts_fresh_and_empty_indices() {
+        assert!(
+            Bm25Index::from_chunks(Vec::new()).is_consistent(),
+            "empty index is consistent"
+        );
+        let idx = idx_from(&[("a.md", "# A\n\n## S\n\nlogin auth pkce")]);
+        assert!(idx.is_consistent(), "freshly built index is consistent");
+    }
+
+    #[test]
+    fn is_consistent_detects_out_of_range_posting_index() {
+        let mut idx = idx_from(&[("a.md", "# A\n\n## S\n\nlogin auth")]);
+        let oob = idx.postings.len() as u32 + 5;
+        idx.term_map.push(("ghost".into(), oob));
+        assert!(
+            !idx.is_consistent(),
+            "term_map index past postings detected"
+        );
+    }
+
+    #[test]
+    fn search_does_not_panic_on_out_of_range_posting_index() {
+        // M9: a corrupt-but-shape-valid index whose term_map points past
+        // `postings` must be SKIPPED, never OOB-panic (fail-open by contract).
+        let mut idx = idx_from(&[("a.md", "# A\n\n## S\n\nlogin auth")]);
+        let oob = idx.postings.len() as u32 + 100;
+        for e in &mut idx.term_map {
+            e.1 = oob;
+        }
+        assert!(!idx.is_consistent());
+        // No panic; the OOB posting is skipped → empty result.
+        assert!(idx.search("login", 5).is_empty());
+        // The query-cleaning pass must be equally safe.
+        let _ = idx.mask_low_idf_terms("login auth", 1.0);
+    }
+
+    #[test]
+    fn search_does_not_panic_on_out_of_range_chunk_idx() {
+        // M9: a posting whose `chunk_idx` points past `chunks` must be skipped,
+        // never index `self.chunks` out of bounds.
+        let mut idx = idx_from(&[("a.md", "# A\n\n## S\n\nlogin auth")]);
+        let oob_chunk = idx.chunks.len() as u32 + 50;
+        for p in &mut idx.postings {
+            for d in &mut p.docs {
+                d.0 = oob_chunk;
+            }
+        }
+        assert!(!idx.is_consistent());
+        assert!(idx.search("login", 5).is_empty(), "no panic, empty result");
+    }
+
+    #[test]
+    fn cache_loader_discards_inconsistent_index_and_rebuilds() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let kd = root.join("knowledge");
+        fs::create_dir_all(&kd).unwrap();
+        fs::write(kd.join("a.md"), "# A\n\n## S\n\nlogin auth pkce").unwrap();
+
+        // Build + cache a good index (writes bm25.bin + bm25.sig).
+        let idx1 = load_or_build_index(root, &kd);
+        assert!(!idx1.chunks.is_empty());
+
+        // Overwrite bm25.bin with a shape-valid-but-INCONSISTENT index, leaving
+        // the matching .sig so the loader takes the cache-hit path.
+        let mut bad = idx1.clone();
+        let oob = bad.postings.len() as u32 + 100;
+        for e in &mut bad.term_map {
+            e.1 = oob;
+        }
+        assert!(!bad.is_consistent());
+        let idx_path = root.join(".umadev/kb-index/bm25.bin");
+        fs::write(&idx_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+
+        // The loader must NOT return the corrupt cache (which would panic on
+        // search); it discards it and rebuilds a consistent, queryable index.
+        let idx2 = load_or_build_index(root, &kd);
+        assert!(
+            idx2.is_consistent(),
+            "loader must discard + rebuild an inconsistent cache"
+        );
+        assert!(
+            !idx2.search("login", 5).is_empty(),
+            "the rebuilt index must be queryable"
+        );
+    }
+
+    #[test]
+    fn corpus_signature_carries_schema_version() {
+        // The schema version is folded into the signature, so an old cache built
+        // by a prior tokenizer/layout can't match after a version bump.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let f = dir.join("a.md");
+        fs::write(&f, "content").unwrap();
+        let sig = corpus_signature(std::slice::from_ref(&f), std::slice::from_ref(&dir));
+        assert!(
+            sig.starts_with(&format!("schema=v{INDEX_SCHEMA_VERSION}")),
+            "signature must be prefixed with the schema version: {sig}"
+        );
+    }
+
     #[tokio::test]
     async fn build_vector_store_is_noop_without_key() {
-        // No API key (or no vector feature) → the store build is a no-op,
+        // No API key AND no local backend → the store build is a no-op,
         // returning None. This is the fail-open contract: BM25 dominates.
+        // Neutralise any installed local model so this holds under
+        // `vector-local` too.
+        let _no_local = crate::testsupport::without_local_model();
         let idx = idx_from(&[("login.md", "# Login\n\n## OAuth\n\nlogin auth")]);
         let tmp = tempfile::TempDir::new().unwrap();
         let store = build_vector_store_if_enabled(tmp.path(), &idx).await;

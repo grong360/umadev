@@ -863,6 +863,14 @@ fn truncate_sig(sig: &str, max: usize) -> String {
 /// Cache directory for the repo map, relative to the project root.
 pub const REPOMAP_CACHE_DIR: &str = ".umadev/repomap-cache";
 
+/// Schema version of the repo-map cache. The signature keys on each file's
+/// mtime+size, which captures CONTENT edits but NOT a change to the symbol-scan
+/// regexes / `SymbolKind` set / cache encoding: after such an upgrade the cached
+/// `symbols.json` is silently stale until a file happens to change. Bumping this
+/// (folded into [`mtime_signature`]) invalidates every older-schema cache. Bump
+/// it whenever the language patterns, ranking, or cache wire form change.
+const REPOMAP_SCHEMA_VERSION: u32 = 1;
+
 /// One in-process memo entry: the resolved index plus the cheap freshness keys.
 struct MemoEntry {
     /// The resolved [`SymbolIndex`] for a root (scope-independent — scope is
@@ -997,10 +1005,17 @@ pub fn invalidate_cache(root: &Path) {
 }
 
 /// A deterministic mtime+size signature of the code files: one line per file,
-/// `<rel_path>\t<mtime_secs>\t<size>`, sorted. Unlike the knowledge corpus
-/// signature (content hash), the repo map is *local* working state, so cheap
-/// mtime+size is the right tradeoff (no need to read every file to hash it).
-/// A read failure for a file omits it from the signature (fail-open).
+/// `<rel_path>\t<mtime_nanos>\t<size>`, sorted, prefixed with the schema
+/// version. Unlike the knowledge corpus signature (content hash), the repo map
+/// is *local* working state, so cheap mtime+size is the right tradeoff (no need
+/// to read every file to hash it). A read failure for a file omits it from the
+/// signature (fail-open).
+///
+/// mtime is captured at NANOSECOND resolution, not seconds: a 1-second
+/// granularity missed a same-second, same-length edit (rewrite a line to one of
+/// equal byte length within the same second → identical signature → stale
+/// `symbols.json`). Nanosecond mtime (which every modern filesystem tracks)
+/// closes that window at no extra cost.
 fn mtime_signature(files: &[PathBuf], root: &Path) -> String {
     let mut entries: Vec<String> = files
         .iter()
@@ -1010,13 +1025,16 @@ fn mtime_signature(files: &[PathBuf], root: &Path) -> String {
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_secs());
+                .map_or(0u128, |d| d.as_nanos());
             let rel = rel_display(p, root);
             Some(format!("{rel}\t{mtime}\t{}", meta.len()))
         })
         .collect();
     entries.sort();
-    entries.join("\n")
+    // Fold in the schema version so a scan-logic/cache-format upgrade
+    // invalidates every older cache even when no file changed.
+    let body = entries.join("\n");
+    format!("schema=v{REPOMAP_SCHEMA_VERSION}\n{body}")
 }
 
 // --- Tiny self-contained (de)serialisation for the cache -------------------
@@ -1603,6 +1621,22 @@ mod tests {
             symbol_index(root).symbol_count(),
             2,
             "a real change after the TTL is re-scanned"
+        );
+    }
+
+    #[test]
+    fn mtime_signature_carries_schema_version() {
+        // A scan-logic/cache-format upgrade (bump REPOMAP_SCHEMA_VERSION) must
+        // invalidate older caches even when no file changed: the version is
+        // folded into the signature, so an old `.sig` can no longer match.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.rs", "pub fn one() {}\n");
+        let files = code_files(root);
+        let sig = mtime_signature(&files, root);
+        assert!(
+            sig.starts_with(&format!("schema=v{REPOMAP_SCHEMA_VERSION}")),
+            "signature must be prefixed with the schema version: {sig}"
         );
     }
 

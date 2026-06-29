@@ -716,7 +716,15 @@ fn rrf_fuse_bm25(
         *scores.entry(*idx).or_insert(0.0) += 1.0 / (kf + rank as f64 + 1.0);
     }
     let mut fused: Vec<(usize, f64)> = scores.into_iter().collect();
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Deterministic tiebreak: equal fused scores are common (two chunks at the
+    // same rank in each list), and collecting from a HashMap yields them in
+    // arbitrary iteration order. Break ties by ascending chunk index so the
+    // fused ranking is reproducible run-to-run (the crate's stated determinism).
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     fused.truncate(top_k);
     fused
 }
@@ -770,7 +778,14 @@ fn rrf_fuse(
     }
 
     let mut fused: Vec<(usize, f64)> = scores.into_iter().collect();
-    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Deterministic tiebreak on ascending chunk index — see [`rrf_fuse_bm25`].
+    // Without it, equal-scored chunks come out of the HashMap in arbitrary order
+    // and the final ranking (and what `top_k` keeps) varies run-to-run.
+    fused.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     fused.truncate(top_k);
     fused
 }
@@ -1025,6 +1040,47 @@ mod tests {
             ids.contains(&0) && ids.contains(&1),
             "both colliding-section chunks must survive fusion: {ids:?}"
         );
+    }
+
+    #[test]
+    fn rrf_fuse_bm25_tiebreak_is_deterministic_by_index() {
+        // Two non-overlapping chunks, each at rank 0 in its own list, tie on
+        // fused score. The tiebreak must order them by ASCENDING chunk index,
+        // reproducibly — not the arbitrary HashMap iteration order.
+        let primary: Vec<(usize, f64)> = vec![(7, 1.0)];
+        let secondary: Vec<(usize, f64)> = vec![(3, 1.0)];
+        for _ in 0..64 {
+            let fused = rrf_fuse_bm25(&primary, &secondary, 60, 5);
+            assert_eq!(fused.len(), 2);
+            assert!(
+                (fused[0].1 - fused[1].1).abs() < 1e-12,
+                "the two solo hits must tie on score"
+            );
+            assert_eq!(fused[0].0, 3, "lower chunk index wins the tie");
+            assert_eq!(fused[1].0, 7);
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_tiebreak_is_deterministic_by_index() {
+        // Same determinism guarantee for the BM25 vector fuser: two chunks that
+        // tie on fused score come out ascending-index ordered every run.
+        let chunks = crate::chunker::chunk_text(
+            "a.md",
+            "# A\n\n## One\n\nalpha\n\n## Two\n\nbeta\n\n## Three\n\ngamma",
+        );
+        let index = Bm25Index::from_chunks(chunks);
+        assert!(index.chunks.len() >= 2);
+        // Chunk 1 from BM25 (rank 0), chunk 0 from vector (rank 0) → equal score.
+        let bm25: Vec<(usize, f64)> = vec![(1, 4.0)];
+        let vec_hits: Vec<(u32, f32)> = vec![(0, 0.9)];
+        for _ in 0..64 {
+            let fused = rrf_fuse(&index, &bm25, &vec_hits, 60, 5);
+            assert_eq!(fused.len(), 2);
+            assert!((fused[0].1 - fused[1].1).abs() < 1e-12, "scores tie");
+            assert_eq!(fused[0].0, 0, "lower chunk index wins the tie");
+            assert_eq!(fused[1].0, 1);
+        }
     }
 
     #[test]
