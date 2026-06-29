@@ -561,6 +561,25 @@ mod tests {
             "tui.cmd.tasks",
             "tui.chip.run",
             "tui.chip.run_indeterminate",
+            // Wave C: the live team roster panel + handoff timeline — the convened
+            // seats as named teammates with their live status (idle/working/
+            // reviewing/blocked/done), and the seat→deliverable handoff entries.
+            "team.roster.panel.title",
+            "team.seat.pm",
+            "team.seat.architect",
+            "team.seat.designer",
+            "team.seat.frontend",
+            "team.seat.backend",
+            "team.seat.qa",
+            "team.seat.security",
+            "team.seat.devops",
+            "team.status.idle",
+            "team.status.working",
+            "team.status.reviewing",
+            "team.status.blocked",
+            "team.status.done",
+            "team.handoff.header",
+            "team.handoff.entry",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

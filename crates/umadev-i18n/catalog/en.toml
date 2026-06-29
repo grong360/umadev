@@ -182,6 +182,24 @@
 "team.deliverable.deploy" = "Deploy proof (deploy-proof.json)"
 "team.no_run" = "No build is running yet — the team convenes on a build. Start one with /run, and this fills in with who was summoned, their verdicts, and the deliverables they produced."
 
+# Live team roster + handoff timeline (Wave C — only convened seats are shown)
+"team.roster.panel.title" = "Team"
+"team.seat.pm" = "Product manager"
+"team.seat.architect" = "Architect"
+"team.seat.designer" = "Designer"
+"team.seat.frontend" = "Frontend"
+"team.seat.backend" = "Backend"
+"team.seat.qa" = "QA"
+"team.seat.security" = "Security"
+"team.seat.devops" = "DevOps"
+"team.status.idle" = "idle"
+"team.status.working" = "working"
+"team.status.reviewing" = "reviewing"
+"team.status.blocked" = "blocked"
+"team.status.done" = "done"
+"team.handoff.header" = "Handoffs"
+"team.handoff.entry" = "{} → {}"
+
 # Team constitution (the charter of non-negotiable operating principles)
 "constitution.title" = "Team Charter — the non-negotiables this team builds to"
 "constitution.intro" = "These are the operating principles your AI development team treats as non-negotiable. They are derived from the rules UmaDev actually enforces and the craft its firmware injects into every turn — not aspirations. Edit this file to make the charter your own; your edits are respected and never overwritten."

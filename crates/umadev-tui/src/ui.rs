@@ -373,7 +373,8 @@ mod theme {
 use ratatui::Frame;
 
 use crate::app::{
-    App, AppMode, ChatRole, CmdGroup, FileDiff, MessageBody, PaletteEntry, ToolCall, ToolStatus,
+    seat_display_name, App, AppMode, ChatRole, CmdGroup, FileDiff, MessageBody, PaletteEntry,
+    RosterSeat, SeatStatus, ToolCall, ToolStatus,
 };
 
 /// Set the terminal's light/dark classification, probed once at launch
@@ -2450,6 +2451,24 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
         }
     }
 
+    // ── Live team roster (Wave C) ──
+    // The convened seats as named teammates + their live status, derived from the
+    // plan steps' seat + status (anti-theater: `convened_roster` only yields seats
+    // that own a real step, so a decorative full roster is never shown). Folded
+    // into the same panel as the checklist so it shares the live region.
+    let roster = app.convened_roster();
+    if !roster.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", umadev_i18n::t(app.lang, "team.roster.panel.title")),
+            Style::default()
+                .fg(theme::PRIMARY())
+                .add_modifier(Modifier::BOLD),
+        )));
+        for seat in &roster {
+            lines.push(roster_seat_line(app.lang, seat));
+        }
+    }
+
     // ── Collapsible team-review panel ──
     if has_review {
         let accepts = app.critic_verdicts.iter().filter(|c| c.accepts).count();
@@ -2526,6 +2545,61 @@ fn checklist_glyph(status: &str) -> (String, ratatui::style::Color) {
         "blocked" => ("[!]".to_string(), theme::ERROR()),
         // [ ] pending (and any unrecognised status).
         _ => ("[ ]".to_string(), theme::TEXT_MUTED()),
+    }
+}
+
+/// One roster row (Wave C): `<status glyph> <seat name> · <status word>` plus, if
+/// the seat has reviewed, a compact verdict chip (`· accepts` / `· N must-fix`).
+/// Built from styled spans so the glyph, status word, and verdict chip each carry
+/// their own theme colour. No literal pictographs (the glyph is from a codepoint).
+fn roster_seat_line(lang: umadev_i18n::Lang, seat: &RosterSeat) -> Line<'static> {
+    let (glyph, color) = seat_status_glyph(seat.status);
+    let status_word = umadev_i18n::t(lang, seat.status.label_key());
+    let mut spans = vec![
+        Span::styled(format!("  {glyph} "), Style::default().fg(color)),
+        Span::styled(
+            truncate_display(&seat_display_name(lang, &seat.role), 24),
+            Style::default()
+                .fg(theme::TEXT())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {status_word}"), Style::default().fg(color)),
+    ];
+    // The verdict chip — only when the seat has actually returned a verdict
+    // (anti-theater: an un-reviewed seat shows no chip).
+    if let Some((accepts, n)) = seat.verdict {
+        let (chip, chip_color) = if accepts {
+            (
+                umadev_i18n::t(lang, "plan.review.accept").to_string(),
+                theme::SUCCESS(),
+            )
+        } else {
+            (
+                umadev_i18n::tf(lang, "plan.review.block", &[&n.max(1).to_string()]),
+                theme::ERROR(),
+            )
+        };
+        spans.push(Span::styled(
+            format!(" · {chip}"),
+            Style::default().fg(chip_color),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The status glyph + colour for one roster seat. Built from codepoints so the
+/// source carries no literal pictographic glyph; `working` and `reviewing` share
+/// the in-progress glyph but differ in colour (and the printed status word).
+fn seat_status_glyph(status: SeatStatus) -> (String, ratatui::style::Color) {
+    match status {
+        SeatStatus::Done => (
+            format!("[{}]", char::from_u32(0x2713).unwrap_or('x')),
+            theme::SUCCESS(),
+        ),
+        SeatStatus::Working => ("[~]".to_string(), theme::WARNING()),
+        SeatStatus::Reviewing => ("[~]".to_string(), theme::SECONDARY()),
+        SeatStatus::Blocked => ("[!]".to_string(), theme::ERROR()),
+        SeatStatus::Idle => ("[ ]".to_string(), theme::TEXT_MUTED()),
     }
 }
 
@@ -6086,6 +6160,54 @@ mod tests {
         assert!(out.contains("[architect]"), "accepting seat shown: {out}");
         assert!(out.contains("[qa]"), "blocking seat shown");
         assert!(out.contains("no tests"), "first must-fix inlined");
+    }
+
+    #[test]
+    fn team_roster_panel_renders_only_convened_seats_with_live_status() {
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · API contract (architect)".into(),
+                "s2 · login form (frontend)".into(),
+                // Unattributed — anti-theater keeps it OUT of the roster.
+                "s3 · housekeeping".into(),
+            ],
+            done: 0,
+            total: 3,
+        });
+        app.apply_engine(umadev_agent::EngineEvent::PlanStepStatus {
+            id: "s2".into(),
+            title: "login form".into(),
+            status: "active".into(),
+        });
+        // A verdict for the convened architect → a chip in its roster row.
+        app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
+            seat: "architect".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        let out = render_chat_to_string(&app, 100, 30);
+        // The roster names the two convened seats (capitalised short names — the
+        // lowercase `(frontend)` in the step title would NOT match these).
+        assert!(out.contains("Architect"), "architect seat in roster: {out}");
+        assert!(out.contains("Frontend"), "frontend seat in roster");
+        // The active doer reads `working`; the architect's accept chip renders.
+        assert!(out.contains("working"), "active doer status shown");
+        assert!(
+            out.contains("accepts"),
+            "the architect's verdict chip shown"
+        );
+    }
+
+    #[test]
+    fn team_roster_panel_is_absent_with_no_plan() {
+        // Fail-open: no plan → no roster section, nothing extra rendered, no panic.
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        let lines = plan_panel_lines(&app, 100);
+        assert!(lines.is_empty(), "no live panel content without a plan");
     }
 
     #[test]

@@ -182,6 +182,24 @@
 "team.deliverable.deploy" = "部署证明(deploy-proof.json)"
 "team.no_run" = "尚未开始构建 —— 团队在构建时集结。用 /run 开一个,这里就会补上谁被召集、各自的评审结论,以及他们产出的交付物。"
 
+# 实时团队花名册 + 交接时间线(Wave C —— 只显示真正被召集的席位)
+"team.roster.panel.title" = "团队"
+"team.seat.pm" = "产品经理"
+"team.seat.architect" = "架构师"
+"team.seat.designer" = "设计师"
+"team.seat.frontend" = "前端"
+"team.seat.backend" = "后端"
+"team.seat.qa" = "测试"
+"team.seat.security" = "安全"
+"team.seat.devops" = "运维"
+"team.status.idle" = "待命"
+"team.status.working" = "进行中"
+"team.status.reviewing" = "评审中"
+"team.status.blocked" = "受阻"
+"team.status.done" = "已完成"
+"team.handoff.header" = "交接时间线"
+"team.handoff.entry" = "{} → {}"
+
 # 团队宪章(不可妥协的工作原则)
 "constitution.title" = "团队宪章 —— 这支团队坚守的不可妥协原则"
 "constitution.intro" = "这些是你的 AI 开发团队视为不可妥协的工作原则。它们来自 UmaDev 真正强制执行的规则,以及固件在每一轮注入的工艺标准 —— 不是口号。你可以编辑本文件,让宪章成为你自己的版本;你的修改会被尊重,永不被覆盖。"

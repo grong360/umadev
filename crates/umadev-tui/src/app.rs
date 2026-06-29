@@ -299,6 +299,11 @@ pub struct PlanStepRow {
     /// Current status id: `pending` / `active` / `done` / `blocked`. Any other
     /// value renders as a neutral pending dot (fail-open).
     pub status: String,
+    /// Canonical role id of the seat that owns this step (`architect`,
+    /// `frontend-engineer`, …), parsed from the `PlanPosted` summary's trailing
+    /// `(seat)` token. Empty when the summary carried no resolvable seat — such a
+    /// step simply doesn't join the live roster (anti-theater: no phantom seats).
+    pub seat: String,
 }
 
 /// Lifecycle status of a background run task tracked by the [`App`] task
@@ -371,6 +376,70 @@ pub struct CriticRow {
     pub advisory: Vec<String>,
 }
 
+/// Live status of one convened teammate in the **team roster** (Wave C). Derived
+/// deterministically from that seat's plan steps' statuses (never narrated): a
+/// blocked step wins, else an active step (a doing seat is `Working`, a reviewing
+/// seat is `Reviewing`), else all-done is `Done`, else `Idle`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SeatStatus {
+    /// The seat is convened but none of its steps have started.
+    Idle,
+    /// A doing seat (frontend / backend / devops) has an active step.
+    Working,
+    /// A reviewing seat (pm / architect / designer / qa / security) has an active step.
+    Reviewing,
+    /// One of the seat's steps is blocked.
+    Blocked,
+    /// Every step the seat owns is done.
+    Done,
+}
+
+impl SeatStatus {
+    /// i18n key for the localized one-word status label rendered in the roster.
+    #[must_use]
+    pub fn label_key(self) -> &'static str {
+        match self {
+            SeatStatus::Idle => "team.status.idle",
+            SeatStatus::Working => "team.status.working",
+            SeatStatus::Reviewing => "team.status.reviewing",
+            SeatStatus::Blocked => "team.status.blocked",
+            SeatStatus::Done => "team.status.done",
+        }
+    }
+}
+
+/// One convened teammate in the live **team roster** panel (Wave C). Built only
+/// from seats that own a real plan step — the anti-theater floor: a decorative
+/// full roster is never shown, only the seats actually working this run.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RosterSeat {
+    /// Canonical role id (e.g. `architect`) — the key for the localized name +
+    /// for matching a [`CriticRow`] verdict.
+    pub role: String,
+    /// Live status aggregated from the seat's plan steps.
+    pub status: SeatStatus,
+    /// The seat's latest verdict, if a [`EngineEvent::CriticVerdict`] landed for
+    /// it — `(accepts, blocking_count)`. `None` until the seat reviews.
+    pub verdict: Option<(bool, usize)>,
+}
+
+/// One entry in the **handoff timeline** (Wave C) — recorded when a plan step
+/// flips to `done`, i.e. a seat handed its finished deliverable downstream
+/// ("architect → API contract → frontend / backend pick it up"). A handoff is a
+/// real DONE transition, never a narration (anti-theater).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Handoff {
+    /// Canonical role id of the seat that completed the step (`""` when the step
+    /// carried no resolvable seat).
+    pub seat: String,
+    /// The completed step's title (the deliverable that was handed off).
+    pub title: String,
+}
+
+/// Hard cap on the retained handoff timeline so a long build can't grow the log
+/// without bound; the oldest entries roll off (the panel/`/team` show the tail).
+const HANDOFFS_CAP: usize = 24;
+
 /// The standing development team rendered by `/team` — the eight specialist
 /// seats plus the coordinator, in delivery order. Each entry is one i18n key
 /// whose string names the role AND the artifact it produces (the
@@ -388,6 +457,91 @@ const TEAM_ROSTER: &[&str] = &[
     "team.roster.devops",
     "team.roster.coordinator",
 ];
+
+/// Map a canonical seat role id to the i18n key for its **short** display name
+/// (the one-word label used in the live roster / handoff timeline, distinct from
+/// the verbose role→deliverable line in [`TEAM_ROSTER`]). An unknown role falls
+/// back to the raw id so a future seat still renders something legible.
+#[must_use]
+pub(crate) fn seat_name_key(role: &str) -> Option<&'static str> {
+    match role {
+        "product-manager" => Some("team.seat.pm"),
+        "architect" => Some("team.seat.architect"),
+        "uiux-designer" => Some("team.seat.designer"),
+        "frontend-engineer" => Some("team.seat.frontend"),
+        "backend-engineer" => Some("team.seat.backend"),
+        "qa-engineer" => Some("team.seat.qa"),
+        "security-engineer" => Some("team.seat.security"),
+        "devops-engineer" => Some("team.seat.devops"),
+        _ => None,
+    }
+}
+
+/// The localized short name of a seat for the roster / handoff surfaces. Resolves
+/// `role` (or a free-text alias) to its canonical seat first so `qa` and
+/// `qa-engineer` print the same name; an unresolvable role prints verbatim.
+#[must_use]
+pub(crate) fn seat_display_name(lang: umadev_i18n::Lang, role: &str) -> String {
+    let canonical = umadev_agent::Seat::from_alias(role).map_or(role, |s| s.role_id());
+    match seat_name_key(canonical) {
+        Some(key) => umadev_i18n::t(lang, key).to_string(),
+        None => role.to_string(),
+    }
+}
+
+/// Whether a canonical seat role is a **doing** seat (drives the main session) vs
+/// a reviewing seat — reuses the agent's own `Seat::is_doer` so the doer set is
+/// one source of truth. An unresolvable role is treated as a reviewer (the
+/// conservative default; a non-doer never claims to be "working").
+fn is_doer_role(role: &str) -> bool {
+    umadev_agent::Seat::from_alias(role).is_some_and(umadev_agent::Seat::is_doer)
+}
+
+/// Map one plan step's `(seat, status)` to the live [`SeatStatus`] it implies: a
+/// blocked step is `Blocked`, an active step is `Working` for a doing seat /
+/// `Reviewing` for a reviewing seat, a done step is `Done`, and anything else
+/// (pending / unknown) is `Idle`.
+fn step_seat_status(role: &str, status: &str) -> SeatStatus {
+    match status {
+        "blocked" => SeatStatus::Blocked,
+        "active" => {
+            if is_doer_role(role) {
+                SeatStatus::Working
+            } else {
+                SeatStatus::Reviewing
+            }
+        }
+        "done" => SeatStatus::Done,
+        // pending and any unrecognised status — the seat hasn't started this step.
+        _ => SeatStatus::Idle,
+    }
+}
+
+/// Precedence rank for aggregating a seat's many steps into ONE live status. A
+/// blocked step dominates, then an in-flight (working/reviewing) step, then a
+/// not-yet-started (idle) step, and only an all-done seat reads as `Done` — so a
+/// seat with one done + one pending step correctly reads as `Idle`, not `Done`.
+fn seat_status_rank(s: SeatStatus) -> u8 {
+    match s {
+        SeatStatus::Done => 0,
+        SeatStatus::Idle => 1,
+        SeatStatus::Working | SeatStatus::Reviewing => 2,
+        SeatStatus::Blocked => 3,
+    }
+}
+
+/// Fold one more step's status into a seat's accumulated live status, keeping the
+/// higher-precedence of the two (see [`seat_status_rank`]). The accumulator is
+/// seeded with [`SeatStatus::Done`] (the lowest rank) so an all-done seat stays
+/// `Done`.
+fn merge_seat_status(acc: SeatStatus, role: &str, status: &str) -> SeatStatus {
+    let s = step_seat_status(role, status);
+    if seat_status_rank(s) > seat_status_rank(acc) {
+        s
+    } else {
+        acc
+    }
+}
 
 /// Source of a chat message — used to colour the role label.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -1751,6 +1905,13 @@ pub struct App {
     /// the CURRENT round, never a stale mix. Default `false` (no round open yet).
     pub critic_round_open: bool,
 
+    /// **Handoff timeline** (Wave C) — one entry per plan step that flipped to
+    /// `done`, in completion order (a seat handing its finished deliverable
+    /// downstream). Recorded from real DONE transitions (anti-theater: never a
+    /// narration), bounded to the most recent [`HANDOFFS_CAP`]. Surfaced by
+    /// `/team`; cleared with the rest of the live-run panel state.
+    pub handoffs: Vec<Handoff>,
+
     /// The last routed intent (Wave 1 deliverable 1) — the class id the router
     /// decided for the in-flight turn (`chat` / `build` / …). Drives the status
     /// chip so the user sees fast-vs-deliberate at a glance. `None` until the
@@ -1903,6 +2064,7 @@ impl App {
             critic_verdicts: Vec::new(),
             critics_collapsed: false,
             critic_round_open: false,
+            handoffs: Vec::new(),
             last_intent_class: None,
         };
         app.load_history();
@@ -4015,13 +4177,16 @@ impl App {
                     id,
                     title,
                     status: "pending".to_string(),
+                    seat: parse_seat(summary),
                 }
             })
             .collect();
         // A fresh plan un-collapses the panel so the first plan is always seen,
         // and seals any open review round (a re-plan starts a clean review cycle).
+        // A re-plan also starts a fresh handoff timeline.
         self.plan_collapsed = false;
         self.critic_round_open = false;
+        self.handoffs.clear();
         // The director path posts a plan WITHOUT a `PipelineStarted` (it set
         // `agentic_in_flight` directly in the event loop), so a posted plan is the
         // reliable "a build is live" signal here — ensure a task exists and seed
@@ -4048,21 +4213,50 @@ impl App {
         // of mixing two rounds. A review burst itself emits no `PlanStepStatus`,
         // so this never splits a round mid-flight.
         self.critic_round_open = false;
+        // A step that newly flips to `done` is a real handoff — capture the seat +
+        // title BEFORE mutating the row so the timeline records who finished what.
+        let mut handoff: Option<Handoff> = None;
         if let Some(row) = self.plan_steps.iter_mut().find(|s| s.id == id) {
+            let newly_done = status == "done" && row.status != "done";
             row.status = status.to_string();
             if !title.trim().is_empty() {
                 row.title = title.to_string();
             }
+            if newly_done {
+                handoff = Some(Handoff {
+                    seat: row.seat.clone(),
+                    title: row.title.clone(),
+                });
+            }
         } else {
+            // An unknown id is appended (never dropped). Try to recover its seat
+            // from a trailing `(seat)` on the title (fail-open: usually empty).
+            let row_title = if title.trim().is_empty() {
+                id.to_string()
+            } else {
+                title.to_string()
+            };
+            let seat = parse_seat(title);
+            if status == "done" {
+                handoff = Some(Handoff {
+                    seat: seat.clone(),
+                    title: row_title.clone(),
+                });
+            }
             self.plan_steps.push(PlanStepRow {
                 id: id.to_string(),
-                title: if title.trim().is_empty() {
-                    id.to_string()
-                } else {
-                    title.to_string()
-                },
+                title: row_title,
                 status: status.to_string(),
+                seat,
             });
+        }
+        if let Some(h) = handoff {
+            self.handoffs.push(h);
+            // Bound the timeline — the oldest handoffs roll off the front.
+            if self.handoffs.len() > HANDOFFS_CAP {
+                let overflow = self.handoffs.len() - HANDOFFS_CAP;
+                self.handoffs.drain(0..overflow);
+            }
         }
         // Reflect the tick into the live registry task's X/Y progress.
         self.sync_active_task_progress();
@@ -4134,6 +4328,46 @@ impl App {
             }
         }
         self.push(ChatRole::System, body);
+    }
+
+    /// Build the **live team roster** (Wave C): one [`RosterSeat`] per seat that
+    /// owns a real plan step, in first-appearance order, with its aggregated live
+    /// status and latest verdict. **Anti-theater is enforced here**: a seat is
+    /// included **only** if it has at least one plan step (a real, machine-tracked
+    /// unit of work) — a decorative full roster is never produced, only the seats
+    /// actually convened this run. Returns empty when no plan is live (the panel
+    /// then renders nothing extra). Fail-open: an unresolvable seat id is skipped.
+    #[must_use]
+    pub fn convened_roster(&self) -> Vec<RosterSeat> {
+        let mut roster: Vec<RosterSeat> = Vec::new();
+        for step in &self.plan_steps {
+            // Anti-theater: only a seat with a real step joins the roster.
+            if step.seat.is_empty() {
+                continue;
+            }
+            // Aggregate this step's status into the seat's running tally.
+            if let Some(existing) = roster.iter_mut().find(|r| r.role == step.seat) {
+                existing.status = merge_seat_status(existing.status, &step.seat, &step.status);
+            } else {
+                roster.push(RosterSeat {
+                    role: step.seat.clone(),
+                    status: merge_seat_status(SeatStatus::Done, &step.seat, &step.status),
+                    verdict: None,
+                });
+            }
+        }
+        // Fold in each seat's latest verdict (matched by canonical role). A
+        // verdict from a seat with no plan step is NOT injected — anti-theater
+        // keeps the roster to convened seats only (such verdicts still show in the
+        // team-review panel).
+        for c in &self.critic_verdicts {
+            let canonical = umadev_agent::Seat::from_alias(&c.seat)
+                .map_or(c.seat.clone(), |s| s.role_id().to_string());
+            if let Some(seat) = roster.iter_mut().find(|r| r.role == canonical) {
+                seat.verdict = Some((c.accepts, c.blocking.len()));
+            }
+        }
+        roster
     }
 
     // ---- engine events ----------------------------------------------------
@@ -5885,6 +6119,7 @@ impl App {
         self.critic_verdicts.clear();
         self.critics_collapsed = false;
         self.critic_round_open = false;
+        self.handoffs.clear();
         // A terminal/reset transition must also settle any tool-call row still
         // showing a spinner: on abort/cancel the base's matching ToolResult
         // never arrives, so without this a stack of in-flight rows (TaskCreate /
@@ -6219,6 +6454,7 @@ impl App {
                 // the last-intent chip — nothing from the prior conversation lingers.
                 self.plan_steps.clear();
                 self.critic_verdicts.clear();
+                self.handoffs.clear();
                 self.last_intent_class = None;
                 // A cleared transcript means the base should start a fresh
                 // session on the next turn, not resume the old one.
@@ -7697,28 +7933,67 @@ impl App {
             body.push('\n');
             body.push_str(umadev_i18n::t(self.lang, "team.run.header"));
             body.push('\n');
-            // Convened seats + their latest verdict — same wording as the live
-            // team-review panel / `show_plan_status` ([seat] accepts / N must-fix).
-            if has_review {
-                let accepts = self.critic_verdicts.iter().filter(|c| c.accepts).count();
-                let blocking = self.critic_verdicts.len() - accepts;
-                body.push_str(&umadev_i18n::tf(
-                    self.lang,
-                    "plan.review.section",
-                    &[&accepts.to_string(), &blocking.to_string()],
-                ));
+            // (2a) Convened roster — ONLY the seats with a real plan step, each
+            // with its live status + (if reviewed) its verdict chip. Anti-theater:
+            // `convened_roster` never invents a seat without a step.
+            let roster = self.convened_roster();
+            if roster.is_empty() {
+                // No seat-attributed plan steps yet — fall back to the raw verdict
+                // list so a review-only run still shows who weighed in (the old
+                // wording), never a blank run section.
+                if has_review {
+                    for c in &self.critic_verdicts {
+                        let verdict = if c.accepts {
+                            umadev_i18n::t(self.lang, "plan.review.accept").to_string()
+                        } else {
+                            umadev_i18n::tf(
+                                self.lang,
+                                "plan.review.block",
+                                &[&c.blocking.len().max(1).to_string()],
+                            )
+                        };
+                        body.push_str(&format!(
+                            "  {} · {verdict}\n",
+                            seat_display_name(self.lang, &c.seat)
+                        ));
+                    }
+                }
+            } else {
+                for seat in &roster {
+                    let status = umadev_i18n::t(self.lang, seat.status.label_key());
+                    let chip = seat
+                        .verdict
+                        .map(|(accepts, n)| {
+                            let v = if accepts {
+                                umadev_i18n::t(self.lang, "plan.review.accept").to_string()
+                            } else {
+                                umadev_i18n::tf(
+                                    self.lang,
+                                    "plan.review.block",
+                                    &[&n.max(1).to_string()],
+                                )
+                            };
+                            format!(" · {v}")
+                        })
+                        .unwrap_or_default();
+                    body.push_str(&format!(
+                        "  {} · {status}{chip}\n",
+                        seat_display_name(self.lang, &seat.role)
+                    ));
+                }
+            }
+            // (2b) Handoff timeline — the real DONE transitions, in order.
+            if !self.handoffs.is_empty() {
+                body.push_str(umadev_i18n::t(self.lang, "team.handoff.header"));
                 body.push('\n');
-                for c in &self.critic_verdicts {
-                    let verdict = if c.accepts {
-                        umadev_i18n::t(self.lang, "plan.review.accept").to_string()
-                    } else {
-                        umadev_i18n::tf(
-                            self.lang,
-                            "plan.review.block",
-                            &[&c.blocking.len().max(1).to_string()],
-                        )
-                    };
-                    body.push_str(&format!("  [{}] {verdict}\n", c.seat));
+                for h in &self.handoffs {
+                    body.push_str("  ");
+                    body.push_str(&umadev_i18n::tf(
+                        self.lang,
+                        "team.handoff.entry",
+                        &[&seat_display_name(self.lang, &h.seat), &h.title],
+                    ));
+                    body.push('\n');
                 }
             }
             // Deliverables that actually exist on disk vs. still pending.
@@ -10689,6 +10964,25 @@ pub(crate) fn split_plan_summary(summary: &str, index: usize) -> (String, String
     (format!("s{index}"), summary.trim().to_string())
 }
 
+/// Extract the canonical seat role id from a `PlanPosted` summary's (or step
+/// title's) trailing `(seat)` token — `… (frontend)` → `frontend-engineer`,
+/// using the same alias set the agent resolves. **Fail-open**: no parenthesised
+/// suffix, or a token that doesn't resolve to a known seat, yields `""` — an
+/// unattributed step simply never joins the live roster (anti-theater: a phantom
+/// seat is never invented from a malformed summary).
+pub(crate) fn parse_seat(summary: &str) -> String {
+    let trimmed = summary.trim_end();
+    if let Some(open) = trimmed.rfind('(') {
+        if trimmed.ends_with(')') && open + 1 < trimmed.len() - 1 {
+            let inner = &trimmed[open + 1..trimmed.len() - 1];
+            if let Some(seat) = umadev_agent::Seat::from_alias(inner) {
+                return seat.role_id().to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Sentinel that prefixes the structured auth metadata `spawn_probe` packs onto
 /// the [`EngineEvent::BackendProbed`] `detail` (since that event can't grow new
 /// fields — it lives in umadev-agent, outside this crate). Shape:
@@ -12057,6 +12351,195 @@ mod tests {
         });
         assert_eq!(app.plan_steps.len(), 4);
         assert_eq!(app.plan_steps[3].id, "s9");
+    }
+
+    // ---- Wave C: live team roster + handoff timeline ----------------------
+
+    #[test]
+    fn convened_roster_shows_only_seated_steps_with_live_status() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · API contract (architect)".into(),
+                "s2 · login form (frontend)".into(),
+                // No `(seat)` → unattributed; anti-theater drops it from the roster.
+                "s3 · housekeeping step".into(),
+            ],
+            done: 0,
+            total: 3,
+        });
+        // The step seat was captured from the `(seat)` token.
+        assert_eq!(app.plan_steps[0].seat, "architect");
+        assert_eq!(app.plan_steps[1].seat, "frontend-engineer");
+        assert_eq!(
+            app.plan_steps[2].seat, "",
+            "no seat parsed for the bare step"
+        );
+        // Only the two seat-attributed steps convene a seat; all pending → idle.
+        let roster = app.convened_roster();
+        assert_eq!(roster.len(), 2, "only seated steps convene a teammate");
+        assert!(roster.iter().all(|r| r.status == SeatStatus::Idle));
+        // A reviewing seat (architect) active reads `Reviewing`; a doing seat
+        // (frontend) active reads `Working`.
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "API contract".into(),
+            status: "active".into(),
+        });
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s2".into(),
+            title: "login form".into(),
+            status: "active".into(),
+        });
+        let roster = app.convened_roster();
+        let arch = roster.iter().find(|r| r.role == "architect").unwrap();
+        let fe = roster
+            .iter()
+            .find(|r| r.role == "frontend-engineer")
+            .unwrap();
+        assert_eq!(arch.status, SeatStatus::Reviewing);
+        assert_eq!(fe.status, SeatStatus::Working);
+    }
+
+    #[test]
+    fn step_done_marks_seat_done_and_records_a_handoff() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec!["s1 · API contract (architect)".into()],
+            done: 0,
+            total: 1,
+        });
+        assert!(
+            app.handoffs.is_empty(),
+            "no handoff before a step completes"
+        );
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "API contract".into(),
+            status: "done".into(),
+        });
+        // The (only) step done → the seat reads Done…
+        assert_eq!(app.convened_roster()[0].status, SeatStatus::Done);
+        // …and a handoff entry was recorded for the architect.
+        assert_eq!(app.handoffs.len(), 1);
+        assert_eq!(app.handoffs[0].seat, "architect");
+        assert!(app.handoffs[0].title.contains("API contract"));
+        // A repeated `done` event does NOT double-record the handoff (idempotent).
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "API contract".into(),
+            status: "done".into(),
+        });
+        assert_eq!(
+            app.handoffs.len(),
+            1,
+            "no duplicate handoff on a repeat done"
+        );
+    }
+
+    #[test]
+    fn roster_verdict_chip_reflects_critic_verdict_only_for_convened_seats() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · API contract (architect)".into(),
+                "s2 · login form (frontend)".into(),
+            ],
+            done: 0,
+            total: 2,
+        });
+        // Architect (convened) accepts; QA (NO plan step) blocks.
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "architect".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec![],
+        });
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: false,
+            blocking: vec!["missing tests".into()],
+            advisory: vec![],
+        });
+        let roster = app.convened_roster();
+        // Anti-theater: QA reviewed but has no step → it never joins the roster.
+        assert!(
+            roster.iter().all(|r| r.role != "qa-engineer"),
+            "an unconvened reviewer is not shown in the roster"
+        );
+        // The architect's chip carries its accept verdict; frontend has no verdict.
+        let arch = roster.iter().find(|r| r.role == "architect").unwrap();
+        assert_eq!(arch.verdict, Some((true, 0)));
+        let fe = roster
+            .iter()
+            .find(|r| r.role == "frontend-engineer")
+            .unwrap();
+        assert_eq!(fe.verdict, None);
+    }
+
+    #[test]
+    fn roster_and_handoffs_are_empty_with_no_active_build() {
+        // Fail-open: a fresh app with no plan shows nothing extra and never panics.
+        let app = fresh_app(Some("offline"));
+        assert!(app.convened_roster().is_empty());
+        assert!(app.handoffs.is_empty());
+    }
+
+    #[test]
+    fn team_command_surfaces_convened_roster_and_handoff_timeline() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · API contract (architect)".into(),
+                "s2 · login form (frontend)".into(),
+            ],
+            done: 0,
+            total: 2,
+        });
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "API contract".into(),
+            status: "done".into(),
+        });
+        let before = app.history.len();
+        app.slash_team("");
+        let note = app
+            .history
+            .iter()
+            .skip(before)
+            .find(|m| m.role == ChatRole::UmaDev)
+            .expect("a team note was pushed");
+        let body = note.body();
+        // The convened architect appears with its done status word, and the handoff
+        // timeline names the architect's completed deliverable.
+        let arch_name = seat_display_name(app.lang, "architect");
+        assert!(body.contains(&arch_name), "names the convened architect");
+        assert!(
+            body.contains(umadev_i18n::t(app.lang, "team.handoff.header")),
+            "shows the handoff timeline header once a step is done"
+        );
+        assert!(
+            body.contains("API contract"),
+            "names the handed-off deliverable"
+        );
+    }
+
+    #[test]
+    fn a_blocked_step_makes_its_seat_read_blocked() {
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec!["s1 · login form (frontend)".into()],
+            done: 0,
+            total: 1,
+        });
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "login form".into(),
+            status: "blocked".into(),
+        });
+        assert_eq!(app.convened_roster()[0].status, SeatStatus::Blocked);
+        // A blocked step is not a completion → no handoff entry.
+        assert!(app.handoffs.is_empty());
     }
 
     // ---- background-run task registry + /tasks ----------------------------
@@ -15020,8 +15503,9 @@ mod tests {
 
     #[test]
     fn slash_team_with_verdicts_shows_per_seat_verdicts() {
-        // Recorded critic verdicts are run context → the run section lists each
-        // convened seat with its verdict (reusing the team-review wording).
+        // Recorded critic verdicts are run context. With NO plan steps the
+        // convened roster is empty, so the run section falls back to naming each
+        // reviewing seat (by its short display name) with its verdict.
         let mut a = fresh_app(Some("offline"));
         a.apply_engine(EngineEvent::CriticVerdict {
             seat: "architect".into(),
@@ -15047,8 +15531,16 @@ mod tests {
             out.contains(umadev_i18n::t(a.lang, "team.run.header")),
             "run header: {out}"
         );
-        assert!(out.contains("[architect]"), "accepting seat: {out}");
-        assert!(out.contains("[qa]"), "blocking seat: {out}");
+        assert!(
+            out.contains(&seat_display_name(a.lang, "architect")),
+            "accepting seat: {out}"
+        );
+        assert!(
+            out.contains(&seat_display_name(a.lang, "qa")),
+            "blocking seat: {out}"
+        );
+        // The verdict wording rides along (accept + must-fix).
+        assert!(out.contains(umadev_i18n::t(a.lang, "plan.review.accept")));
     }
 
     #[test]
