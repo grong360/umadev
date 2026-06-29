@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（）
+# React Native 完整开发标准
 
 ## React Native 完整开发标准
 

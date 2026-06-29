@@ -8,7 +8,7 @@ tags: [ai, ai可观测性与值班runbook, and, observability, oncall, runbook]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# ai-observability-and-oncall-runbook
 
 ## AI可观测性与值班Runbook
 

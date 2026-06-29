@@ -5,8 +5,8 @@ domain: development
 category: 03-checklists
 difficulty: intermediate
 tags: [checklist, development, production, readiness, 可靠性与容灾, 合规与审计, 基础设施与部署, 安全]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 90
+last_updated: 2026-06-29
 ---
 # 生产就绪检查清单 (Production Readiness Checklist)
 
@@ -169,11 +169,11 @@ last_updated: 2026-06-15
 
 ---
 
-## 参考
+## 相关规范
 
-- Google SRE Book: Production Readiness Review — https://sre.google/sre-book/evolving-sre-engagement-model/
-- AWS Well-Architected Framework — https://aws.amazon.com/architecture/well-architected/
-- The Twelve-Factor App — https://12factor.net/
+- 服务级一次性 go/no-go 决策门：`operations/01-standards/production-readiness-review`
+- 每次发布的 pass/fail 门禁：`cicd/release-readiness-gate`
+- 配置与环境治理：`architecture/01-standards/configuration-and-environment-management`
 
 ---
 

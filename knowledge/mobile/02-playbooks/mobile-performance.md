@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（）
+# 移动应用性能优化手册
 
 ## 移动应用性能优化手册
 

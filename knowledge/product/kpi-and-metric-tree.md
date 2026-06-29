@@ -8,7 +8,7 @@ tags: [and, kpi, metric, product, tree, 与指标树方法库]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# kpi-and-metric-tree
 
 ## KPI 与指标树方法库
 

@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（）
+# 移动应用发布检查清单
 
 ## 移动应用发布检查清单
 

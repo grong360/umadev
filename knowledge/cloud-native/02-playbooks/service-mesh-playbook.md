@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（）
+# 服务网格作战手册
 # 功能：服务网格实施与运维作战手册
 # 作用：指导 Istio/Linkerd 服务网格的部署、配置和运维
 # 创建时间：2025-03-20

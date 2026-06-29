@@ -8,7 +8,7 @@ tags: [agent, ai, deep, dive, engineering, llm, 工程深度知识库]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# llm-agent-engineering-deep-dive
 
 ## LLM 与 Agent 工程深度知识库
 

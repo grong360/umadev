@@ -8,7 +8,7 @@ tags: [ai, ai模型选型与路由策略, and, model, routing, selection, strate
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# ai-model-selection-and-routing-strategy
 
 ## AI模型选型与路由策略
 

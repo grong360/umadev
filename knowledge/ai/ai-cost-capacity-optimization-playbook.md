@@ -8,7 +8,7 @@ tags: [ai, ai成本与容量优化手册, capacity, cost, optimization, playbook
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# ai-cost-capacity-optimization-playbook
 
 ## AI成本与容量优化手册
 

@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（）
+# 案例：Kubernetes 扩展
 # 功能：Kubernetes 自动扩展实战案例
 # 作用：分享 K8s 弹性伸缩的实践经验
 # 创建时间：2025-03-20

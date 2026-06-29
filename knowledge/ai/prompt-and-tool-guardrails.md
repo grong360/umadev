@@ -8,7 +8,7 @@ tags: [ai, and, guardrails, prompt, tool, 与工具调用护栏规范]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# prompt-and-tool-guardrails
 
 ## Prompt 与工具调用护栏规范
 

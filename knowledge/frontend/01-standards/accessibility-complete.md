@@ -5,8 +5,8 @@ domain: frontend
 category: 01-standards
 difficulty: intermediate
 tags: [accessibility, aria, complete, frontend, html, 屏幕阅读器优化, 属性, 概述]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 90
+last_updated: 2026-06-29
 ---
 # Web 无障碍完整指南
 
@@ -402,7 +402,7 @@ function DropdownMenu({ items }: { items: MenuItem[] }) {
   padding-left: 12px;
 }
 .error::before {
-  content: "⚠ ";
+  content: "! ";
 }
 ```
 

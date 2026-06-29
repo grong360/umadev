@@ -8,7 +8,7 @@ tags: [adr, and, architecture, examples, template, 模板与示例规范]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# adr-template-and-examples
 
 ## ADR 模板与示例规范
 

@@ -8,7 +8,7 @@ tags: [ai, ai红队测试与安全评估, and, evaluation, red, safety, team]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# ai-red-team-and-safety-evaluation
 
 ## AI红队测试与安全评估
 

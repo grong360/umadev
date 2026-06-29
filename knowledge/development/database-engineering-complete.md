@@ -8,7 +8,7 @@ tags: [complete, database, development, engineering, 数据库工程完整知识
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# database-engineering-complete
 
 ## 数据库工程完整知识库
 

@@ -8,7 +8,7 @@ tags: [command, incident, operations, system]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# incident-command-system
 
 ## 事故指挥体系（ICS）手册
 

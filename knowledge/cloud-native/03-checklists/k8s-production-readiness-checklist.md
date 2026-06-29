@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（）
+# Kubernetes 生产就绪检查清单
 # 功能：Kubernetes 生产环境部署前检查清单
 # 作用：确保应用具备生产环境运行条件
 # 创建时间：2025-03-20

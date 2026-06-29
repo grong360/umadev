@@ -8,7 +8,7 @@ tags: [complete, development, engineering, frontend, 前端工程完整知识库
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# frontend-engineering-complete
 
 ## 前端工程完整知识库
 

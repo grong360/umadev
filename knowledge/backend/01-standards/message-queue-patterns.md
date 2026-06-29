@@ -1,379 +1,101 @@
 ---
 id: message-queue-patterns
-title: 消息队列模式完整指南
+title: 消息队列选型与消息模式规范（按场景选队列 + 用对消息模式，商业级必读）
 domain: backend
 category: 01-standards
-difficulty: intermediate
-tags: [backend, kafka, message, patterns, queue, rabbitmq, redis, streams]
-quality_score: 70
-last_updated: 2026-06-15
+difficulty: advanced
+tags: [message-queue, kafka, rabbitmq, redis-streams, broker-selection, pub-sub, work-queue, event-streaming, event-sourcing, cqrs, fanout, routing, partitioning, schema-evolution, 消息队列, 选型, 消息模式, 事件流, 商业级]
+quality_score: 95
+last_updated: 2026-06-29
 ---
-# 消息队列模式完整指南
-
-## 概述
-
-消息队列是分布式系统的核心基础设施，实现服务解耦、异步处理、流量削峰和事件驱动架构。本指南覆盖 Kafka、RabbitMQ 和 Redis Streams 的选型、核心模式和最佳实践。
-
----
-
-## 方案选型对比
-
-| 特性 | Kafka | RabbitMQ | Redis Streams |
-|------|-------|----------|---------------|
-| 定位 | 分布式事件流平台 | 消息代理 | 轻量级消息流 |
-| 吞吐量 | 百万级/秒 | 万级/秒 | 十万级/秒 |
-| 消息持久化 | 磁盘，可配置保留期 | 内存+磁盘 | 内存+RDB/AOF |
-| 消费模型 | Consumer Group + Offset | Queue/Exchange 路由 | Consumer Group |
-| 消息顺序 | Partition 内有序 | Queue 内有序 | Stream 内有序 |
-| 延迟 | 毫秒级 | 微秒级 | 微秒级 |
-| 适用场景 | 事件溯源/日志/大数据 | 任务队列/RPC/路由 | 轻量事件/缓存层流 |
-
----
-
-## Kafka
-
-### 核心概念
-
-```
-Producer -> Topic (Partition 0, 1, 2...) -> Consumer Group
-                                             ├── Consumer A (Partition 0, 1)
-                                             └── Consumer B (Partition 2)
-```
-
-### 生产者
-
-```python
-from confluent_kafka import Producer
-
-producer = Producer({
-    "bootstrap.servers": "kafka:9092",
-    "acks": "all",                    # 等待所有副本确认
-    "retries": 3,
-    "enable.idempotence": True,       # 幂等生产者
-    "max.in.flight.requests.per.connection": 5,
-})
-
-def send_event(topic: str, key: str, value: dict):
-    import json
-    producer.produce(
-        topic=topic,
-        key=key.encode("utf-8"),
-        value=json.dumps(value).encode("utf-8"),
-        callback=delivery_report,
-    )
-    producer.flush()
-
-def delivery_report(err, msg):
-    if err:
-        logger.error(f"Message delivery failed: {err}")
-    else:
-        logger.info(f"Message delivered to {msg.topic()} [{msg.partition()}]")
-```
-
-### 消费者
-
-```python
-from confluent_kafka import Consumer, KafkaError
-
-consumer = Consumer({
-    "bootstrap.servers": "kafka:9092",
-    "group.id": "order-service",
-    "auto.offset.reset": "earliest",
-    "enable.auto.commit": False,     # 手动提交 offset
-    "max.poll.interval.ms": 300000,
-})
-
-consumer.subscribe(["order-events"])
-
-try:
-    while True:
-        msg = consumer.poll(timeout=1.0)
-        if msg is None:
-            continue
-        if msg.error():
-            if msg.error().code() == KafkaError._PARTITION_EOF:
-                continue
-            raise KafkaException(msg.error())
-
-        try:
-            event = json.loads(msg.value().decode("utf-8"))
-            process_order_event(event)
-            consumer.commit(msg)     # 处理成功后手动提交
-        except ProcessingError as e:
-            logger.error(f"Failed to process: {e}")
-            send_to_dlq(msg)         # 发送到死信队列
-            consumer.commit(msg)
-finally:
-    consumer.close()
-```
-
-### Kafka 最佳实践
-
-- **分区数**: 通常等于消费者数量的倍数
-- **Key 设计**: 使用业务 ID 保证同一实体的消息有序
-- **保留策略**: 根据业务需求设置（7 天/30 天/永久）
-- **压缩**: 使用 lz4 或 snappy 减少网络和存储开销
-
----
-
-## RabbitMQ
-
-### Exchange 类型
-
-```
-Direct:   routing_key 精确匹配
-Fanout:   广播到所有绑定队列
-Topic:    routing_key 模式匹配 (*.error, order.#)
-Headers:  基于 header 属性匹配
-```
-
-### 生产者
-
-```python
-import pika
-import json
-
-connection = pika.BlockingConnection(pika.ConnectionParameters(
-    host="rabbitmq",
-    credentials=pika.PlainCredentials("guest", "guest"),
-    heartbeat=600,
-))
-channel = connection.channel()
-
-# 声明持久化队列和交换机
-channel.exchange_declare(exchange="orders", exchange_type="topic", durable=True)
-channel.queue_declare(queue="order-processing", durable=True)
-channel.queue_bind(queue="order-processing", exchange="orders", routing_key="order.created")
-
-def publish_order_event(order_id: str, event_type: str, data: dict):
-    channel.basic_publish(
-        exchange="orders",
-        routing_key=f"order.{event_type}",
-        body=json.dumps({"order_id": order_id, **data}),
-        properties=pika.BasicProperties(
-            delivery_mode=2,        # 持久化消息
-            content_type="application/json",
-            message_id=str(uuid.uuid4()),
-            timestamp=int(time.time()),
-        ),
-    )
-```
-
-### 消费者
-
-```python
-def callback(ch, method, properties, body):
-    try:
-        event = json.loads(body)
-        process_order(event)
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-    except Exception as e:
-        logger.error(f"Processing failed: {e}")
-        # 拒绝并重新入队（或发送到 DLQ）
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-
-channel.basic_qos(prefetch_count=10)  # 流控
-channel.basic_consume(queue="order-processing", on_message_callback=callback)
-channel.start_consuming()
-```
-
-### 死信队列 (DLQ)
-
-```python
-# 声明 DLQ
-channel.queue_declare(queue="order-processing-dlq", durable=True)
-
-# 主队列绑定 DLQ
-channel.queue_declare(
-    queue="order-processing",
-    durable=True,
-    arguments={
-        "x-dead-letter-exchange": "",
-        "x-dead-letter-routing-key": "order-processing-dlq",
-        "x-message-ttl": 86400000,     # 消息 TTL: 24h
-        "x-max-length": 100000,        # 队列最大长度
-    },
-)
-```
-
----
-
-## Redis Streams
-
-### 基本操作
-
-```python
-import redis
-
-r = redis.Redis(host="localhost", port=6379, decode_responses=True)
-
-# 生产者：添加消息到 Stream
-message_id = r.xadd("order-events", {
-    "order_id": "ORD-001",
-    "event": "created",
-    "amount": "99.99",
-    "timestamp": str(int(time.time())),
-})
-
-# 创建消费者组
-r.xgroup_create("order-events", "order-service", id="0", mkstream=True)
-
-# 消费者：读取消息
-while True:
-    messages = r.xreadgroup(
-        groupname="order-service",
-        consumername="worker-1",
-        streams={"order-events": ">"},
-        count=10,
-        block=5000,
-    )
-
-    for stream, entries in messages:
-        for msg_id, fields in entries:
-            try:
-                process_event(fields)
-                r.xack("order-events", "order-service", msg_id)
-            except Exception as e:
-                logger.error(f"Failed: {e}")
-                # 消息留在 PEL 中，稍后重试
-
-# 处理 pending 消息（故障恢复）
-pending = r.xpending_range("order-events", "order-service", "-", "+", count=100)
-for entry in pending:
-    if entry["time_since_delivered"] > 300000:  # 超过 5 分钟未确认
-        messages = r.xclaim(
-            "order-events", "order-service", "worker-1",
-            min_idle_time=300000,
-            message_ids=[entry["message_id"]],
-        )
-        for msg_id, fields in messages:
-            reprocess_event(fields)
-            r.xack("order-events", "order-service", msg_id)
-```
-
----
-
-## 事件驱动架构模式
-
-### 事件溯源 (Event Sourcing)
-
-```python
-# 事件存储
-class EventStore:
-    def __init__(self, producer: KafkaProducer):
-        self.producer = producer
-
-    def append(self, aggregate_id: str, event: DomainEvent):
-        self.producer.send(
-            topic=f"events-{event.aggregate_type}",
-            key=aggregate_id,
-            value={
-                "event_id": str(uuid.uuid4()),
-                "aggregate_id": aggregate_id,
-                "event_type": event.__class__.__name__,
-                "data": event.to_dict(),
-                "version": event.version,
-                "timestamp": datetime.utcnow().isoformat(),
-            },
-        )
-
-# 事件重放
-class OrderAggregate:
-    def __init__(self):
-        self.status = None
-        self.items = []
-        self.total = 0
-
-    def apply(self, event: DomainEvent):
-        if isinstance(event, OrderCreated):
-            self.status = "created"
-            self.items = event.items
-        elif isinstance(event, OrderPaid):
-            self.status = "paid"
-            self.total = event.amount
-```
-
-### 幂等消费者
-
-```python
-class IdempotentConsumer:
-    def __init__(self, redis_client: redis.Redis):
-        self.redis = redis_client
-        self.ttl = 86400 * 7  # 7 天去重窗口
-
-    def process(self, message_id: str, handler: Callable):
-        key = f"processed:{message_id}"
-        if self.redis.exists(key):
-            logger.info(f"Duplicate message {message_id}, skipping")
-            return
-
-        handler()
-
-        self.redis.set(key, "1", ex=self.ttl)
-```
-
-### 重试策略
-
-```python
-import time
-from functools import wraps
-
-def retry_with_backoff(max_retries=3, base_delay=1.0, max_delay=60.0):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                except RetryableError as e:
-                    if attempt == max_retries:
-                        raise
-                    delay = min(base_delay * (2 ** attempt), max_delay)
-                    jitter = delay * 0.1 * random.random()
-                    time.sleep(delay + jitter)
-                    logger.warning(f"Retry {attempt + 1}/{max_retries}: {e}")
-        return wrapper
-    return decorator
-```
-
----
-
-## 监控指标
-
-| 指标 | 说明 | 告警阈值 |
-|------|------|----------|
-| Consumer Lag | 消费者落后的消息数 | > 10000 |
-| Message Rate | 每秒消息产生/消费量 | 异常波动 |
-| Error Rate | 处理失败率 | > 1% |
-| DLQ Size | 死信队列堆积数 | > 100 |
-| Processing Latency | 消息处理延迟 P99 | > 5s |
-
----
-
-## 常见反模式
-
-| 反模式 | 问题 | 正确做法 |
-|--------|------|----------|
-| 消息体过大 | 网络/存储开销 | 消息只传 ID + 元数据，数据走存储 |
-| 不做幂等 | 重复处理 | 消息 ID 去重 + 幂等写入 |
-| 自动提交 offset | 消息丢失 | 处理成功后手动提交 |
-| 忽略 DLQ | 失败消息丢失 | 配置死信队列并监控 |
-| 无重试策略 | 临时故障导致消息丢失 | 指数退避重试 |
-| 强依赖消息顺序 | 扩展困难 | 仅在必要时保证分区内有序 |
-
----
-
-## Agent Checklist
-
-- [ ] 根据吞吐量和延迟需求选择合适的消息队列
-- [ ] 生产者启用幂等写入和重试
-- [ ] 消费者手动提交 offset/ack
-- [ ] 实现幂等消费者（消息 ID 去重）
-- [ ] 配置死信队列 (DLQ) 并监控大小
-- [ ] 实现指数退避重试策略
-- [ ] 消息体控制在 1MB 以内
-- [ ] Kafka 分区 Key 设计保证业务有序性
-- [ ] 消费者 Group 内消费者数 <= 分区数
-- [ ] 监控 Consumer Lag / Error Rate / DLQ Size
-- [ ] 消息 Schema 有版本管理（Avro/Protobuf + Schema Registry）
-- [ ] 生产环境 Kafka 至少 3 副本，acks=all
+# 消息队列选型与消息模式规范（商业级必读）
+
+> 引入消息队列前先答两个问题：**选哪种队列**、**用哪种消息模式**。选错队列，要么吞吐扛不住、要么为简单任务上了重平台；用错模式，要么把事件流当任务队列、要么把广播写成点对点，越用越拧巴。
+> 本规范只解决"选型 + 模式"：按场景把队列类型选对、把生产/消费模式用对。**消费侧怎么写才可靠**（投递语义、幂等有效一次、可见性超时、顺序、毒消息与死信、背压）是另一件事，见 `backend/01-standards/queue-and-consumer-reliability`，本文不重复；**任务该不该异步、怎么编排**见 `backend/01-standards/background-jobs-and-async`。
+
+## 1. 三类队列定位（先分清你要什么）
+
+| 维度 | 事件流平台（如 Kafka 类） | 消息代理（如 RabbitMQ 类） | 轻量流（如 Redis Streams 类） |
+|---|---|---|---|
+| 定位 | 持久化、可重放的事件日志 | 灵活路由的任务/消息分发 | 进程内/小规模轻量事件流 |
+| 量级 | 极高吞吐、海量留存 | 中等吞吐、复杂路由 | 中等吞吐、低运维成本 |
+| 消费模型 | 消费组 + 位点（offset），可回放 | 队列/交换机路由，消费即出队 | 消费组 + PEL（待确认列表） |
+| 留存与重放 | 按保留期留存，可重放历史 | 通常消费即删除，不便重放 | 可留存一段，能重放近期 |
+| 有序粒度 | 分区内有序 | 队列内有序 | 流内有序 |
+| 典型场景 | 事件溯源、日志聚合、数据管道、多消费方 | 任务队列、RPC、按规则路由分发 | 轻量异步、已有该存储栈、低门槛 |
+
+**选型判据**：需要**重放历史 / 多个独立消费方 / 超高吞吐** → 事件流平台；需要**复杂路由 / 每条消息一次性派给一个工作者** → 消息代理；**规模不大、已有该内存存储、想省一套中间件** → 轻量流。别为一个定时任务上重型事件平台，也别用轻量流硬扛海量留存与回放。
+
+## 2. 选型决策清单（按需求倒推）
+
+| 需求信号 | 倾向选择 |
+|---|---|
+| 同一份事件要被多个团队/服务各自独立消费 | 事件流平台（消费组互不影响 + 可回放） |
+| 要按 routing key / header 把消息精确分发到不同队列 | 消息代理（交换机路由能力强） |
+| 吞吐在十万～百万级、需长期留存与重算 | 事件流平台 |
+| 经典工作队列：N 个 worker 抢任务，处理完即删 | 消息代理 |
+| 团队已重度使用某内存存储、不想新增运维面 | 轻量流（够用即可） |
+| 强延迟敏感 + 简单点对点 | 消息代理 / 轻量流 |
+
+选型还要算**运维成本**：事件流平台能力最强但运维最重（分区、副本、保留、再平衡都要管）；轻量流最省心但能力边界明显。能力够用的前提下，**选运维最轻的那个**。
+
+## 3. 核心生产/消费模式
+
+| 模式 | 用途 | 关键点 |
+|---|---|---|
+| 工作队列 work queue | N 个消费者瓜分任务 | 每条消息只被一个消费者成功处理；按预取控制并发 |
+| 发布订阅 pub/sub（fanout） | 一条消息广播给所有订阅方 | 每个订阅方一份；新增订阅方不影响既有 |
+| 路由/主题 routing/topic | 按 key/pattern 精确或模式投递 | 路由键设计决定可扩展性，别用一个万能队列 |
+| 分区有序 partitioned | 同实体有序、跨实体并行 | 用实体键路由到同一分区，仅保证分区内有序（顺序细节见 reliability 文档） |
+| 请求/响应 over MQ | 异步 RPC | 用 correlation-id + 回复队列；超时要兜底，别永久等 |
+
+## 4. 关键设计点（选型之后立刻要定）
+
+- **分区/路由键设计**：键决定**并行度与有序性**。用业务实体 ID 作分区键，让同一实体落同一分区（有序）、不同实体散开（并行）。键选错会造成热分区或丧失可扩展性。
+- **消费者数 ≤ 分区数**：事件流平台里，消费组内并行度受分区数上限制约；分区数要按目标吞吐与未来扩容预留。
+- **消息载荷小而稳**：消息传 **ID/引用 + 必要元数据**，大对象走对象存储，别把大 blob 塞进消息体撑爆网络与留存。
+- **Schema 演进有契约**：消息体用带版本的结构化 Schema（如 Avro/Protobuf/JSON + 版本字段 + Schema Registry 思路），**只做向后兼容的演进**（加可选字段，不改语义、不删必填），消费者要容忍未知新增字段。
+- **保留与回放策略**：事件流平台明确保留期（按业务与重算需求）；用到回放时，消费者必须**幂等**才能安全重放（见 reliability 文档）。
+- **多消费方解耦**：同一事件被多方消费时，用独立消费组/订阅，彼此进度互不影响，杜绝"一个慢消费方拖垮其他人"。
+
+## 5. 事件驱动架构模式（选型支撑的上层玩法）
+
+- **事件溯源 Event Sourcing**：以**事件序列**为真相源，状态由事件重放得出。要求底座支持持久化与有序回放（事件流平台是天然载体）；聚合重建依赖事件幂等可重放。
+- **CQRS**：写侧产生事件，读侧消费事件构建查询视图，读写分离各自扩展。注意读模型是**最终一致**的，UI/契约要承认这点。
+- **Saga / 事件编排**：跨服务长流程用事件串联，每步有补偿动作，避免分布式强事务（分布式事务取舍见 `architecture/distributed-transactions`）。
+- **Outbox 投递**：业务写库与"待发事件"同事务落库，再由投递器异步发出，杜绝"库改了消息没发/消息发了库回滚"（端到端可靠属 reliability 文档范畴）。
+
+## 6. 监控与容量（选型落地的运维基线）
+
+| 指标 | 看什么 | 含义 |
+|---|---|---|
+| 消费滞后 lag | 消费组落后生产的量 | 持续增长 = 消费跟不上，要扩容/优化/限流 |
+| 生产/消费速率 | 每秒入队/出队 | 异常骤变是上游异常或消费停摆的早信号 |
+| 死信堆积 | DLQ 大小 | 堆积说明有系统性失败（处置见 reliability 文档） |
+| 处理延迟 | 入队到处理完的 P99 | 端到端时延，影响业务体验 |
+| 分区均衡 | 各分区流量/lag 分布 | 不均 = 路由键设计问题（热分区） |
+
+容量上：分区数、消费者并发、留存大小要**按目标峰值预留余量**，别按当前流量卡满；扩容路径（加分区/加消费者）要提前想清楚，事件流平台的分区数通常**只能增不能减**。
+
+## 7. 反模式（出现即不合格）
+
+1. **场景与队列错配**：为简单定时任务上重型事件平台，或用轻量流硬扛海量留存与回放。
+2. **一个万能队列**：所有消息塞进一个队列/主题，不做路由与隔离，无法独立扩展与监控。
+3. **路由键/分区键拍脑袋**：键设计不当导致热分区、丧失有序性或无法并行。
+4. **大对象进消息体**：把大 blob 塞进消息，撑爆网络、留存与重放成本。
+5. **Schema 无版本、破坏性演进**：改语义/删必填字段，消费者直接崩。
+6. **多消费方共用一个消费组**：本该独立消费的多方互相抢消息、互相拖累。
+7. **消费者数 > 分区数还指望线性扩展**：多出来的消费者空转，吞吐上不去。
+8. **不监控 lag 与分区均衡**：消费早跟不上或热分区，积压到爆才发现。
+9. **把可靠性细节当选型问题糊弄**：投递语义/幂等/死信不按 reliability 规范做（见交叉引用）。
+
+## 8. 最低交付 checklist
+
+- [ ] 按"重放/多消费方/超高吞吐 vs 复杂路由 vs 轻量省心"把队列类型选对，并算了运维成本。
+- [ ] 分区/路由键用业务实体 ID 设计，同实体有序、跨实体并行；消费者数 ≤ 分区数。
+- [ ] 消息载荷小（传 ID/引用），大对象走对象存储。
+- [ ] 消息 Schema 带版本、只做向后兼容演进，消费者容忍未知新增字段。
+- [ ] 事件流平台明确保留期与回放策略；多消费方用独立消费组解耦。
+- [ ] 监控 lag / 速率 / DLQ / 处理延迟 / 分区均衡，容量按峰值预留并想清扩容路径。
+- [ ] 事件溯源/CQRS/Saga/Outbox 等上层模式按需选用，承认读模型最终一致。
+- [ ] 消费侧可靠性（投递语义/幂等有效一次/可见性超时/顺序/毒消息/背压）按 `backend/01-standards/queue-and-consumer-reliability` 落地，本文不重复。

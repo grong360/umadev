@@ -8,7 +8,7 @@ tags: [feature, framework, prioritization, product]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（）
+# feature-prioritization-framework
 
 ## 功能优先级决策框架（深度版）
 

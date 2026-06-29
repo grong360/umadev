@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（）
+# 云原生词汇表
 # 功能：云原生核心术语定义
 # 作用：统一术语理解，便于沟通和学习
 # 创建时间：2025-03-20

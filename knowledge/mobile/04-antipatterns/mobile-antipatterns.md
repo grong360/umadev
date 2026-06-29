@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（）
+# 移动开发反模式库
 
 ## 移动开发反模式库
 
