@@ -772,6 +772,21 @@ pub fn director_build_directive(requirement: &str) -> String {
     // from "decides the route" to "a prior the director consults".
     let prior = crate::planner::advisory_prior(requirement);
 
+    // When the goal's app calls an LLM at RUNTIME, carry the app-runtime-model
+    // contract so the base treats the app's runtime model + API as the USER's
+    // configurable choice — defaulting to whatever they named — instead of
+    // silently hardcoding the dev base's vendor (Anthropic / Claude). Empty for a
+    // plain build (no AI runtime), so it only shows up where it matters. Prefixed
+    // with a newline so it sits as its own block after the advisory prior.
+    let app_runtime = {
+        let d = crate::app_runtime::runtime_model_directive(requirement);
+        if d.is_empty() {
+            String::new()
+        } else {
+            format!("\n{d}\n")
+        }
+    };
+
     // SCALE THE FIRMWARE TO THE GOAL'S SIZE. A simple, clearly-lean goal (a
     // todo/记账 single page, a bug fix, a refactor — `TaskKind::is_lean_build`)
     // must NOT be framed as a "COMPLETE, ship-quality, commercial-grade product
@@ -796,7 +811,7 @@ pub fn director_build_directive(requirement: &str) -> String {
              invent extra surfaces (auth / database / dashboards) the goal never \
              asked for, and do NOT run a heavy PM → architect → docs process for a \
              page-sized task. The fewest real files that do the job well.\n\
-             {prior}\n\
+             {prior}{app_runtime}\n\
              Your team's craft floor still holds: never emoji as icons (use a \
              declared icon library — Lucide / Heroicons / Tabler), design-token \
              colors only, real representative content (never placeholders). Ground \
@@ -819,7 +834,7 @@ pub fn director_build_directive(requirement: &str) -> String {
          never ceremony for its own sake, never under-built either. There is no \
          fixed phase checklist you must march through; orchestrate it the way a \
          strong senior director would.\n\
-         {prior}\n\
+         {prior}{app_runtime}\n\
          Build to your team's craft and taste, write real representative content \
          (never placeholders), and ground every \"done\" claim in the real files on \
          disk and the project's real build/test — report only what actually works."
@@ -1003,6 +1018,27 @@ mod tests {
         assert!(lower.contains("no fixed phase") || lower.contains("no fixed-phase"));
         // The honesty contract (real files, real build, report only what works).
         assert!(lower.contains("real files") || lower.contains("on disk"));
+    }
+
+    #[test]
+    fn director_build_directive_threads_the_app_runtime_model_contract() {
+        // A build whose app calls an LLM at runtime carries the app-runtime-model
+        // contract (configurable, never hardcode the dev base's vendor) and threads
+        // an explicitly-named runtime model. A plain build carries none of it.
+        let ai = director_build_directive("做一个智能客服系统,运行时用千问 Max");
+        assert!(
+            ai.contains("App runtime model — USER-CONFIGURABLE"),
+            "AI-app build directive carries the runtime-model contract: {ai}"
+        );
+        assert!(
+            ai.contains("NAMED a runtime model") && ai.contains("Qwen"),
+            "the named runtime model is threaded into the directive: {ai}"
+        );
+        let plain = director_build_directive("做一个带邮箱登录的 SaaS 落地页");
+        assert!(
+            !plain.contains("App runtime model — USER-CONFIGURABLE"),
+            "a plain build must not carry the runtime-model contract: {plain}"
+        );
     }
 
     #[test]

@@ -37,6 +37,7 @@
 pub mod acceptance;
 pub mod adopt;
 pub mod agents;
+pub mod app_runtime;
 pub mod base_error;
 pub mod checkpoint;
 pub mod coach;
@@ -84,6 +85,7 @@ pub use adopt::{
     is_adopted, load_project_source_index, read_adopt_marker, run_adopt, AdoptReport,
     DetectedCommand,
 };
+pub use app_runtime::{app_calls_llm_at_runtime, runtime_model_directive, stated_runtime_model};
 pub use checkpoint::{
     create_run_baseline, rollback_run, run_baseline, Checkpoint, RUN_BASELINE_PREFIX,
 };

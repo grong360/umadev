@@ -239,6 +239,22 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         if !facts.trim().is_empty() {
             fw.push_block(&facts);
         }
+
+        // ── App RUNTIME MODEL — keep it the user's choice, not the dev base's ──
+        // When this build's app will itself call an LLM at RUNTIME (a chatbot / RAG
+        // service / AI assistant), the base — left unguided — tends to hardcode the
+        // BUILT APP's runtime engine to the same vendor it is itself (Anthropic /
+        // Claude). The dev base and the app's runtime model are two DIFFERENT things;
+        // this block tells the base to treat the app's runtime model + API as a
+        // USER-CONFIGURABLE choice (env-driven provider layer: model id + base URL +
+        // key var), DEFAULT it to whatever the user named in the requirement, and
+        // NEVER silently hardcode the dev base's provider. Pure string analysis (no
+        // I/O), part of the always-on work-class head, and EMPTY for a non-AI build —
+        // so a plain CRUD product spends no tokens on it. Fail-open by construction.
+        let app_llm = crate::app_runtime::runtime_model_directive(requirement);
+        if !app_llm.trim().is_empty() {
+            fw.push_block(&app_llm);
+        }
     }
 
     // The always-on head (identity + craft) is now fully in `buf` and can no longer
@@ -987,6 +1003,79 @@ mod tests {
         let out = b.finish();
         assert!(!out.contains("DROPPED"), "no-room block is dropped");
         assert!(out.chars().count() <= 20);
+    }
+
+    #[tokio::test]
+    async fn ai_app_build_carries_the_runtime_model_directive() {
+        // A build whose app calls an LLM at RUNTIME must carry the
+        // app-runtime-model-is-configurable instruction: never silently hardcode the
+        // dev base's vendor (Claude) as the app's runtime engine.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::BackendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "做一个智能客服聊天机器人").await;
+        assert!(
+            fw.contains("App runtime model — USER-CONFIGURABLE"),
+            "AI-app build carries the runtime-model directive: {fw}"
+        );
+        assert!(
+            fw.contains("ANTHROPIC_API_KEY") || fw.contains("Anthropic / Claude"),
+            "directive names the vendor not to hardcode: {fw}"
+        );
+        assert!(
+            fw.to_lowercase().contains("openai-compatible"),
+            "directive offers the OpenAI-compatible provider layer: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_app_build_threads_an_explicit_runtime_model() {
+        // When the requirement NAMES a runtime model, the firmware threads it as the
+        // default the app should be configured for.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::BackendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "做一个聊天机器人,运行时用千问 Max").await;
+        assert!(
+            fw.contains("NAMED a runtime model") && fw.contains("Qwen"),
+            "explicit runtime model is detected + threaded into the firmware: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_build_does_not_carry_the_runtime_model_directive() {
+        // An ordinary CRUD product (no runtime LLM) must NOT carry the directive —
+        // no wasted tokens, and the gap fix stays scoped to AI apps.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "做一个待办事项 SaaS 产品").await;
+        assert!(
+            !fw.contains("App runtime model — USER-CONFIGURABLE"),
+            "plain build must not carry the runtime-model directive: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_chat_skips_the_runtime_model_directive() {
+        // Even an AI-flavoured chat turn stays light: the directive is a work-class
+        // head block, so pure chat carries no runtime-model directive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = route(RouteClass::Chat, Depth::Fast, Vec::new());
+        let fw = compose_firmware(tmp.path(), &r, "聊天机器人一般怎么做?").await;
+        assert!(
+            !fw.contains("App runtime model — USER-CONFIGURABLE"),
+            "chat must not carry the runtime-model directive: {fw}"
+        );
     }
 
     #[test]
