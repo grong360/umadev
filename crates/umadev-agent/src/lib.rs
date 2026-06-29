@@ -174,8 +174,9 @@ pub use test_integrity::{
     check as check_test_integrity, snapshot as snapshot_test_surface, TestSnapshot,
 };
 pub use trust::{
-    capability_class, capability_requires_confirmation, requires_confirmation, reversibility_class,
-    Capability, CapabilityPolicy, CircuitBreaker, GateTrust, Reversibility, TrustLedger, TrustMode,
+    capability_class, capability_requires_confirmation, remember_project_approval,
+    requires_confirmation, requires_confirmation_with_ledger, reversibility_class, Capability,
+    CapabilityPolicy, CircuitBreaker, GateTrust, Reversibility, TrustLedger, TrustMode,
     TrustSuggestion, CIRCUIT_THRESHOLD, CIRCUIT_WINDOW_SECS,
 };
 pub use verify::{detect_project, run_verify, ProjectKind, VerifyOutcome};

@@ -51,7 +51,7 @@ use crate::events::{EngineEvent, EventSink};
 use crate::gates::Gate;
 use crate::runner::RunOptions;
 use crate::state::{write_workflow_state, WorkflowState};
-use crate::trust::{requires_confirmation, TrustMode};
+use crate::trust::requires_confirmation_with_ledger;
 
 /// The hard ceiling on rework rounds at any single review node. The critic team
 /// is ADVISORY: it may fold blocking findings into ONE rework directive and
@@ -558,7 +558,7 @@ async fn drive_phase(
                 action,
                 target,
             } => {
-                let decision = approval_decision(options.mode, &action, &target);
+                let decision = approval_decision(options, &action, &target);
                 if matches!(decision, ApprovalDecision::Deny) {
                     events.emit(EngineEvent::Note(umadev_i18n::tlf(
                         "continuous.dangerous_action_denied",
@@ -707,14 +707,22 @@ fn evaluate_tool_call(
 
 /// Map a [`SessionEvent::NeedApproval`] to a trust-tiered [`ApprovalDecision`].
 ///
-/// `auto` lets reversible actions through; the irreversible-action floor
-/// (`.git` internals, network, destructive shell verbs) forces a confirmation
-/// regardless of mode — and in this non-interactive driving loop a forced
-/// confirmation degrades to DENY so the base can't run an irreversible action
-/// unattended. `guarded` / `plan` also deny here (the human gate happens at the
-/// confirm gates, not mid-turn).
-fn approval_decision(mode: TrustMode, action: &str, target: &str) -> ApprovalDecision {
-    if requires_confirmation(mode, action, target) {
+/// The decision is **mode-aware** ([`requires_confirmation`]): `auto` lets
+/// reversible actions through; `guarded` additionally confirms a write that
+/// escapes the workspace; `plan` confirms any real execution. The irreversible
+/// floor (`.git` internals, network, destructive shell verbs) forces a
+/// confirmation regardless of mode — and in this non-interactive driving loop a
+/// forced confirmation degrades to DENY so the base can't run an unattended
+/// risky action.
+///
+/// It also consults the per-project **trust ledger** of remembered approvals
+/// (`<root>/.umadev/trust.json`, [`requires_confirmation_with_ledger`]): a
+/// reversible action class the user already approved for this project is not
+/// re-asked. Fail-open: a missing / corrupt ledger behaves exactly as the bare
+/// mode policy; the floor is never relaxed by a remembered rule.
+fn approval_decision(options: &RunOptions, action: &str, target: &str) -> ApprovalDecision {
+    let ledger = crate::trust::TrustLedger::load(&options.project_root);
+    if requires_confirmation_with_ledger(options.mode, action, target, &ledger) {
         ApprovalDecision::Deny
     } else {
         ApprovalDecision::Allow
@@ -1909,7 +1917,7 @@ async fn drive_rework_turn_with_idle(
                 action,
                 target,
             } => {
-                let decision = approval_decision(options.mode, &action, &target);
+                let decision = approval_decision(options, &action, &target);
                 if session.respond(&req_id, decision).await.is_err() {
                     return ReworkTurn {
                         done: false,
@@ -2263,6 +2271,7 @@ fn kind_phase_label(kind: ReviewKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::TrustMode;
     use std::path::Path;
     use std::sync::Mutex;
     use umadev_runtime::SessionError;

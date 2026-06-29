@@ -99,7 +99,7 @@ use crate::events::{EngineEvent, EventSink};
 use crate::plan_state::{self, Plan, StepStatus};
 use crate::router::RoutePlan;
 use crate::runner::RunOptions;
-use crate::trust::requires_confirmation;
+use crate::trust::requires_confirmation_with_ledger;
 use umadev_spec::Phase;
 
 /// The hard ceiling on auto-QC feedback-fix rounds in one `/run`. One round is: the
@@ -2515,18 +2515,24 @@ async fn drive_one_turn(
                 action,
                 target,
             } => {
-                // Always-on irreversible floor: deny an irreversible action even
-                // headless (the same floor the `auto` tier can't skip), allow the
-                // rest so a headless build isn't wedged waiting on a human.
-                let decision = if requires_confirmation(options.mode, &action, &target) {
-                    events.emit(EngineEvent::Note(umadev_i18n::tlf(
-                        "continuous.dangerous_action_denied",
-                        &[&action, &target],
-                    )));
-                    ApprovalDecision::Deny
-                } else {
-                    ApprovalDecision::Allow
-                };
+                // Mode-aware floor + self-learning ledger: deny an irreversible
+                // action even headless (the floor the `auto` tier can't skip) plus
+                // the per-mode reversible policy, but honour a class the user has
+                // already approved for this project (`.umadev/trust.json`) so it
+                // isn't re-denied. Fail-open: a missing/corrupt ledger behaves as
+                // the bare mode policy. Reversible in-tree edits stay allowed so a
+                // headless build isn't wedged waiting on a human.
+                let ledger = crate::trust::TrustLedger::load(&options.project_root);
+                let decision =
+                    if requires_confirmation_with_ledger(options.mode, &action, &target, &ledger) {
+                        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "continuous.dangerous_action_denied",
+                            &[&action, &target],
+                        )));
+                        ApprovalDecision::Deny
+                    } else {
+                        ApprovalDecision::Allow
+                    };
                 if let Err(e) = session.respond(&req_id, decision).await {
                     // LOW #2: a turn that dies on the approval round-trip still spent
                     // its tokens — record the estimate (fail-open) before bailing. No

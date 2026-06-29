@@ -319,27 +319,174 @@ fn path_touches_vcs(s: &str) -> bool {
 /// to a confirmation before it runs?
 ///
 /// This is the per-tool-call chokepoint the non-interactive driving loop
-/// consults (a base that asks `can_use_tool` mid-turn). The human gate lives at
-/// the pipeline's **confirm gates** (`docs_confirm` / `preview_confirm`), NOT on
-/// every mid-turn tool call — so the only thing this floor escalates is an
-/// **irreversible** action (`.git` internals, network, destructive shell verbs),
-/// which [`Reversibility::always_escalates`] flags. That floor is
-/// **mode-independent**: even [`TrustMode::Auto`] cannot skip it, and even
-/// [`TrustMode::Guarded`] / [`TrustMode::Plan`] do NOT escalate a *reversible*
-/// in-project write — otherwise a guarded run could never let the base edit a
-/// file (the base would be DENY'd on every write and spin doing nothing).
+/// consults (a base that asks `can_use_tool` mid-turn). It is **mode-aware**:
+/// `mode` shapes the policy that rides on top of the always-on irreversible
+/// floor. The human gate for the *whole pipeline* still lives at the confirm
+/// gates (`docs_confirm` / `preview_confirm`); this is the finer, per-action
+/// layer.
+///
+/// 1. **Irreversible floor — every mode, bypass-immune.** A `.git`-internals
+///    write, a network reach, or a destructive shell verb
+///    ([`Reversibility::always_escalates`]) is escalated regardless of mode —
+///    even [`TrustMode::Auto`] cannot skip it. This is the hard safety floor.
+/// 2. **Per-mode policy on the *reversible* set** (reached only when the floor
+///    did NOT already escalate). A reversible **in-tree** write stays automatic
+///    in *every* mode so a non-interactive run is never wedged DENY-ing the
+///    base's own edits (the base would spin doing nothing); modes differ on the
+///    riskier reversible actions:
+///    - [`TrustMode::Auto`] — fully autonomous: nothing else is escalated. The
+///      user opted into max trust; only the hard floor stops an action.
+///    - [`TrustMode::Guarded`] — the default: a write that **escapes the
+///      workspace** (an absolute system path / `~` / a `..` the checkpoint
+///      can't rewind) is escalated; reversible in-tree edits + build/test stay
+///      automatic.
+///    - [`TrustMode::Plan`] — read-only planning: any real **execution** (a
+///      non-read shell command) and any out-of-tree write are escalated; reads
+///      and the in-tree planning-doc writes that are plan mode's deliverable
+///      stay automatic.
 ///
 /// The gate-pause policy (guarded / plan pausing the *whole pipeline* for the
 /// user) is a separate concern handled by the gate machinery
 /// ([`TrustMode::gates_auto_approve`]); it is not this per-tool-call decision.
-///
-/// `mode` is retained in the signature so callers keep a single chokepoint and a
-/// future per-mode policy has a hook, but today the decision is mode-independent:
-/// it depends only on the action's reversibility class.
 #[must_use]
 pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) -> bool {
-    let _ = mode; // mode-independent today: the floor escalates only irreversible actions
-    reversibility_class(command, target_path).always_escalates()
+    // 1) Always-on irreversible floor — bypass-immune in EVERY mode (even Auto).
+    if reversibility_class(command, target_path).always_escalates() {
+        return true;
+    }
+    // 2) The action is reversible. Apply the per-mode policy. A reversible
+    //    in-tree write stays automatic in every mode (else a guarded/plan run
+    //    DENY's every edit and spins); the modes differ only on the riskier
+    //    reversible actions below.
+    let cap = capability_class(command, target_path);
+    let out_of_tree_write =
+        matches!(cap, Capability::Write) && target_escapes_workspace(target_path);
+    match mode {
+        // Fully autonomous: only the hard floor (handled above) escalates.
+        TrustMode::Auto => false,
+        // Default: confirm a write that escapes the workspace (not
+        // checkpoint-rewindable); allow reversible in-tree edits + build/test.
+        TrustMode::Guarded => out_of_tree_write,
+        // Read-only planning: confirm any real execution (a non-read shell
+        // command) and any out-of-tree write; allow reads + the in-tree
+        // planning-doc writes that are plan mode's deliverable.
+        TrustMode::Plan => out_of_tree_write || matches!(cap, Capability::Shell),
+    }
+}
+
+/// Whether a write `target` path escapes the project workspace — i.e. it is NOT
+/// a path the in-tree checkpoint ([`crate::checkpoint`]) could rewind, so a
+/// guarded / plan run escalates it rather than letting the base write outside
+/// the tree unattended. A home-relative (`~`) path, a `..` parent-traversal that
+/// climbs out, or an absolute **system** root (`/etc`, `/usr`, `/dev`, …,
+/// `C:\Windows`) all land outside the work-tree.
+///
+/// Deterministic + dependency-free. A project-relative path or an absolute path
+/// under the user's own project does NOT match (so a normal in-tree write stays
+/// automatic); conversely an ambiguous system-rooted path escalates rather than
+/// silently writing outside the tree. Deliberately conservative about which
+/// absolute roots count as "system" so a temp/working project directory (e.g.
+/// `/var/folders/...`, `/private/...`) is never mis-flagged as an escape.
+#[must_use]
+fn target_escapes_workspace(target_path: &str) -> bool {
+    let p = target_path.trim();
+    if p.is_empty() {
+        return false;
+    }
+    // Home-relative — expands outside the project tree.
+    if p.starts_with('~') {
+        return true;
+    }
+    // A `..` path segment climbs above the workspace root.
+    if p.split(['/', '\\']).any(|seg| seg == "..") {
+        return true;
+    }
+    // Absolute UNIX system roots that never hold a user's project workspace.
+    // (`/var`, `/private`, `/opt` are intentionally excluded — temp/working
+    // project dirs live there, so flagging them would mis-escalate in-tree work.)
+    const SYSTEM_ROOTS: &[&str] = &[
+        "/etc/", "/usr/", "/bin/", "/sbin/", "/sys/", "/proc/", "/dev/", "/boot/", "/root/",
+        "/lib/",
+    ];
+    let lower = p.to_ascii_lowercase();
+    if SYSTEM_ROOTS.iter().any(|r| lower.starts_with(r)) {
+        return true;
+    }
+    // Windows system roots.
+    lower.starts_with("c:\\windows") || lower.starts_with("c:\\program files")
+}
+
+/// The stable class key under which an APPROVED reversible action is remembered
+/// in the per-project [`TrustLedger`], or `None` when the action must **never**
+/// be remembered. The floor wins: an irreversible action (`.git` internals,
+/// network, destructive shell verb) returns `None` so it can never be persisted
+/// or auto-allowed — it always re-confirms. A read returns `None` too (it is
+/// auto-allowed in every mode, so there is nothing to remember). Otherwise the
+/// key distinguishes the riskier reversible actions a mode would confirm:
+/// an in-tree vs. out-of-tree write, or a local shell command.
+#[must_use]
+fn remembered_class(command: &str, target_path: &str) -> Option<&'static str> {
+    // Irreversible-floor actions are NEVER remembered — they always re-confirm.
+    if reversibility_class(command, target_path).always_escalates() {
+        return None;
+    }
+    match capability_class(command, target_path) {
+        // A read is auto-allowed in every mode → nothing to remember.
+        // Network is always a floor action → handled above, never reaches here.
+        Capability::Read | Capability::Network => None,
+        Capability::Write => Some(if target_escapes_workspace(target_path) {
+            "write_out_of_tree"
+        } else {
+            "write_in_tree"
+        }),
+        Capability::Shell => Some("shell"),
+    }
+}
+
+/// The decision, consulting the per-project **trust ledger** of remembered
+/// approvals: like [`requires_confirmation`], but a reversible action whose class
+/// the user already approved for this project (recorded via
+/// [`TrustLedger::remember_approval`]) is NOT re-asked.
+///
+/// The irreversible floor is **consulted first and can never be overridden** by a
+/// remembered rule — `.git` internals / network / destructive verbs always
+/// re-confirm in every mode, even if a stale/forged rule somehow names them. The
+/// ledger can only ever *relax* a reversible confirmation, never the floor.
+#[must_use]
+pub fn requires_confirmation_with_ledger(
+    mode: TrustMode,
+    command: &str,
+    target_path: &str,
+    ledger: &TrustLedger,
+) -> bool {
+    // Floor first — a remembered rule can NEVER skip an irreversible action.
+    if reversibility_class(command, target_path).always_escalates() {
+        return true;
+    }
+    // Reversible: if the per-mode policy would confirm it, skip the prompt only
+    // when the user has already approved this action class for THIS project.
+    if requires_confirmation(mode, command, target_path) {
+        return !ledger.remembers(command, target_path);
+    }
+    false
+}
+
+/// Persist that the user approved a guarded/plan confirmation for this action's
+/// class in `project_root` — the one-call entry point an interactive approval
+/// handler uses: load the project ledger, [`TrustLedger::remember_approval`],
+/// and atomically save. Returns `true` when a new rule was recorded.
+///
+/// Fully fail-open and floor-safe: an irreversible-floor action records nothing
+/// (returns `false`), and any IO error during load/save is swallowed so trust
+/// learning never blocks the pipeline.
+pub fn remember_project_approval(project_root: &Path, command: &str, target_path: &str) -> bool {
+    let mut ledger = TrustLedger::load(project_root);
+    if ledger.remember_approval(command, target_path) {
+        ledger.save(project_root);
+        true
+    } else {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -668,13 +815,29 @@ pub struct GateTrust {
     pub suggested: bool,
 }
 
-/// Project-scoped trust ledger persisted to `.umadev/trust.json`. Keyed by the
-/// gate id string (`docs_confirm`, `preview_confirm`, `clarify`).
+/// Project-scoped trust ledger persisted to `.umadev/trust.json`. Two parts:
+/// per-gate auto-advance counters (keyed by gate id — `docs_confirm`,
+/// `preview_confirm`, `clarify`) and the self-learning **allow-rules** — the
+/// reversible action classes the user has explicitly approved for THIS project,
+/// so a class already OK'd is not re-asked ([`Self::remember_approval`] /
+/// [`Self::remembers`], consulted by [`requires_confirmation_with_ledger`]).
+///
+/// The whole struct is **fail-open**: a missing / corrupt file yields the empty
+/// default ([`Self::load`]), so the run behaves exactly as it would with no
+/// ledger. An irreversible-floor action is NEVER recorded here (see
+/// [`remembered_class`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustLedger {
     /// Per-gate counters. A `BTreeMap` keeps the on-disk JSON key order stable.
     #[serde(default)]
     pub gates: std::collections::BTreeMap<String, GateTrust>,
+    /// Reversible action classes the user has explicitly approved for this
+    /// project (keys from [`remembered_class`], e.g. `write_out_of_tree` /
+    /// `shell`). NEVER contains an irreversible-floor class. A `BTreeSet` keeps
+    /// the on-disk order stable. Defaulted so an older `trust.json` without this
+    /// field loads cleanly (back-compat / fail-open).
+    #[serde(default)]
+    pub allow_rules: std::collections::BTreeSet<String>,
 }
 
 impl TrustLedger {
@@ -689,20 +852,55 @@ impl TrustLedger {
             .unwrap_or_default()
     }
 
-    /// Persist the ledger. Best-effort: an IO error is swallowed (fail-open —
+    /// Persist the ledger **atomically**: serialize, write a sibling temp file,
+    /// then rename it over `trust.json` so a crash mid-write can never leave a
+    /// half-written (corrupt) ledger — a torn read just falls back to the empty
+    /// default on next load. Best-effort: any IO error is swallowed (fail-open —
     /// trust tracking must never block or fail the pipeline).
     pub fn save(&self, project_root: &Path) {
         let dir = project_root.join(".umadev");
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(dir.join("trust.json"), text);
+        let Ok(text) = serde_json::to_string_pretty(self) else {
+            return;
+        };
+        let tmp = dir.join("trust.json.tmp");
+        if std::fs::write(&tmp, text).is_err() {
+            return;
+        }
+        // Atomic publish. If the rename fails, drop the temp so we don't litter.
+        if std::fs::rename(&tmp, Self::path(project_root)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
     fn path(project_root: &Path) -> PathBuf {
         project_root.join(".umadev").join("trust.json")
+    }
+
+    /// Record that the user **approved** a guarded/plan confirmation for this
+    /// action's class, scoped to THIS project (the ledger lives at
+    /// `<root>/.umadev/trust.json`). A later action of the same class is then not
+    /// re-asked ([`Self::remembers`] / [`requires_confirmation_with_ledger`]).
+    ///
+    /// Returns `true` when a new rule was added. An **irreversible-floor** action
+    /// (`.git` internals, network, destructive verb) is NEVER remembered — it
+    /// returns `false` and records nothing, so the floor always re-confirms. A
+    /// read (auto-allowed anyway) also records nothing.
+    pub fn remember_approval(&mut self, command: &str, target_path: &str) -> bool {
+        match remembered_class(command, target_path) {
+            Some(key) => self.allow_rules.insert(key.to_string()),
+            None => false,
+        }
+    }
+
+    /// Whether this project already has a remembered approval covering `command`
+    /// / `target_path`. Always `false` for an irreversible-floor action (its
+    /// class is `None`), so the floor can never be skipped via a remembered rule.
+    #[must_use]
+    pub fn remembers(&self, command: &str, target_path: &str) -> bool {
+        remembered_class(command, target_path).is_some_and(|k| self.allow_rules.contains(k))
     }
 
     /// Record that `gate_id` was approved (auto or manual) without a revision.
@@ -947,17 +1145,164 @@ mod tests {
         // A plain in-project edit is reversible → it is NEVER escalated to a
         // mid-turn confirmation, in ANY mode. The human gate is at the confirm
         // gates, not on every tool call — so a GUARDED run must still let the base
-        // write files (else it would DENY every write and spin doing nothing).
+        // write files (else it would DENY every write and spin doing nothing). The
+        // SAME holds for Plan: its in-tree planning-doc writes are its deliverable.
         for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
             assert!(
                 !requires_confirmation(mode, "", "src/app.tsx"),
                 "reversible in-project write must not be escalated in {mode:?}"
             );
-            // Build/test commands are reversible too.
+        }
+        // Build/test commands are reversible in-tree shell: Auto + Guarded run
+        // them automatically (else a guarded build would wedge), but Plan is
+        // read-only and confirms any real execution.
+        assert!(!requires_confirmation(TrustMode::Auto, "npm run build", ""));
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "npm run build",
+            ""
+        ));
+        assert!(
+            requires_confirmation(TrustMode::Plan, "npm run build", ""),
+            "plan (read-only) confirms a non-read shell command"
+        );
+    }
+
+    #[test]
+    fn modes_differ_per_action_guarded_vs_auto_and_plan() {
+        // The bug fixed: Guarded and Auto must NOT be identical per-action. A
+        // write that ESCAPES the workspace (not checkpoint-rewindable) is the
+        // concrete delta — Guarded/Plan confirm it, Auto (max trust) allows it.
+        for out in ["/etc/hosts", "~/.ssh/config", "../../escape.txt"] {
             assert!(
-                !requires_confirmation(mode, "npm run build", ""),
-                "reversible build command must not be escalated in {mode:?}"
+                requires_confirmation(TrustMode::Guarded, "", out),
+                "guarded confirms out-of-tree write {out}"
             );
+            assert!(
+                requires_confirmation(TrustMode::Plan, "", out),
+                "plan confirms out-of-tree write {out}"
+            );
+            assert!(
+                !requires_confirmation(TrustMode::Auto, "", out),
+                "auto is more permissive — allows reversible out-of-tree write {out}"
+            );
+        }
+        // A normal in-tree write (relative or absolute under the project) is auto
+        // in every mode — the escape heuristic must not mis-flag it.
+        for p in [
+            "src/app.tsx",
+            "output/demo-prd.md",
+            "/Users/me/project/src/x.rs",
+            "/var/folders/xx/proj/src/y.rs",
+        ] {
+            for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+                assert!(
+                    !requires_confirmation(mode, "", p),
+                    "in-tree write {p} must stay automatic in {mode:?}"
+                );
+            }
+        }
+        // Plan ≠ Guarded on real execution: Plan confirms a reversible shell
+        // command Guarded allows.
+        assert!(requires_confirmation(TrustMode::Plan, "cargo test", ""));
+        assert!(!requires_confirmation(TrustMode::Guarded, "cargo test", ""));
+    }
+
+    #[test]
+    fn ledger_remembers_reversible_class_and_is_not_reasked() {
+        // T2: an APPROVED reversible class persists + isn't re-asked for THIS
+        // project. Guarded confirms an out-of-tree write; after the user approves
+        // it once, the same class auto-allows.
+        let (cmd, tgt) = ("", "/etc/hosts");
+        let empty = TrustLedger::default();
+        // Before learning: guarded would confirm.
+        assert!(requires_confirmation_with_ledger(
+            TrustMode::Guarded,
+            cmd,
+            tgt,
+            &empty
+        ));
+        // Learn the approval.
+        let mut led = TrustLedger::default();
+        assert!(
+            led.remember_approval(cmd, tgt),
+            "reversible class is recorded"
+        );
+        assert!(led.allow_rules.contains("write_out_of_tree"));
+        // After learning: not re-asked.
+        assert!(
+            !requires_confirmation_with_ledger(TrustMode::Guarded, cmd, tgt, &led),
+            "an approved class is not re-asked"
+        );
+        // A DIFFERENT reversible class the user did NOT approve is still asked.
+        assert!(requires_confirmation_with_ledger(
+            TrustMode::Plan,
+            "cargo test",
+            "",
+            &led
+        ));
+    }
+
+    #[test]
+    fn ledger_round_trips_allow_rules_atomically_and_fail_open() {
+        let tmp = TempDir::new().unwrap();
+        // No ledger on disk → behaves exactly as today (fail-open).
+        assert!(remember_project_approval(tmp.path(), "", "/etc/hosts"));
+        // Persisted + reloaded: the rule survives and short-circuits the prompt.
+        let back = TrustLedger::load(tmp.path());
+        assert!(back.allow_rules.contains("write_out_of_tree"));
+        assert!(!requires_confirmation_with_ledger(
+            TrustMode::Guarded,
+            "",
+            "/etc/hosts",
+            &back
+        ));
+        // No stray temp file left behind by the atomic write.
+        assert!(!tmp.path().join(".umadev").join("trust.json.tmp").exists());
+        // Fail-open: a fresh project with no ledger confirms as normal.
+        let tmp2 = TempDir::new().unwrap();
+        let none = TrustLedger::load(tmp2.path());
+        assert!(none.allow_rules.is_empty());
+        assert!(requires_confirmation_with_ledger(
+            TrustMode::Guarded,
+            "",
+            "/etc/hosts",
+            &none
+        ));
+    }
+
+    #[test]
+    fn irreversible_floor_action_is_never_remembered_or_auto_allowed() {
+        // The hard guarantee: an irreversible-floor action is NEVER persisted and
+        // NEVER auto-allowed, in ANY mode — even if the ledger is somehow forced to
+        // contain its class.
+        for (cmd, tgt) in [
+            ("git push origin main", ""),
+            ("rm -rf build", ""),
+            ("", ".git/config"),
+            ("git reset --hard HEAD~3", ""),
+        ] {
+            let mut led = TrustLedger::default();
+            // remember_approval refuses to record a floor action.
+            assert!(
+                !led.remember_approval(cmd, tgt),
+                "floor action {cmd:?}/{tgt:?} must not be recorded"
+            );
+            assert!(led.allow_rules.is_empty(), "nothing was persisted");
+            // Even a forged rule cannot relax the floor (it always re-confirms).
+            led.allow_rules.insert("write_out_of_tree".into());
+            led.allow_rules.insert("shell".into());
+            led.allow_rules.insert("network".into());
+            for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+                assert!(
+                    requires_confirmation_with_ledger(mode, cmd, tgt, &led),
+                    "floor {cmd:?}/{tgt:?} still confirms in {mode:?} despite forged rules"
+                );
+                assert!(
+                    !led.remembers(cmd, tgt),
+                    "floor {cmd:?}/{tgt:?} is never 'remembered'"
+                );
+            }
         }
     }
 
