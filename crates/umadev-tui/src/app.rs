@@ -54,6 +54,48 @@ const CONVERSATION_CAP: usize = 16;
 /// Max chars in the input box.
 const INPUT_CAP: usize = 8192;
 
+/// Max entries kept in the kill-ring (Ctrl+U/K/W feed it; Ctrl+Y / Alt+Y read
+/// it). The oldest entry falls off the back when a fresh, distinct kill pushes
+/// past the cap.
+const KILL_RING_CAP: usize = 10;
+
+/// Max snapshots kept on each undo / redo stack — bounds the memory a long
+/// editing session can accrue while still reaching far further back than a user
+/// ever asks for.
+const UNDO_CAP: usize = 50;
+
+/// How long after the previous edit-snapshot a new edit still COALESCES into it
+/// (no fresh undo step). A rapid burst of keystrokes inside this window collapses
+/// to one undo step; a pause longer than this opens the next step. Measured with
+/// the same `Instant` clock the rest of the TUI uses — there is no wall-clock in
+/// this environment.
+const UNDO_COALESCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Direction of a kill (Ctrl+U/K/W) so consecutive same-direction kills COALESCE
+/// into one kill-ring entry the readline way: a forward kill (Ctrl+K — text to
+/// the RIGHT of the caret) APPENDS to the front entry; a backward kill (Ctrl+U /
+/// Ctrl+W — text to the LEFT) PREPENDS. A direction change, or any non-kill key,
+/// starts a fresh ring entry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KillDir {
+    /// Text removed from AFTER the caret (Ctrl+K) — appends when coalescing.
+    Forward,
+    /// Text removed from BEFORE the caret (Ctrl+U / Ctrl+W) — prepends.
+    Backward,
+}
+
+/// One point-in-time snapshot of the editable input: its text plus the caret
+/// position (in CHARACTERS, matching [`App::input_cursor`]). The undo / redo
+/// stacks are stacks of these, so a restore brings back both the text and where
+/// the caret sat.
+#[derive(Clone, Debug, Default)]
+struct EditSnapshot {
+    /// Input buffer contents at snapshot time.
+    text: String,
+    /// Caret position (char index) at snapshot time.
+    cursor: usize,
+}
+
 /// Marker prefix on the live `Thinking` placeholder System row (P5c). Used to
 /// re-validate the row before collapsing it to a summary, so a shifted/rolled-off
 /// history index can never rewrite an unrelated row. Also the structural sentinel
@@ -1760,6 +1802,33 @@ pub struct App {
     /// within a short window actually cancels. `None` = not armed.
     pub interrupt_armed_at: Option<std::time::Instant>,
 
+    /// Kill-ring (I1): text removed by Ctrl+U / Ctrl+K / Ctrl+W is PUSHED here
+    /// (most-recent at the front) instead of being destroyed, so Ctrl+Y can yank
+    /// it back and Alt+Y can cycle older entries. Capped at [`KILL_RING_CAP`].
+    pub kill_ring: VecDeque<String>,
+    /// Direction of the LAST kill, or `None` when the last action was not a kill.
+    /// Drives readline-style coalescing: a consecutive same-direction kill folds
+    /// into the front ring entry instead of pushing a new one. Reset by any
+    /// non-kill key.
+    last_kill: Option<KillDir>,
+    /// The span the most recent yank / yank-pop inserted, as `(char_start,
+    /// char_len)`. `Some` ONLY immediately after a yank — Alt+Y (yank-pop) is
+    /// valid only then and replaces this span with the next ring entry. Any other
+    /// key clears it.
+    yank_span: Option<(usize, usize)>,
+    /// Rotation cursor into [`Self::kill_ring`] for Alt+Y yank-pop cycling.
+    yank_ring_idx: usize,
+    /// Undo stack (I2): snapshots of the input taken just before edits (most
+    /// recent on top). Ctrl+Z pops one to restore. Bounded by [`UNDO_CAP`].
+    undo_stack: Vec<EditSnapshot>,
+    /// Redo stack: states popped by undo, replayable by Alt+Z. Truncated on any
+    /// fresh edit so a new edit forks a clean future.
+    redo_stack: Vec<EditSnapshot>,
+    /// When the last undo snapshot was pushed, for [`UNDO_COALESCE`] debouncing.
+    /// `None` forces the next edit to snapshot (set after undo / redo so the next
+    /// edit always opens a clean step).
+    last_snapshot_at: Option<std::time::Instant>,
+
     /// REAL token usage for THIS session (input+output), accumulated from the
     /// base's own per-turn reports (`EngineEvent::TurnUsage`, F3) — true
     /// consumption, the base's numbers, NOT an estimate or the all-time ledger.
@@ -2054,6 +2123,13 @@ impl App {
             pending_quit_confirm: false,
             pending_rewind: false,
             interrupt_armed_at: None,
+            kill_ring: VecDeque::new(),
+            last_kill: None,
+            yank_span: None,
+            yank_ring_idx: 0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_snapshot_at: None,
             session_tokens: 0,
             status: String::new(),
             tick: 0,
@@ -3118,6 +3194,7 @@ impl App {
         if self.input_len() >= INPUT_CAP {
             return;
         }
+        self.snapshot_for_undo();
         let pos = self.byte_index(self.input_cursor);
         self.input.insert(pos, c);
         self.input_cursor += 1;
@@ -3155,6 +3232,7 @@ impl App {
             added += 1;
         }
         if !buf.is_empty() {
+            self.snapshot_for_undo();
             let pos = self.byte_index(self.input_cursor);
             self.input.insert_str(pos, &buf);
             self.input_cursor += added;
@@ -3170,6 +3248,7 @@ impl App {
         if self.input_cursor == 0 {
             return;
         }
+        self.snapshot_for_undo();
         let end = self.byte_index(self.input_cursor);
         let start = self.byte_index(self.input_cursor - 1);
         self.input.replace_range(start..end, "");
@@ -3184,32 +3263,47 @@ impl App {
         if self.input_cursor >= self.input_len() {
             return;
         }
+        self.snapshot_for_undo();
         let start = self.byte_index(self.input_cursor);
         let end = self.byte_index(self.input_cursor + 1);
         self.input.replace_range(start..end, "");
         self.palette_selected = 0;
     }
 
-    /// Delete from the cursor back to the start of the line (Ctrl+U).
+    /// Delete from the cursor back to the start of the line (Ctrl+U). The removed
+    /// text is PUSHED to the kill-ring (recoverable with Ctrl+Y), not destroyed.
     pub fn delete_to_line_start(&mut self) {
         let start = self.input[..self.byte_index(self.input_cursor)]
             .rfind('\n')
             .map_or(0, |i| i + 1);
-        let start_char = self.input[..start].chars().count();
         let end = self.byte_index(self.input_cursor);
+        if start == end {
+            return;
+        }
+        let start_char = self.input[..start].chars().count();
+        let killed = self.input[start..end].to_string();
+        self.snapshot_for_undo();
         self.input.replace_range(start..end, "");
         self.input_cursor = start_char;
         self.palette_selected = 0;
+        self.push_kill(&killed, KillDir::Backward);
     }
 
-    /// Delete from the cursor to the end of the line (Ctrl+K).
+    /// Delete from the cursor to the end of the line (Ctrl+K). The removed text
+    /// is PUSHED to the kill-ring (recoverable with Ctrl+Y), not destroyed.
     pub fn delete_to_line_end(&mut self) {
         let from = self.byte_index(self.input_cursor);
         let end = self.input[from..]
             .find('\n')
             .map_or(self.input.len(), |i| from + i);
+        if from == end {
+            return;
+        }
+        let killed = self.input[from..end].to_string();
+        self.snapshot_for_undo();
         self.input.replace_range(from..end, "");
         self.palette_selected = 0;
+        self.push_kill(&killed, KillDir::Forward);
     }
 
     /// Char index of the previous word boundary before the cursor: skip any spaces
@@ -3258,14 +3352,173 @@ impl App {
         self.palette_selected = 0;
     }
 
-    /// Delete the word before the cursor (Ctrl+W / Alt+Backspace).
+    /// Delete the word before the cursor (Ctrl+W / Alt+Backspace). The removed
+    /// text is PUSHED to the kill-ring (recoverable with Ctrl+Y), not destroyed.
     pub fn delete_word_back(&mut self) {
         let c = self.prev_word_boundary();
+        if c == self.input_cursor {
+            return;
+        }
         let start = self.byte_index(c);
         let end = self.byte_index(self.input_cursor);
+        let killed = self.input[start..end].to_string();
+        self.snapshot_for_undo();
         self.input.replace_range(start..end, "");
         self.input_cursor = c;
         self.palette_selected = 0;
+        self.push_kill(&killed, KillDir::Backward);
+    }
+
+    /// Push freshly-killed text onto the kill-ring, coalescing a consecutive
+    /// same-direction kill into the front entry (forward APPENDS, backward
+    /// PREPENDS) so repeated Ctrl+K / Ctrl+U build one yank-able chunk. A
+    /// direction change pushes a new entry; the ring is capped at
+    /// [`KILL_RING_CAP`]. Killing also closes any open yank-pop window.
+    fn push_kill(&mut self, killed: &str, dir: KillDir) {
+        if killed.is_empty() {
+            return;
+        }
+        self.yank_span = None;
+        if self.last_kill == Some(dir) {
+            if let Some(front) = self.kill_ring.front_mut() {
+                match dir {
+                    KillDir::Forward => front.push_str(killed),
+                    KillDir::Backward => front.insert_str(0, killed),
+                }
+            } else {
+                self.kill_ring.push_front(killed.to_string());
+            }
+        } else {
+            self.kill_ring.push_front(killed.to_string());
+            while self.kill_ring.len() > KILL_RING_CAP {
+                self.kill_ring.pop_back();
+            }
+        }
+        self.last_kill = Some(dir);
+    }
+
+    /// Reset the kill-coalescing + yank-pop windows. Called for every key that is
+    /// neither a kill (Ctrl+U/K/W) nor a yank (Ctrl+Y / Alt+Y), so a kill after a
+    /// cursor move starts a fresh ring entry and Alt+Y is valid only directly
+    /// after a yank. Leaves the ring CONTENTS intact.
+    fn reset_kill_yank(&mut self) {
+        self.last_kill = None;
+        self.yank_span = None;
+    }
+
+    /// Ctrl+Y — yank: insert the front kill-ring entry at the caret and remember
+    /// the inserted span so an immediately-following Alt+Y can yank-pop it.
+    /// No-op (fail-open) on an empty ring.
+    pub fn yank(&mut self) {
+        let Some(front) = self.kill_ring.front().cloned() else {
+            return;
+        };
+        let start = self.input_cursor;
+        // `insert_str_at_cursor` snapshots for undo + honours `INPUT_CAP`; the
+        // actual chars inserted is the cursor delta (a full box inserts nothing).
+        self.insert_str_at_cursor(&front);
+        let added = self.input_cursor.saturating_sub(start);
+        self.yank_span = (added > 0).then_some((start, added));
+        self.yank_ring_idx = 0;
+        self.last_kill = None;
+    }
+
+    /// Alt+Y — yank-pop: cycle to the next-older kill-ring entry and REPLACE the
+    /// span the previous yank / yank-pop inserted. Valid ONLY immediately after a
+    /// yank (the span is recorded); otherwise a no-op. No-op with fewer than two
+    /// ring entries (nothing to cycle to).
+    pub fn yank_pop(&mut self) {
+        let Some((start, len)) = self.yank_span else {
+            return;
+        };
+        if self.kill_ring.len() < 2 {
+            return;
+        }
+        self.yank_ring_idx = (self.yank_ring_idx + 1) % self.kill_ring.len();
+        let Some(replacement) = self.kill_ring.get(self.yank_ring_idx).cloned() else {
+            return;
+        };
+        self.snapshot_for_undo();
+        let bstart = self.byte_index(start);
+        let bend = self.byte_index(start + len);
+        self.input.replace_range(bstart..bend, &replacement);
+        let new_len = replacement.chars().count();
+        self.input_cursor = start + new_len;
+        self.yank_span = Some((start, new_len));
+        self.palette_selected = 0;
+        self.last_kill = None;
+    }
+
+    /// Snapshot the current input + caret onto the undo stack BEFORE a mutating
+    /// edit, coalescing a rapid burst into one step: if the previous snapshot was
+    /// pushed within [`UNDO_COALESCE`], this edit folds into it (no new step).
+    /// Every edit — coalesced or not — truncates the redo branch, so a fresh edit
+    /// after an undo forks a clean future. Fail-open: pure bookkeeping, no panics.
+    fn snapshot_for_undo(&mut self) {
+        // Any fresh edit invalidates the redo branch.
+        self.redo_stack.clear();
+        let now = std::time::Instant::now();
+        let coalesce = self
+            .last_snapshot_at
+            .is_some_and(|t| now.duration_since(t) < UNDO_COALESCE);
+        self.last_snapshot_at = Some(now);
+        if coalesce {
+            return;
+        }
+        self.undo_stack.push(EditSnapshot {
+            text: self.input.clone(),
+            cursor: self.input_cursor,
+        });
+        if self.undo_stack.len() > UNDO_CAP {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// Ctrl+Z — undo: restore the previous input snapshot, saving the current
+    /// state to the redo stack first. No-op (fail-open) when there is nothing to
+    /// undo.
+    pub fn undo(&mut self) {
+        let Some(prev) = self.undo_stack.pop() else {
+            return;
+        };
+        self.redo_stack.push(EditSnapshot {
+            text: self.input.clone(),
+            cursor: self.input_cursor,
+        });
+        if self.redo_stack.len() > UNDO_CAP {
+            self.redo_stack.remove(0);
+        }
+        self.restore_snapshot(prev);
+    }
+
+    /// Alt+Z — redo: replay the most recently undone snapshot, saving the current
+    /// state back to the undo stack. No-op when the redo branch is empty.
+    pub fn redo(&mut self) {
+        let Some(next) = self.redo_stack.pop() else {
+            return;
+        };
+        self.undo_stack.push(EditSnapshot {
+            text: self.input.clone(),
+            cursor: self.input_cursor,
+        });
+        if self.undo_stack.len() > UNDO_CAP {
+            self.undo_stack.remove(0);
+        }
+        self.restore_snapshot(next);
+    }
+
+    /// Apply a snapshot to the live input + caret and settle the surrounding edit
+    /// state: the next edit opens a clean undo step (`last_snapshot_at` cleared),
+    /// history-recall is exited, and the popover highlights reset so the slash /
+    /// @-mention popovers re-evaluate against the restored text. The caret is
+    /// clamped to the restored length (fail-open).
+    fn restore_snapshot(&mut self, snap: EditSnapshot) {
+        self.input = snap.text;
+        self.input_cursor = snap.cursor.min(self.input_len());
+        self.last_snapshot_at = None;
+        self.input_history_idx = None;
+        self.palette_selected = 0;
+        self.mention_selected = 0;
     }
 
     /// Move cursor by `delta` characters, clamped to `[0, len]`.
@@ -3344,6 +3597,9 @@ impl App {
     /// case). Fail-open: a path that can't be canonicalised / read falls back to
     /// plain text, so a normal paste containing a `.png` word is never swallowed.
     pub fn handle_paste(&mut self, text: &str) {
+        // A paste is an edit — close the kill-coalesce + yank-pop windows so a
+        // following kill starts fresh and Alt+Y isn't mistaken for valid.
+        self.reset_kill_yank();
         let lines: Vec<&str> = text.trim().lines().collect();
         let all_images = !lines.is_empty()
             && lines
@@ -5291,6 +5547,18 @@ impl App {
         // CONTROL editing/shell key (Ctrl-U clears the line, Ctrl-D is EOF).
         let ctrl_alt = ctrl && alt && !shift;
 
+        // Kill-ring coalescing + the yank-pop window live only across a run of
+        // consecutive same-FAMILY keys. Any key that is neither a kill
+        // (Ctrl+U/K/W) nor a yank (Ctrl+Y / Alt+Y) closes both windows, so a
+        // cursor move between two kills starts a fresh ring entry and Alt+Y is
+        // valid only immediately after a yank. (Search / overlay / help modes
+        // return earlier, so they never touch this state.)
+        let is_kill = ctrl && !alt && matches!(key, KeyCode::Char('u' | 'k' | 'w'));
+        let is_yank = (ctrl ^ alt) && matches!(key, KeyCode::Char('y'));
+        if !is_kill && !is_yank {
+            self.reset_kill_yank();
+        }
+
         match key {
             // ---- @-mention popover: Esc closes it WITHOUT inserting ----
             // Higher precedence than the interrupt / quit-confirm Esc below, so a
@@ -5598,6 +5866,33 @@ impl App {
             }
             KeyCode::Char('w') if ctrl => {
                 self.delete_word_back();
+                Action::None
+            }
+            // Ctrl+Y — yank: re-insert whatever the last Ctrl+U/K/W removed (the
+            // front kill-ring entry). Pairs with the kills so a mis-fired
+            // line/word delete is recoverable instead of destroyed.
+            KeyCode::Char('y') if ctrl => {
+                self.yank();
+                Action::None
+            }
+            // Alt+Y — yank-pop: cycle to an older kill-ring entry, replacing the
+            // just-yanked span. Valid only immediately after a yank/yank-pop.
+            KeyCode::Char('y') if alt => {
+                self.yank_pop();
+                Action::None
+            }
+            // Ctrl+Z — undo the last input edit (text + caret). Raw mode disables
+            // the terminal's own SIGTSTP, so Ctrl+Z arrives here as a plain key,
+            // free to own — job-control resume is handled separately via SIGCONT,
+            // not by this in-app keystroke. The priority recovery key, complement
+            // to the kill-ring.
+            KeyCode::Char('z') if ctrl => {
+                self.undo();
+                Action::None
+            }
+            // Alt+Z — redo (replay an undone edit). A free combo; undo is Ctrl+Z.
+            KeyCode::Char('z') if alt => {
+                self.redo();
                 Action::None
             }
             KeyCode::Char('c') if ctrl => {
@@ -11345,6 +11640,204 @@ mod tests {
         // (where `animations_enabled_default` would otherwise pick `false`).
         app.animations = true;
         app
+    }
+
+    // ---- I1: kill-ring + yank / yank-pop -------------------------------------
+
+    use crossterm::event::KeyModifiers;
+
+    /// Build the modifier set for a Ctrl-key.
+    fn ctrl() -> KeyModifiers {
+        KeyModifiers::CONTROL
+    }
+    /// Build the modifier set for an Alt-key.
+    fn alt() -> KeyModifiers {
+        KeyModifiers::ALT
+    }
+
+    #[test]
+    fn ctrl_u_pushes_to_kill_ring_and_ctrl_y_yanks_it_back() {
+        let mut app = fresh_app(Some("offline"));
+        app.input = "hello world".to_string();
+        app.input_cursor = app.input_len();
+        // Ctrl+U kills the line back to the start — but PUSHES it, not destroys.
+        let _ = app.apply_key_with_mods(KeyCode::Char('u'), ctrl());
+        assert_eq!(app.input, "", "Ctrl+U cleared the line");
+        assert_eq!(
+            app.kill_ring.front().map(String::as_str),
+            Some("hello world"),
+            "the killed text is on the ring, not lost"
+        );
+        // Ctrl+Y yanks the front entry back in.
+        let _ = app.apply_key_with_mods(KeyCode::Char('y'), ctrl());
+        assert_eq!(app.input, "hello world", "Ctrl+Y restored the killed text");
+        assert_eq!(app.input_cursor, app.input_len());
+    }
+
+    #[test]
+    fn ctrl_k_and_ctrl_w_both_feed_the_ring() {
+        // Ctrl+K (kill to end).
+        let mut app = fresh_app(Some("offline"));
+        app.input = "abcdef".to_string();
+        app.input_cursor = 0;
+        let _ = app.apply_key_with_mods(KeyCode::Char('k'), ctrl());
+        assert_eq!(app.kill_ring.front().map(String::as_str), Some("abcdef"));
+        // Ctrl+W (delete word back).
+        let mut app = fresh_app(Some("offline"));
+        app.input = "one two".to_string();
+        app.input_cursor = app.input_len();
+        let _ = app.apply_key_with_mods(KeyCode::Char('w'), ctrl());
+        assert_eq!(app.kill_ring.front().map(String::as_str), Some("two"));
+    }
+
+    #[test]
+    fn consecutive_same_direction_kills_coalesce_into_one_entry() {
+        // Two consecutive Ctrl+W (both BACKWARD) build ONE ring entry, the
+        // newer-killed text PREPENDED so the chunk reads in document order.
+        let mut app = fresh_app(Some("offline"));
+        app.input = "one two three".to_string();
+        app.input_cursor = app.input_len();
+        let _ = app.apply_key_with_mods(KeyCode::Char('w'), ctrl());
+        let _ = app.apply_key_with_mods(KeyCode::Char('w'), ctrl());
+        assert_eq!(
+            app.kill_ring.len(),
+            1,
+            "two same-direction kills are one ring entry"
+        );
+        assert_eq!(
+            app.kill_ring.front().map(String::as_str),
+            Some("two three"),
+            "backward kills prepend so the chunk reads in order"
+        );
+    }
+
+    #[test]
+    fn push_kill_coalesces_per_direction_and_forks_on_change() {
+        let mut app = fresh_app(Some("offline"));
+        // Forward kills APPEND into the front entry.
+        app.push_kill("aa", KillDir::Forward);
+        app.push_kill("bb", KillDir::Forward);
+        assert_eq!(app.kill_ring.len(), 1);
+        assert_eq!(app.kill_ring.front().map(String::as_str), Some("aabb"));
+        // A direction change FORKS a new entry; backward kills PREPEND.
+        app.push_kill("cc", KillDir::Backward);
+        app.push_kill("dd", KillDir::Backward);
+        assert_eq!(app.kill_ring.len(), 2);
+        assert_eq!(app.kill_ring[0], "ddcc");
+        assert_eq!(app.kill_ring[1], "aabb");
+        // A non-kill key resets coalescing, so the next kill never folds in.
+        app.reset_kill_yank();
+        app.push_kill("ee", KillDir::Backward);
+        assert_eq!(app.kill_ring.len(), 3);
+        assert_eq!(app.kill_ring[0], "ee");
+    }
+
+    #[test]
+    fn alt_y_yank_pops_to_cycle_the_ring_after_a_yank() {
+        let mut app = fresh_app(Some("offline"));
+        app.input = String::new();
+        app.input_cursor = 0;
+        // Seed two distinct ring entries (front = most recent).
+        app.kill_ring = VecDeque::from(["AAA".to_string(), "BBB".to_string()]);
+        // Ctrl+Y yanks the front entry.
+        let _ = app.apply_key_with_mods(KeyCode::Char('y'), ctrl());
+        assert_eq!(app.input, "AAA");
+        // Alt+Y replaces the just-yanked span with the next ring entry.
+        let _ = app.apply_key_with_mods(KeyCode::Char('y'), alt());
+        assert_eq!(app.input, "BBB", "Alt+Y cycled to the next ring entry");
+        // Alt+Y wraps back around the 2-entry ring.
+        let _ = app.apply_key_with_mods(KeyCode::Char('y'), alt());
+        assert_eq!(app.input, "AAA");
+    }
+
+    #[test]
+    fn alt_y_is_inert_without_a_preceding_yank() {
+        let mut app = fresh_app(Some("offline"));
+        app.input = "draft".to_string();
+        app.input_cursor = app.input_len();
+        app.kill_ring = VecDeque::from(["AAA".to_string(), "BBB".to_string()]);
+        // No yank happened first → yank-pop must be a no-op (no span recorded).
+        let _ = app.apply_key_with_mods(KeyCode::Char('y'), alt());
+        assert_eq!(app.input, "draft");
+    }
+
+    // ---- I2: undo / redo ------------------------------------------------------
+
+    #[test]
+    fn edit_then_undo_restores_text_and_cursor() {
+        let mut app = fresh_app(Some("offline"));
+        // A pre-existing draft (set directly → not itself a snapshot).
+        app.input = "hello".to_string();
+        app.input_cursor = app.input_len();
+        // Type a char — the FIRST edit always opens a fresh undo step.
+        let _ = app.apply_key(KeyCode::Char('!'));
+        assert_eq!(app.input, "hello!");
+        assert_eq!(app.input_cursor, 6);
+        // Ctrl+Z restores both the text AND the caret.
+        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
+        assert_eq!(app.input, "hello");
+        assert_eq!(app.input_cursor, 5);
+    }
+
+    #[test]
+    fn rapid_edits_coalesce_into_one_undo_step() {
+        let mut app = fresh_app(Some("offline"));
+        // Three keystrokes with no pause between them (the test runs in
+        // microseconds, well inside the coalesce window).
+        for c in ['a', 'b', 'c'] {
+            let _ = app.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(app.input, "abc");
+        assert_eq!(
+            app.undo_stack.len(),
+            1,
+            "a rapid burst collapses to one undo step"
+        );
+        // One Ctrl+Z reverts the entire burst.
+        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn redo_reapplies_after_undo() {
+        let mut app = fresh_app(Some("offline"));
+        let _ = app.apply_key(KeyCode::Char('a'));
+        assert_eq!(app.input, "a");
+        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
+        assert_eq!(app.input, "");
+        // Alt+Z replays the undone edit.
+        let _ = app.apply_key_with_mods(KeyCode::Char('z'), alt());
+        assert_eq!(app.input, "a");
+    }
+
+    #[test]
+    fn a_fresh_edit_truncates_the_redo_branch() {
+        let mut app = fresh_app(Some("offline"));
+        let _ = app.apply_key(KeyCode::Char('a'));
+        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
+        assert_eq!(app.input, "");
+        // A new edit forks a clean future — the redo branch is gone.
+        let _ = app.apply_key(KeyCode::Char('b'));
+        assert_eq!(app.input, "b");
+        assert!(app.redo_stack.is_empty(), "the redo branch was truncated");
+        // Alt+Z now has nothing to replay.
+        let _ = app.apply_key_with_mods(KeyCode::Char('z'), alt());
+        assert_eq!(app.input, "b");
+    }
+
+    #[test]
+    fn ring_and_undo_do_not_fire_while_search_owns_the_keys() {
+        let mut app = fresh_app(Some("offline"));
+        app.input = "hello world".to_string();
+        app.input_cursor = app.input_len();
+        // Search mode owns EVERY keystroke.
+        app.open_search();
+        let _ = app.apply_key_with_mods(KeyCode::Char('u'), ctrl());
+        let _ = app.apply_key_with_mods(KeyCode::Char('y'), ctrl());
+        let _ = app.apply_key_with_mods(KeyCode::Char('z'), ctrl());
+        assert_eq!(app.input, "hello world", "the input buffer is untouched");
+        assert!(app.kill_ring.is_empty(), "no kill fired");
+        assert!(app.undo_stack.is_empty(), "no undo snapshot fired");
     }
 
     #[test]
