@@ -1502,7 +1502,7 @@ async fn review_and_rework(
 ) {
     // Scale the team to the task; an empty team (lean / no-UI / docs-only paths)
     // means "no cross-review here" — return immediately, the floor stands.
-    let team = team_for(kind, &options.requirement);
+    let team = team_for(kind, &options.requirement, &options.project_root);
     if team.is_empty() {
         return;
     }
@@ -1560,14 +1560,33 @@ async fn review_and_rework(
     }
 }
 
-/// The team for a review node, scaled to the task via the planner's tiering.
-pub(crate) fn team_for(kind: ReviewKind, requirement: &str) -> Vec<Box<dyn RoleCritic>> {
+/// The team for a review node, scaled to the task via the planner's tiering, plus
+/// any USER-DEFINED seats (`.umadev/agents/*.md`) that apply to this node.
+///
+/// The built-in roster scales with the task kind exactly as before. User-defined
+/// seats ride the SAME scaling: they are appended ONLY when the built-in team is
+/// non-empty (so a lean kind still convenes none — the deterministic floor stands
+/// alone there) and ONLY for the review kinds they apply to. They are ADDED on top
+/// of the eight built-in seats, never replacing them, and convene on the same
+/// read-only-fork path as advisory-only critics (the floor still governs).
+pub(crate) fn team_for(
+    kind: ReviewKind,
+    requirement: &str,
+    project_root: &std::path::Path,
+) -> Vec<Box<dyn RoleCritic>> {
     let tier = crate::planner::classify(requirement);
-    match kind {
+    let mut team: Vec<Box<dyn RoleCritic>> = match kind {
         ReviewKind::Docs => crate::critics::docs_team_for_kind(tier),
         ReviewKind::Preview => crate::critics::preview_team_for_kind(tier),
         ReviewKind::Quality => crate::critics::quality_team_for_kind(tier),
+    };
+    // Custom seats only join a node that ALREADY convenes a built-in team — this is
+    // what keeps the team-size scaling intact (a lean kind convenes no team, so it
+    // convenes no custom seats either; a one-line tweak never pays for a reviewer).
+    if !team.is_empty() {
+        team.extend(crate::agents::custom_team_for(project_root, kind));
     }
+    team
 }
 
 /// Run the whole team in PARALLEL — one read-only `BaseSession::fork()` per seat
@@ -2931,16 +2950,53 @@ mod tests {
     #[test]
     fn team_for_scales_with_the_kind() {
         // A greenfield requirement seats the full docs team; a one-line tweak
-        // seats none (the deterministic floor stands).
+        // seats none (the deterministic floor stands). No agents dir -> the
+        // built-in roster only.
+        let tmp = tempfile::TempDir::new().unwrap();
         assert_eq!(
             team_for(
                 ReviewKind::Docs,
-                "build a SaaS dashboard web app with login"
+                "build a SaaS dashboard web app with login",
+                tmp.path()
             )
             .len(),
             3
         );
-        assert!(team_for(ReviewKind::Docs, "fix a typo in the readme").is_empty());
+        assert!(team_for(ReviewKind::Docs, "fix a typo in the readme", tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn team_for_appends_custom_seats_only_where_a_built_in_team_convenes() {
+        // A user-defined seat joins the team for an applicable kind on a tier that
+        // already convenes a built-in team — but a lean kind (which convenes none)
+        // stays empty, so the custom seat can never convene a team / drive the loop
+        // on its own (the deterministic floor still governs). The 8 built-in seats
+        // are unchanged: the custom seat is ADDED on top.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev").join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("accessibility.md"),
+            "---\nname: Accessibility Reviewer\napplies_to: [preview, quality]\n\
+             focus: WCAG 2.1 AA review.\n---\nAudit every interactive control.\n",
+        )
+        .unwrap();
+
+        let green = "build a SaaS dashboard web app with login";
+        // Quality node on a greenfield: 4 built-in + 1 custom = 5.
+        let q = team_for(ReviewKind::Quality, green, tmp.path());
+        assert_eq!(
+            q.len(),
+            5,
+            "the custom seat joins the built-in quality team"
+        );
+        assert!(q.iter().any(|c| c.role() == "accessibility-reviewer"));
+        // Docs node: the custom seat is scoped out (preview/quality only) -> the 3
+        // built-in docs seats only.
+        assert_eq!(team_for(ReviewKind::Docs, green, tmp.path()).len(), 3);
+        // A lean kind convenes NO team even with a custom seat on disk -> the floor
+        // stands alone; a custom seat can never force a review where none runs.
+        assert!(team_for(ReviewKind::Quality, "fix a typo in the readme", tmp.path()).is_empty());
     }
 
     #[test]

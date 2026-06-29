@@ -405,7 +405,7 @@ pub async fn review(
     events: &Arc<dyn EventSink>,
     kind: ReviewKind,
 ) -> ReviewResult {
-    let team = continuous::team_for(kind, &options.requirement);
+    let team = continuous::team_for(kind, &options.requirement, &options.project_root);
     review_with_team(session, options, events, kind, team).await
 }
 
@@ -417,13 +417,24 @@ pub async fn review(
 ///
 /// Fail-open identically to [`review`]: a base that can't fork / an offline brain /
 /// a parse failure yields accepting empty verdicts → no blocking → proceed.
+///
+/// User-defined seats (`.umadev/agents/*.md`) that apply to the QUALITY node join
+/// here too, so a custom reviewer rides the route-sized path uniformly — appended
+/// only when the route actually convened a built-in quality team (an empty route
+/// team stays empty, so a lean/fast route convenes no custom seats either).
 pub async fn review_with_seats(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     seats: &[crate::critics::Seat],
 ) -> ReviewResult {
-    let team = crate::critics::quality_team_for_seats(seats);
+    let mut team = crate::critics::quality_team_for_seats(seats);
+    if !team.is_empty() {
+        team.extend(crate::agents::custom_team_for(
+            &options.project_root,
+            ReviewKind::Quality,
+        ));
+    }
     review_with_team(session, options, events, ReviewKind::Quality, team).await
 }
 
