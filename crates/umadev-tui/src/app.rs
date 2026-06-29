@@ -1237,6 +1237,23 @@ pub struct App {
     /// down outside the selection. See [`crate::selection`].
     pub selection: Option<crate::selection::Selection>,
 
+    /// `true` while a left-button drag-selection is IN PROGRESS — set on a
+    /// mouse-down that landed inside the transcript, cleared on mouse-up. The
+    /// selection stays `Some` (highlighted) after the button releases, so this
+    /// flag is the only thing that distinguishes "still dragging" from "drag
+    /// finished, span just highlighted". A wheel notch consults it to decide
+    /// whether to EXTEND the selection past the viewport (mid-drag) or merely
+    /// scroll (drag over / no drag). See [`Self::mouse_wheel_select`].
+    pub selection_dragging: bool,
+
+    /// The last screen `(col, row)` reported during an active drag, set on the
+    /// mouse-down and on every drag move. When a wheel notch arrives mid-drag
+    /// the transcript scrolls and the SAME screen cell now sits over a different
+    /// content row, so re-resolving the selection cursor at this position grows
+    /// the span to include the freshly revealed rows (the reported "滚轮复制
+    /// 更多" gap). `None` outside a drag.
+    pub last_drag_mouse: Option<(u16, u16)>,
+
     /// **Per-frame cache of the rendered transcript as plain text** — one
     /// `String` per wrapped visual row, in render order. Rebuilt every frame by
     /// `ui::render_transcript` from the same folded `Vec<Line>` it paints. The
@@ -1681,6 +1698,8 @@ impl App {
             // the terminal's native click-drag selection.
             mouse_scroll: true,
             selection: None,
+            selection_dragging: false,
+            last_drag_mouse: None,
             transcript_rows: std::cell::RefCell::new(Vec::new()),
             transcript_gutters: std::cell::RefCell::new(Vec::new()),
             transcript_area: std::cell::Cell::new((0, 0, 0, 0)),
@@ -2507,27 +2526,105 @@ impl App {
         )
     }
 
-    /// Mouse-down (left button) at screen `(col, row)`: begin a fresh selection
-    /// anchored at the mapped content point. A click OUTSIDE the transcript
-    /// clears any existing selection (so a copied span un-highlights once the
-    /// user clicks away).
-    pub fn selection_begin(&mut self, col: u16, row: u16) {
-        match self.map_mouse_point(col, row) {
-            Some(p) => self.selection = Some(crate::selection::Selection::at(p)),
-            None => self.selection = None,
-        }
+    /// Mirror the renderer's `transcript_first_visible` from the CURRENT scroll
+    /// offset, without waiting for the next frame. The renderer publishes
+    /// `first_visible = hidden_above − user_offset` once per draw; after a
+    /// programmatic scroll inside one event (wheel-during-drag, edge
+    /// auto-scroll) the cached value is stale, so a same-event re-resolve would
+    /// map the screen cell to the OLD content row. Recompute it here so the
+    /// re-resolve sees the new geometry immediately. Pure + fail-open.
+    fn sync_first_visible(&self) {
+        let hidden_above = self.transcript_max_scroll.get();
+        let user_offset = self.transcript_scroll.get().min(hidden_above);
+        self.transcript_first_visible
+            .set(hidden_above.saturating_sub(user_offset));
     }
 
-    /// Mouse-drag (left button held) at screen `(col, row)`: extend the live
-    /// selection's cursor to the mapped content point. No-op when there's no
-    /// active selection or the point doesn't map (e.g. dragged off the area —
-    /// the anchor + last good cursor are kept).
-    pub fn selection_extend(&mut self, col: u16, row: u16) {
-        if let Some(p) = self.map_mouse_point(col, row) {
+    /// Re-resolve the live selection's cursor at screen `(col, row)`, CLAMPING
+    /// the point into the transcript rectangle first so a position dragged off
+    /// an edge pins the end to the nearest visible row/col (rather than freezing
+    /// the cursor as the raw mapping would). No-op without a live selection or a
+    /// zero-size area. Used by both the wheel-during-drag and edge-auto-scroll
+    /// extension paths after they have applied their scroll.
+    fn resolve_cursor_clamped(&mut self, col: u16, row: u16) {
+        let (left, top, width, height) = self.transcript_area.get();
+        if width == 0 || height == 0 {
+            return;
+        }
+        let cc = col.clamp(left, left.saturating_add(width).saturating_sub(1));
+        let cr = row.clamp(top, top.saturating_add(height).saturating_sub(1));
+        if let Some(p) = self.map_mouse_point(cc, cr) {
             if let Some(sel) = self.selection.as_mut() {
                 sel.cursor = p;
             }
         }
+    }
+
+    /// Mouse-down (left button) at screen `(col, row)`: begin a fresh selection
+    /// anchored at the mapped content point. A click OUTSIDE the transcript
+    /// clears any existing selection (so a copied span un-highlights once the
+    /// user clicks away). A down inside the transcript also opens a drag
+    /// (`selection_dragging`) and records the position, so a wheel notch before
+    /// the first drag move can already extend the selection past the viewport.
+    pub fn selection_begin(&mut self, col: u16, row: u16) {
+        if let Some(p) = self.map_mouse_point(col, row) {
+            self.selection = Some(crate::selection::Selection::at(p));
+            self.selection_dragging = true;
+            self.last_drag_mouse = Some((col, row));
+        } else {
+            self.selection = None;
+            self.selection_dragging = false;
+            self.last_drag_mouse = None;
+        }
+    }
+
+    /// Mouse-drag (left button held) at screen `(col, row)`: extend the live
+    /// selection's cursor toward the cursor. Records the position (so a wheel
+    /// notch can re-resolve there) and, when the drag has gone PAST the top or
+    /// bottom edge of the transcript, auto-scrolls one step in that direction
+    /// and pins the end to the newly revealed edge row — the standard "drag past
+    /// the edge to keep selecting" behavior. Inside the area it just moves the
+    /// end to the mapped point. No-op when there's no active selection.
+    pub fn selection_extend(&mut self, col: u16, row: u16) {
+        self.last_drag_mouse = Some((col, row));
+        // Edge auto-scroll: a drag STRICTLY beyond the top/bottom edge pulls one
+        // off-screen row into view per drag event (a drag that stays inside,
+        // even on the boundary row, never auto-scrolls — that would make
+        // selecting the last visible line jitter the viewport).
+        let (_, top, _, height) = self.transcript_area.get();
+        if height > 0 {
+            let bottom = top.saturating_add(height); // first row BELOW the area
+            if row < top {
+                self.transcript_scroll_up(1);
+                self.sync_first_visible();
+            } else if row >= bottom {
+                self.transcript_scroll_down(1);
+                self.sync_first_visible();
+            }
+        }
+        self.resolve_cursor_clamped(col, row);
+    }
+
+    /// Route one wheel notch while a drag-selection MAY be active. Scrolls the
+    /// transcript exactly as [`Self::mouse_wheel`] does, and — when a drag is in
+    /// progress and no overlay owns the wheel — additionally re-resolves the
+    /// selection's cursor at the last drag position so the selection GROWS to
+    /// include the rows the scroll just revealed. The anchor is left fixed, so
+    /// the user can wheel up/down mid-drag to extend the copy span beyond the
+    /// visible viewport (the reported "复制文字没法滚轮复制更多" gap). With no
+    /// active drag this is a plain wheel-scroll. Returns `true` if consumed.
+    pub fn mouse_wheel_select(&mut self, up: bool, step: usize) -> bool {
+        let consumed = self.mouse_wheel(up, step);
+        if consumed && self.selection_dragging && self.overlay.is_none() {
+            // The scroll moved which content row sits under the cursor; mirror
+            // the renderer's first-visible NOW so the re-resolve sees it, then
+            // extend to the last drag position over the freshly revealed rows.
+            self.sync_first_visible();
+            if let Some((col, row)) = self.last_drag_mouse {
+                self.resolve_cursor_clamped(col, row);
+            }
+        }
+        consumed
     }
 
     /// Mouse-up (left button) — finish the selection and copy it. When there is
@@ -2539,6 +2636,10 @@ impl App {
     /// any single-click selection in place) when nothing is selected — fail-open.
     #[must_use]
     pub fn selection_finish_copy(&mut self) -> Option<String> {
+        // The button released: the drag is over (the span stays highlighted, but
+        // a later wheel notch must scroll, not extend). Clear unconditionally.
+        self.selection_dragging = false;
+        self.last_drag_mouse = None;
         let sel = self.selection?;
         if sel.is_empty() {
             return None;
@@ -13339,6 +13440,116 @@ mod tests {
         // Second Esc actually quits.
         let action = a.apply_key(KeyCode::Esc);
         assert_eq!(action, Action::Quit);
+    }
+
+    // ── wheel / edge extends a drag-selection past the viewport ───────────
+    //
+    // Shared geometry: 10 content rows "row0".."row9", a 4-row viewport at the
+    // top-left, `hidden_above` (max_scroll) = 6. Pinned to the bottom
+    // (`transcript_scroll` = 0) the renderer would publish `first_visible` = 6,
+    // so rows 6,7,8,9 are on screen and rows 0..5 are hidden ABOVE.
+    fn seed_transcript_geometry(a: &App) {
+        *a.transcript_rows.borrow_mut() = (0..10).map(|i| format!("row{i}")).collect();
+        a.transcript_gutters.borrow_mut().clear();
+        a.transcript_area.set((0, 0, 10, 4));
+        a.transcript_max_scroll.set(6);
+        a.set_transcript_scroll(0);
+        a.transcript_first_visible.set(6);
+    }
+
+    #[test]
+    fn wheel_during_drag_extends_selection_past_viewport() {
+        let mut a = fresh_app(Some("offline"));
+        seed_transcript_geometry(&a);
+        // Press at the end of the bottom-most visible row (screen row 3 → content
+        // row 9): the anchor that the wheel must keep fixed.
+        a.selection_begin(9, 3);
+        assert!(
+            a.selection_dragging,
+            "a down inside the transcript opens a drag"
+        );
+        assert_eq!(a.selection.unwrap().anchor, (9, 4));
+        // Drag up to the TOP visible row (screen row 0 → content row 6). The
+        // selection now spans only what is on screen: rows 6..9.
+        a.selection_extend(0, 0);
+        assert_eq!(a.selection.unwrap().cursor, (6, 0));
+        assert_eq!(
+            crate::selection::extract(&a.transcript_rows.borrow(), &a.selection.unwrap()),
+            "row6\nrow7\nrow8\nrow9",
+            "before the wheel the span is just the visible viewport",
+        );
+        // Wheel UP three rows WHILE the drag is live: the transcript scrolls AND
+        // the selection end re-resolves at the last drag position (screen row 0),
+        // which now sits over content row 3 — so the span GROWS to rows 3..9,
+        // reaching content that was hidden above the old viewport.
+        assert!(a.mouse_wheel_select(true, 3));
+        assert_eq!(
+            a.transcript_scroll(),
+            3,
+            "the wheel still scrolls the transcript"
+        );
+        assert_eq!(
+            a.selection.unwrap().cursor,
+            (3, 0),
+            "end grew to the revealed row"
+        );
+        assert_eq!(
+            a.selection.unwrap().anchor,
+            (9, 4),
+            "the anchor stays pinned"
+        );
+        assert_eq!(
+            crate::selection::extract(&a.transcript_rows.borrow(), &a.selection.unwrap()),
+            "row3\nrow4\nrow5\nrow6\nrow7\nrow8\nrow9",
+            "extract returns the now-larger, beyond-the-viewport span",
+        );
+    }
+
+    #[test]
+    fn wheel_without_active_drag_only_scrolls() {
+        let mut a = fresh_app(Some("offline"));
+        seed_transcript_geometry(&a);
+        // Make a real selection then release the button (mouse-up): the span
+        // stays highlighted but the drag is over.
+        a.selection_begin(9, 3); // anchor (9,4)
+        a.selection_extend(0, 0); // cursor (6,0)
+        let copied = a.selection_finish_copy();
+        assert_eq!(copied.as_deref(), Some("row6\nrow7\nrow8\nrow9"));
+        assert!(!a.selection_dragging, "mouse-up ends the drag");
+        let before = a.selection.unwrap();
+        // A wheel notch now must ONLY scroll — the highlighted span is frozen.
+        assert!(a.mouse_wheel_select(true, 3));
+        assert_eq!(a.transcript_scroll(), 3, "the wheel scrolls as usual");
+        assert_eq!(
+            a.selection.unwrap(),
+            before,
+            "no active drag → the selection is left untouched",
+        );
+    }
+
+    #[test]
+    fn drag_past_bottom_edge_auto_scrolls_and_extends() {
+        let mut a = fresh_app(Some("offline"));
+        seed_transcript_geometry(&a);
+        // Scroll all the way UP first so rows 0..3 are visible and there is room
+        // to auto-scroll DOWN toward the newer rows.
+        a.set_transcript_scroll(6);
+        a.transcript_first_visible.set(0);
+        a.selection_begin(0, 0); // anchor at content row 0
+        assert_eq!(a.selection.unwrap().anchor, (0, 0));
+        // Drag STRICTLY below the bottom edge (screen row 4 == top+height): one
+        // auto-scroll step downward + the end pins to the freshly revealed row.
+        a.selection_extend(0, 4);
+        assert_eq!(
+            a.transcript_scroll(),
+            5,
+            "dragging past the bottom auto-scrolls one step"
+        );
+        assert_eq!(
+            a.selection.unwrap().cursor.0,
+            4,
+            "the end extends to the row pulled into view below the old viewport",
+        );
     }
 
     #[test]

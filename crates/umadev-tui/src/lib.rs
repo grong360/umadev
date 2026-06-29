@@ -4317,11 +4317,17 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         // the chat transcript when wheel-capture is on. Without this the
                         // wheel scrolled the transcript hidden BEHIND an open overlay and
                         // the overlay looked "stuck".
+                        // `mouse_wheel_select` scrolls exactly like `mouse_wheel`
+                        // but, when a left-drag selection is in progress, ALSO
+                        // re-resolves the selection's end at the last drag
+                        // position so the wheel EXTENDS the copy span past the
+                        // viewport (the "复制时没法滚轮复制更多" gap). No active
+                        // drag → plain scroll; an open overlay still owns the wheel.
                         MouseEventKind::ScrollUp => {
-                            app.mouse_wheel(true, 3);
+                            app.mouse_wheel_select(true, 3);
                         }
                         MouseEventKind::ScrollDown => {
-                            app.mouse_wheel(false, 3);
+                            app.mouse_wheel_select(false, 3);
                         }
                         // The drag-to-select/copy layer is chat-only, gated by `/mouse`,
                         // and suppressed while a modal overlay is up (the overlay owns the
