@@ -5168,9 +5168,11 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         theme::PRIMARY()
     };
 
-    // Placeholder (Claude Code style: dim hint when empty). Localized.
-    let placeholder = if app.active_gate.is_some() {
-        umadev_i18n::t(app.lang, "input.gate")
+    // Placeholder (Claude Code style: dim hint when empty). Localized. `Cow` so
+    // the state hints stay borrowed from the static catalog while the I9
+    // first-run example tip (an owned, file-substituted String) can slot in.
+    let placeholder: std::borrow::Cow<'_, str> = if app.active_gate.is_some() {
+        umadev_i18n::t(app.lang, "input.gate").into()
     } else if app.thinking || app.tool_in_progress {
         // ACTIVELY working a turn (a chat reply streaming, or a tool running) —
         // show the interruptible "running" hint. This MUST win over `aborted`
@@ -5178,18 +5180,23 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         // so a stale `aborted` from a PRIOR block would otherwise persist and the
         // placeholder wrongly read "本轮已中止" while the base was replying normally
         // (user-reported). A live turn is, by definition, not aborted.
-        umadev_i18n::t(app.lang, "input.running")
+        umadev_i18n::t(app.lang, "input.running").into()
     } else if app.finished {
-        umadev_i18n::t(app.lang, "input.finished")
+        umadev_i18n::t(app.lang, "input.finished").into()
     } else if app.aborted {
         // The round bailed — tell the user to re-enter a requirement, NOT that a
         // run is still in flight (which the bare `run_started` branch below would
         // wrongly imply, since `run_started` stays set on an aborted block).
-        umadev_i18n::t(app.lang, "input.aborted")
+        umadev_i18n::t(app.lang, "input.aborted").into()
     } else if app.run_started {
-        umadev_i18n::t(app.lang, "input.running")
+        umadev_i18n::t(app.lang, "input.running").into()
+    } else if let Some(tip) = app.first_run_example_tip() {
+        // I9 — idle + empty + first-run: a rotating "try this" example above the
+        // plain idle hint, teaching the prompt surface by demonstration. Vanishes
+        // the moment the user types (the box is no longer empty) or interacts.
+        tip.into()
     } else {
-        umadev_i18n::t(app.lang, "input.idle")
+        umadev_i18n::t(app.lang, "input.idle").into()
     };
 
     // Build the wrapped input: row 0 carries the `>_ ` mode prefix; wrapped

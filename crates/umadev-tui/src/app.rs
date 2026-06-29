@@ -1426,6 +1426,75 @@ fn collect_repo_files(root: &std::path::Path) -> Vec<String> {
     out
 }
 
+/// I9 — the repo file the first-run example tip names: the most recently
+/// MODIFIED source file under `root`, as a repo-relative `/`-separated path, so
+/// "重构 <file>" / "refactor <file>" points at something the user actually just
+/// touched. Bounded walk reusing the @-mention scan's skip rules (hidden dirs,
+/// `target`, `node_modules`) and caps. Restricted to common source extensions so
+/// the example never suggests acting on a lockfile or binary. `None` when the
+/// repo has no recognisable source file or is unreadable — the caller then falls
+/// back to a generic token. Fail-open: never panics.
+fn most_recently_modified_source_file(root: &std::path::Path) -> Option<String> {
+    const SRC_EXTS: &[&str] = &[
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "rb", "php", "c", "cc",
+        "cpp", "h", "hpp", "cs", "swift", "kt", "vue", "svelte", "css", "scss", "less", "html",
+    ];
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    let mut scanned = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        if scanned >= MENTION_FILE_CAP {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue; // unreadable dir → skip (fail-open)
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < MENTION_SCAN_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            scanned += 1;
+            let path = entry.path();
+            let is_src = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| SRC_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+            if !is_src {
+                continue;
+            }
+            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            // Keep the newest; a lexicographic tie-break on the path so an
+            // equal-mtime repo picks the same file deterministically each launch.
+            let better = match &best {
+                Some((t, cur)) => mtime > *t || (mtime == *t && rel.as_str() < cur.as_str()),
+                None => true,
+            };
+            if better {
+                best = Some((mtime, rel));
+            }
+        }
+    }
+    best.map(|(_, rel)| rel)
+}
+
 /// True for a RECOVERABLE, mid-turn base hiccup (rate-limit / overloaded / retry)
 /// that should surface as a transient live status line rather than a permanent
 /// `[warn]` transcript row — so a flurry of retries doesn't spam the region next
@@ -2348,6 +2417,20 @@ pub struct App {
     /// first route. Set deterministically (Tier-0) the instant a turn is
     /// submitted, then refined by the async Tier-1 consult.
     pub last_intent_class: Option<String>,
+
+    /// I9 — how many prompts the user has submitted *this session* (any submit:
+    /// chat / slash / bang). `0` until the first interaction, which is exactly
+    /// the "first-run" window in which the rotating example tip
+    /// ([`Self::first_run_example_tip`]) is offered above the idle placeholder.
+    /// Incremented in [`Self::remember_submission`]; NOT persisted (a fresh
+    /// session re-offers the tip, with a rotated example).
+    pub session_turns: usize,
+
+    /// I9 — cached resolution of the repo file named by the first-run example
+    /// tip (the most recently modified source file, or `None`). Interior-mutable
+    /// so the pure `&App` renderer can populate it on first use; the bounded FS
+    /// walk then runs at most once per session. Outer `None` = not yet computed.
+    pub example_file: std::cell::RefCell<Option<Option<String>>>,
 }
 
 impl App {
@@ -2511,6 +2594,8 @@ impl App {
             critic_round_open: false,
             handoffs: Vec::new(),
             last_intent_class: None,
+            session_turns: 0,
+            example_file: std::cell::RefCell::new(None),
         };
         app.load_history();
         // Reload the persisted background-task registry so recent / interrupted
@@ -4287,6 +4372,9 @@ impl App {
         if text.trim().is_empty() {
             return;
         }
+        // I9 — the user has now interacted, so we're past the "first-run" window:
+        // the rotating example tip stops being offered above the idle placeholder.
+        self.session_turns = self.session_turns.saturating_add(1);
         if self.input_history.back().map(String::as_str) == Some(text) {
             return;
         }
@@ -4914,6 +5002,64 @@ impl App {
         }
         let files = collect_repo_files(&self.project_root);
         *self.mention_files.borrow_mut() = Some(files);
+    }
+
+    /// I9 — the first-run example tip layered above the idle placeholder: a short,
+    /// rotating "试试 …" / "Try …" example (trilingual) that teaches the prompt
+    /// surface by demonstration. Shown ONLY at the very start of a session — an
+    /// empty, idle box on which the user has not yet sent anything
+    /// (`session_turns == 0`) — and naming a real recently-touched repo file when
+    /// one is found, else a generic token.
+    ///
+    /// Returns `None` once the user has spoken, while the box has text, or when a
+    /// turn / run is in flight or settled — so the tip vanishes the instant they
+    /// start typing or working, never nagging. Rotation uses a SESSION-STABLE
+    /// index (the persisted prompt-history depth, constant across the first-run
+    /// window) so the tip never flickers within a session yet a returning user
+    /// sees a different example each launch — no RNG (none is deterministic for
+    /// tests here). Pure read plus a once-cached file lookup; safe every frame.
+    #[must_use]
+    pub(crate) fn first_run_example_tip(&self) -> Option<String> {
+        // The rotating example templates (each takes one `{}` = the file).
+        const TEMPLATES: [&str; 3] = [
+            "input.example.refactor",
+            "input.example.tests",
+            "input.example.explain",
+        ];
+        if self.session_turns > 0 || !self.input.is_empty() || !self.is_idle_for_tip() {
+            return None;
+        }
+        let idx = self.input_history.len() % TEMPLATES.len();
+        let file = self
+            .resolve_example_file()
+            .unwrap_or_else(|| umadev_i18n::t(self.lang, "input.example.file_generic").to_string());
+        Some(umadev_i18n::tf(self.lang, TEMPLATES[idx], &[&file]))
+    }
+
+    /// True when nothing is in flight or settled — the same "idle" condition
+    /// under which the input placeholder shows `input.idle` (no open gate, not
+    /// thinking, no tool running, no started / finished / aborted run). Gates the
+    /// first-run example tip ([`Self::first_run_example_tip`]).
+    fn is_idle_for_tip(&self) -> bool {
+        self.active_gate.is_none()
+            && !self.thinking
+            && !self.tool_in_progress
+            && !self.finished
+            && !self.aborted
+            && !self.run_started
+    }
+
+    /// I9 — cached lookup of the repo file named by the first-run example tip:
+    /// the most recently modified source file under the project root, or `None`.
+    /// The bounded FS walk runs at most once per session (interior-mutable cache)
+    /// so re-rendering the tip every frame stays free. Fail-open via the walk.
+    fn resolve_example_file(&self) -> Option<String> {
+        if let Some(cached) = self.example_file.borrow().as_ref() {
+            return cached.clone();
+        }
+        let chosen = most_recently_modified_source_file(&self.project_root);
+        *self.example_file.borrow_mut() = Some(chosen.clone());
+        chosen
     }
 
     /// The ranked `@`-mention candidates for the partial currently under the
@@ -6257,6 +6403,14 @@ impl App {
                     self.interrupt_armed_at = Some(std::time::Instant::now());
                     return Action::None;
                 }
+                // I6 — empty box + a chat turn parked behind the in-flight one →
+                // pull the most recent queued message back for editing (popping
+                // it) BEFORE the rewind/quit gesture, so a queued turn can be
+                // fixed (or dropped) before it sends. A no-op when the queue is
+                // empty, falling through to the rewind/quit arms below.
+                if self.input.is_empty() && self.recall_queued_chat() {
+                    return Action::None;
+                }
                 // Idle, EMPTY input, with a prior user turn → double-Esc REWINDS:
                 // re-load the last user message into the box for editing and drop
                 // the turns after it, so the user can fix + re-ask from that point
@@ -6420,6 +6574,16 @@ impl App {
             // is what stops the "↑ in a multi-line prompt destroys my draft" bug.
             KeyCode::Up if !has_palette || self.input_history_idx.is_some() => {
                 if self.caret_move_up_wrapped() {
+                    return Action::None;
+                }
+                // I6 — empty box + a chat turn parked behind the in-flight one →
+                // recall the QUEUE first (pull the most recent queued message back
+                // for editing), taking precedence over shell-history recall. Only
+                // on a genuinely empty box that isn't already mid history-paging.
+                if self.input.is_empty()
+                    && self.input_history_idx.is_none()
+                    && self.recall_queued_chat()
+                {
                     return Action::None;
                 }
                 // Caret is on the first row — recall history if we have any to
@@ -7011,6 +7175,33 @@ impl App {
         let text = self.queued_chat.pop_front()?;
         self.record_user_turn(&text);
         Some(text)
+    }
+
+    /// I6 — pull the MOST RECENT chat turn parked behind the in-flight one
+    /// ([`queued_chat`]) back into the input box for editing, popping it from the
+    /// queue. Lets the user fix (or drop) a queued message before it sends,
+    /// instead of it being uneditable until it fires. Returns `true` when a
+    /// queued message was recalled. Fail-open: a no-op returning `false` when the
+    /// queue is empty (the caller then falls back to shell-history recall / the
+    /// rewind gesture). The newest is popped because it is the one the user just
+    /// typed and most likely wants to correct. Memory stays clean — a queued turn
+    /// is only recorded into conversation memory when it actually FIRES
+    /// (`take_next_queued_chat`), never at queue time, so this pop leaves no
+    /// dangling record.
+    fn recall_queued_chat(&mut self) -> bool {
+        let Some(text) = self.queued_chat.pop_back() else {
+            return false;
+        };
+        self.input = text;
+        self.input_cursor = self.input_len();
+        // Land as a clean fresh draft: not mid history-recall, no armed
+        // quit/rewind gesture carried over.
+        self.input_history_idx = None;
+        self.pending_quit_confirm = false;
+        self.pending_rewind = false;
+        // The "queued N" chip count just dropped — keep the status line honest.
+        self.refresh_status();
+        true
     }
 
     /// Number of turns currently waiting to be sent — the chat-routing queue
@@ -19757,6 +19948,147 @@ mod tests {
         assert_eq!(a.queued_chat.len(), 2);
         assert_eq!(a.take_next_queued_chat().as_deref(), Some("second message"));
         assert_eq!(a.take_next_queued_chat().as_deref(), Some("third message"));
+    }
+
+    // ---- I6: editable queued-input recall ------------------------------------
+
+    #[test]
+    fn i6_up_on_empty_box_recalls_most_recent_queued_message_for_editing() {
+        let mut a = fresh_app(Some("offline"));
+        // A routed turn is in flight, with two more parked behind it (FIFO).
+        let _ = a.submit_text("first message".to_string()); // routes, marks thinking
+        assert!(a.thinking);
+        let _ = a.submit_text("second message".to_string()); // queued
+        let _ = a.submit_text("third message".to_string()); // queued
+        assert_eq!(a.queued_chat.len(), 2);
+        // Empty box → Up pulls the MOST RECENT queued message back for editing,
+        // popping it (recall the queue BEFORE shell history).
+        a.input.clear();
+        a.input_cursor = 0;
+        let act = a.apply_key(KeyCode::Up);
+        assert_eq!(act, Action::None);
+        assert_eq!(
+            a.input, "third message",
+            "the newest queued turn is recalled"
+        );
+        assert_eq!(a.queued_chat.len(), 1, "the recalled turn was popped");
+        assert_eq!(
+            a.queued_chat.front().map(String::as_str),
+            Some("second message"),
+            "the earlier queued turn stays parked"
+        );
+    }
+
+    #[test]
+    fn i6_esc_on_empty_box_recalls_queued_message_before_rewind() {
+        let mut a = fresh_app(Some("offline"));
+        let _ = a.submit_text("first".to_string());
+        let _ = a.submit_text("queued edit".to_string());
+        assert_eq!(a.queued_chat.len(), 1);
+        a.input.clear();
+        a.input_cursor = 0;
+        // Esc with a parked queued turn recalls it (popping) instead of arming the
+        // idle rewind gesture — the box was empty, so the queue wins.
+        let act = a.apply_key(KeyCode::Esc);
+        assert_eq!(act, Action::None);
+        assert_eq!(a.input, "queued edit");
+        assert!(
+            a.queued_chat.is_empty(),
+            "the queued turn was popped for editing"
+        );
+        assert!(
+            !a.pending_rewind,
+            "queue recall takes precedence over the rewind arm"
+        );
+    }
+
+    #[test]
+    fn i6_up_with_no_queue_still_does_history_recall() {
+        let mut a = fresh_app(Some("offline"));
+        a.remember_submission("an earlier prompt");
+        assert!(a.queued_chat.is_empty());
+        a.input.clear();
+        a.input_cursor = 0;
+        // Empty box + NO queue → Up recalls shell history exactly as before.
+        let act = a.apply_key(KeyCode::Up);
+        assert_eq!(act, Action::None);
+        assert_eq!(
+            a.input, "an earlier prompt",
+            "with no queue, history recall is unchanged"
+        );
+    }
+
+    // ---- I9: first-run rotating example placeholder --------------------------
+
+    #[test]
+    fn i9_first_run_example_tip_shows_when_idle_empty_early() {
+        let a = fresh_app(Some("offline"));
+        // Fresh session: idle, empty box, nothing sent yet → a rotating example.
+        let tip = a
+            .first_run_example_tip()
+            .expect("a first-run example shows");
+        assert!(!tip.is_empty());
+        assert_ne!(
+            tip,
+            umadev_i18n::t(a.lang, "input.idle"),
+            "the tip is the example, layered above the plain idle hint"
+        );
+        // The empty test workspace has no source file → the generic token is used.
+        let generic = umadev_i18n::t(a.lang, "input.example.file_generic");
+        assert!(
+            tip.contains(generic),
+            "names a generic file when none is found: {tip}"
+        );
+    }
+
+    #[test]
+    fn i9_example_tip_vanishes_on_typing_and_after_first_turn() {
+        let mut a = fresh_app(Some("offline"));
+        assert!(a.first_run_example_tip().is_some(), "shown at first-run");
+        // The instant the user types, the box is non-empty → the tip is gone.
+        let _ = a.apply_key(KeyCode::Char('h'));
+        assert!(!a.input.is_empty());
+        assert!(
+            a.first_run_example_tip().is_none(),
+            "vanishes the moment the user types"
+        );
+        // Cleared again, but still no submit this session → the tip returns.
+        a.input.clear();
+        a.input_cursor = 0;
+        assert!(
+            a.first_run_example_tip().is_some(),
+            "empty again, no submit yet → still first-run"
+        );
+        // After an ACTUAL submit, the first-run window closes for the session.
+        a.remember_submission("do a thing");
+        a.input.clear();
+        a.input_cursor = 0;
+        assert!(
+            a.first_run_example_tip().is_none(),
+            "the first-run window closes after a submit"
+        );
+    }
+
+    #[test]
+    fn i9_example_tip_rotates_by_session_stable_index() {
+        let mut a = fresh_app(Some("offline"));
+        let templates = [
+            "input.example.refactor",
+            "input.example.tests",
+            "input.example.explain",
+        ];
+        let generic = umadev_i18n::t(a.lang, "input.example.file_generic").to_string();
+        // Rotation index = the persisted prompt-history depth (stable across the
+        // first-run window; `session_turns` stays 0 since we don't submit). No RNG.
+        for depth in 0..6usize {
+            a.input_history.clear();
+            for i in 0..depth {
+                a.input_history.push_back(format!("p{i}"));
+            }
+            let tip = a.first_run_example_tip().expect("idle+empty+early");
+            let expected = umadev_i18n::tf(a.lang, templates[depth % 3], &[&generic]);
+            assert_eq!(tip, expected, "depth {depth} picks template {}", depth % 3);
+        }
     }
 
     #[test]

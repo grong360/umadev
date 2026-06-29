@@ -37,6 +37,11 @@
 "model.reasoning" = "reasoning effort {} (from the base config; UmaDev does not override)"
 "input.idle" = "Ask anything…  (/help for commands)"
 "input.aborted" = "this round was aborted — type a new requirement to try again"
+# I9 first-run rotating example tip (layered over input.idle; shown only when idle, empty, and nothing sent yet this session; {} is a real recently-changed file, else a generic placeholder)
+"input.example.refactor" = "Try \"refactor {}\""
+"input.example.tests" = "Try \"add tests for {}\""
+"input.example.explain" = "Try \"explain what {} does\""
+"input.example.file_generic" = "<a recently changed file>"
 
 # Status
 "status.ready" = "Ready"

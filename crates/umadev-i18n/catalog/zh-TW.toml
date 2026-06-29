@@ -37,6 +37,11 @@
 "model.reasoning" = "思考強度 {}(底座設定,umadev 不覆寫)"
 "input.idle" = "問我任何事…（/help 查看指令）"
 "input.aborted" = "本輪已中止 —— 重新輸入需求再試"
+# I9 首次啟動的輪換範例提示（疊在 input.idle 之上，僅在閒置、空輸入、本次工作階段還沒送過訊息時顯示；{} 處替換為最近改過的真實檔案，否則用通用佔位）
+"input.example.refactor" = "試試 「重構 {}」"
+"input.example.tests" = "試試 「為 {} 補測試」"
+"input.example.explain" = "試試 「解釋 {} 的作用」"
+"input.example.file_generic" = "<一個最近改過的檔案>"
 
 # 狀態
 "status.ready" = "就緒"

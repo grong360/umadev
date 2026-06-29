@@ -37,6 +37,11 @@
 "model.reasoning" = "思考强度 {}(底座配置,umadev 不覆盖)"
 "input.idle" = "问我任何事…（/help 查看命令）"
 "input.aborted" = "本轮已中止 —— 重新输入需求再试"
+# I9 首次启动的轮换示例提示（叠在 input.idle 之上，仅在空闲、空输入、本次会话还没发过消息时显示；{} 处替换为最近改过的真实文件，否则用通用占位）
+"input.example.refactor" = "试试 “重构 {}”"
+"input.example.tests" = "试试 “给 {} 补测试”"
+"input.example.explain" = "试试 “解释 {} 的作用”"
+"input.example.file_generic" = "<一个最近改过的文件>"
 
 # 状态
 "status.ready" = "就绪"

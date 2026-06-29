@@ -598,6 +598,12 @@ mod tests {
             // Trust ledger: the one-time note shown when the user approves a
             // guarded confirmation and the action class is remembered.
             "trust.approval_remembered",
+            // I9: the first-run rotating example tip layered above the idle input
+            // placeholder (three templates + the generic-file fallback token).
+            "input.example.refactor",
+            "input.example.tests",
+            "input.example.explain",
+            "input.example.file_generic",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {
