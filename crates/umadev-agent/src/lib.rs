@@ -70,6 +70,7 @@ pub mod security;
 pub mod skills;
 pub mod state;
 pub mod tech_debt;
+pub mod test_integrity;
 pub mod trust;
 pub mod verify;
 
@@ -168,6 +169,9 @@ pub use skills::{
 pub use state::{
     list_snapshots, read_workflow_state, read_workflow_state_diagnostic, restore_snapshot,
     unfinished_plan_summary, write_workflow_state, ReadState, WorkflowState,
+};
+pub use test_integrity::{
+    check as check_test_integrity, snapshot as snapshot_test_surface, TestSnapshot,
 };
 pub use trust::{
     capability_class, capability_requires_confirmation, requires_confirmation, reversibility_class,

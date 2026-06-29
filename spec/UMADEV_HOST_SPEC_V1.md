@@ -197,6 +197,40 @@ This is an advisory clause and is **not** machine-verifiable at L2. At
 L3, the Quality Report (§6.3) **MUST** include a section indicating
 whether pre-research occurred.
 
+### 3.5 Test-integrity / anti-reward-hacking guard (`UD-QA-001`)
+
+> Level: **MUST**
+
+A borrowed brain can make a failing test suite report "pass" without
+delivering working code by **gaming the tests** rather than fixing the
+implementation. A conformant host **MUST NOT** trust a step's passing test
+signal when, across that step's doer turn, the project's **test files** were
+weakened. The host **MUST** deterministically compare the test surface
+*before* and *after* the doer turn and treat any of the following as a
+blocking integrity violation:
+
+1. a test file or a test case (`it` / `test` / `def test_` / `#[test]` / …)
+   was **deleted**;
+2. the **assertion count** in a kept test dropped with no corresponding test
+   removed (assertions stripped out of a surviving test);
+3. a **skip / xfail / ignore / `.only` / focus** marker, or commented-out
+   test code, was newly introduced;
+4. a test now **asserts a hard-coded literal that matches the
+   implementation's own output** (best-effort), trivially forcing a green;
+5. the **test harness / runner config or the test command** (`jest.config.*`,
+   `pytest.ini`, `package.json` `scripts.test`, …) was **modified or deleted**
+   during the build step.
+
+The guard is part of the **deterministic floor** (not an advisory critic): a
+violation is folded into the step's acceptance as a blocking finding with a
+typed, file-naming directive, driving a **bounded** rework round under the
+host's existing fix-round / stall counters — never an open-ended loop. It is
+**fail-open**: when integrity cannot be determined (no baseline snapshot, an
+unreadable tree, an unparseable file) the guard yields **no** finding rather
+than a spurious block, and **adding** new tests is never a violation — only
+the destruction or weakening of pre-existing test signal is. A
+genuinely-passing, un-gamed suite is unaffected.
+
 ## 4. Layer 2 — Flow contract
 
 This layer governs **the order, gates, and continuity** of the

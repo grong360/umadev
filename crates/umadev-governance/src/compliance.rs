@@ -69,6 +69,14 @@ pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
             iso27001_annex_a: s(&["A.5.37"]),
             eu_ai_act_article: s(&["Article 13"]),
         },
+        // Test-integrity guard: anti-reward-hacking enforcement over the test
+        // signal — change-management + monitoring controls; ISO secure-coding +
+        // security-testing in development/acceptance; EU AI Act accuracy/robustness.
+        "UD-QA-001" => ComplianceFrameworks {
+            soc2_cc: s(&["CC4.1", "CC8.1"]),
+            iso27001_annex_a: s(&["A.8.28", "A.8.29"]),
+            eu_ai_act_article: s(&["Article 15"]),
+        },
         // Layer 2 — flow contract
         "UD-FLOW-001" => ComplianceFrameworks {
             soc2_cc: s(&["CC8.1"]),

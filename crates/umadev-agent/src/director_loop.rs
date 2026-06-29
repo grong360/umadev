@@ -1331,6 +1331,17 @@ async fn drive_build_step(
         instruction.push_str(pitfalls.trim());
     }
 
+    // TEST-INTEGRITY BASELINE (UD-QA-001). Snapshot the project's TEST surface
+    // BEFORE this step's doer turn(s) so the deterministic floor can detect
+    // test-gaming across the step — a deleted test, removed test case, stripped
+    // assertion, new skip/xfail/ignore marker, a hard-coded impl-output literal,
+    // or a weakened test harness/command. Captured once at entry (the pre-step
+    // state), so a deletion in round 0 that a later round restores clears itself.
+    // Fail-open: a tree that can't be read yields an empty baseline (additions are
+    // never flagged), and the whole guard is bounded by the SAME `max_fix_rounds`
+    // as every other step finding — never an open grind.
+    let test_baseline = crate::test_integrity::snapshot(&options.project_root);
+
     let mut drove = false;
     let mut last_reply = String::new();
     for round in 0..=max_fix_rounds {
@@ -1379,7 +1390,24 @@ async fn drive_build_step(
         // summon's governed pump). Fail-open: capture never affects the schedule.
         capture_turn_pitfalls(options, events, &summoned.pitfalls);
         // Verify against THIS step's acceptance on the deterministic floor.
-        let verdict = verify_step_acceptance(session, options, events, route, step).await;
+        let mut verdict = verify_step_acceptance(session, options, events, route, step).await;
+        // TEST-INTEGRITY FLOOR (UD-QA-001). Compare the test surface to the
+        // pre-step baseline. If the doer gamed the tests to fake a pass (deleted a
+        // test, stripped assertions, added a skip/xfail/ignore marker, baked the
+        // impl's output into an assertion, or weakened the harness/test command),
+        // the step's passing test signal is NOT trusted: fold the typed,
+        // file-naming findings into the verdict as blocking evidence so the SAME
+        // bounded re-drive that handles any failing acceptance fixes the cause.
+        // Deterministic + part of the floor (not an advisory critic); fail-open
+        // (no baseline / unreadable tree → no findings); bounded by `max_fix_rounds`.
+        let integrity = crate::test_integrity::check(&options.project_root, Some(&test_baseline));
+        if !integrity.is_empty() {
+            verdict.accepted = false;
+            for finding in &integrity {
+                events.emit(EngineEvent::Note(format!("floor · {finding}")));
+            }
+            verdict.evidence.extend(integrity);
+        }
         // MEDIUM #3 — a dead/hung summon turn that never actually ran (`!drove`) must
         // not "complete" a Build step on a NEUTRAL-SKIP acceptance (an unavailable
         // check / a TurnSettled free pass). Require REAL evidence: either the doer
@@ -5967,6 +5995,160 @@ mod tests {
         assert!(
             !outcome.made_progress,
             "a dead turn over a neutral skip is not real progress"
+        );
+    }
+
+    /// A doer session that GAMES the tests on every turn: it deletes a pre-existing
+    /// test file while leaving the real impl source in place (so the source-present
+    /// floor still passes). The ONLY thing that can fail the step is the
+    /// test-integrity guard — exactly what we want to prove. Records the directives
+    /// it received so the test can assert the guard's evidence was folded back in.
+    struct GamingSession {
+        root: std::path::PathBuf,
+        test_rel: String,
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+        current: std::collections::VecDeque<SessionEvent>,
+    }
+    impl GamingSession {
+        fn new(root: &std::path::Path, test_rel: &str) -> Self {
+            Self {
+                root: root.to_path_buf(),
+                test_rel: test_rel.to_string(),
+                sent: Arc::new(std::sync::Mutex::new(Vec::new())),
+                current: std::collections::VecDeque::new(),
+            }
+        }
+        fn sent_handle(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
+            Arc::clone(&self.sent)
+        }
+    }
+    #[async_trait::async_trait]
+    impl BaseSession for GamingSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("test".into()))
+        }
+        async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
+            self.sent.lock().unwrap().push(directive);
+            // Game the tests: delete the pre-existing test file (idempotent — once
+            // gone, the violation persists every round, so the step never clears).
+            let _ = std::fs::remove_file(self.root.join(&self.test_rel));
+            self.current = [
+                SessionEvent::TextDelta("Build done, all green.".into()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ]
+            .into_iter()
+            .collect();
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            self.current.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_integrity_guard_blocks_a_gaming_step_and_is_bounded() {
+        // UD-QA-001: a Build step whose doer DELETES a pre-existing test to fake a
+        // pass must NOT be accepted, even though real impl source is on disk (so the
+        // source-present floor passes). The guard flips the otherwise-passing verdict
+        // to blocked, folds a file-naming finding into the re-drive directive, and is
+        // bounded by the SAME fix-round counter — never an open grind.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // app.ts (impl) → source-present floor passes
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/app.test.ts"),
+            "it('adds', () => { expect(add(1,2)).toEqual(3); });\n",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        let mut sess = GamingSession::new(tmp.path(), "src/app.test.ts");
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        // The step's declared acceptance is SourcePresent — which WOULD pass over the
+        // remaining impl source; only the integrity guard can block it.
+        let step = one_failing_build_plan().steps.into_iter().next().unwrap();
+
+        let outcome = drive_build_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            0, // leaf step → base fix budget (MAX_STEP_FIX_ROUNDS), no rigor bonus
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+
+        assert!(
+            !outcome.accepted,
+            "a step that games tests must NOT be accepted even with impl source present"
+        );
+        // Bounded: round 0 + MAX_STEP_FIX_ROUNDS re-drives = 3 turns, never infinite.
+        let directives = sent.lock().unwrap().clone();
+        assert_eq!(
+            directives.len(),
+            MAX_STEP_FIX_ROUNDS + 1,
+            "the integrity-driven rework is bounded by the fix-round counter: {directives:?}"
+        );
+        // The re-drive directive carries the typed, file-naming evidence.
+        assert!(
+            directives[1].contains("test-integrity") && directives[1].contains("app.test.ts"),
+            "the fix directive names the gamed file: {:?}",
+            directives[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_integrity_guard_leaves_an_ungamed_step_alone() {
+        // The complement: a Build step whose doer leaves the tests intact (FakeSession
+        // never touches the fs) must pass cleanly — the guard is silent on an un-gamed
+        // suite, so a genuine build is unaffected.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/app.test.ts"),
+            "it('adds', () => { expect(add(1,2)).toEqual(3); });\n",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![text_turn("Implemented it. Done.")], false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let step = one_failing_build_plan().steps.into_iter().next().unwrap();
+
+        let outcome = drive_build_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            0,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(
+            outcome.accepted,
+            "an un-gamed build (tests left intact) must pass — the guard is silent"
         );
     }
 

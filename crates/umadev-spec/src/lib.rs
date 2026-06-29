@@ -216,6 +216,18 @@ pub const CLAUSES: &[Clause] = &[
         level: ClauseLevel::Should,
         section: "3.4",
     },
+    // Test-integrity guard: a code-weight constraint over the TEST code the team
+    // writes. Namespaced `UD-QA-*` (the `UD-CODE-005` slot is reserved for the §10
+    // accessibility candidate), but classified in the Code layer with its siblings
+    // because it is the same shape — a deterministic, fail-open floor over the
+    // delivered code that folds a violation into a blocking rework finding.
+    Clause {
+        id: "UD-QA-001",
+        layer: Layer::Code,
+        title: "Test-integrity / anti-reward-hacking guard",
+        level: ClauseLevel::Must,
+        section: "3.5",
+    },
     // --- Layer 2 — flow contract (UD-FLOW-*) ---
     Clause {
         id: "UD-FLOW-001",
