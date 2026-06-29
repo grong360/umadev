@@ -36,7 +36,8 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use umadev_governance::{
     check_client_secret_leak, check_dangerous_bash, check_hardcoded_secret,
-    check_plaintext_password, check_sensitive_path, Decision, ProjectContext,
+    check_plaintext_password, check_sensitive_path, record_tool_call, Decision, ProjectContext,
+    ToolCallRecord,
 };
 
 /// The env var UmaDev sets on a base subprocess when (and only when) it is
@@ -346,6 +347,95 @@ fn run_pre_bash_scoped(stdin: &str, driving: bool) -> Decision {
     }
     check_dangerous_bash(command)
 }
+/// Read a PostToolUse payload from stdin and AUDIT the tool call the base just
+/// executed to the tool-call JSONL — `UD-EVID-002`, the evidence half of the
+/// Layer-3 governance contract ("PostToolUse hooks audit results"). This is the
+/// post-write counterpart to the PreToolUse guards: by the time PostToolUse
+/// fires the tool has ALREADY run, so there is nothing to gate — the hook's only
+/// job is to leave the audit trail. It therefore NEVER blocks and NEVER prints a
+/// permission decision; it records and exits clean.
+///
+/// Returns the written [`ToolCallRecord`] for testing, or `None` when nothing was
+/// recorded. Fail-open by contract: not-driving, an unparseable payload, or an
+/// empty tool name all yield `None` with no error and no side effect (PostToolUse
+/// must never block or error the base).
+///
+/// **Base scoping.** Only **claude-code** exposes a tool-lifecycle hook surface
+/// (`hooks.PostToolUse`). Codex and opencode have NO such hook — UmaDev does not
+/// invent one for them. For those bases the SAME audit record is written by
+/// UmaDev's own runner as it streams the base's tool-use events
+/// (`umadev_agent::continuous::govern_tool_call` and
+/// `director_loop::record_tool_call_audit`), so the trail is never empty; this
+/// hook is the claude-code path that the runner-side write complements.
+pub fn run_post_tool(stdin: &str, project_root: &Path) -> Option<ToolCallRecord> {
+    run_post_tool_scoped(stdin, project_root, govern_root().is_some())
+}
+
+/// The PostToolUse audit core with the "UmaDev is driving" decision passed
+/// EXPLICITLY (instead of read from the process env), so it is testable without
+/// mutating the process-global `UMADEV_GOVERN_ROOT`. `driving` is `false` when
+/// [`GOVERN_ROOT_ENV`] is unset → record NOTHING: the user is driving the base
+/// directly and UmaDev does not audit the user's other tools — the same
+/// self-limit the PreToolUse hooks apply.
+fn run_post_tool_scoped(stdin: &str, project_root: &Path, driving: bool) -> Option<ToolCallRecord> {
+    // Self-limit: only audit when UmaDev is itself driving this run/session.
+    if !driving {
+        return None;
+    }
+    // Fail-open: an unparseable payload records nothing (and never blocks — a
+    // PostToolUse hook that exits 0 with no output simply lets the base proceed).
+    let payload: PostToolUsePayload = serde_json::from_str(stdin).ok()?;
+    let tool = payload.tool_name.trim();
+    if tool.is_empty() {
+        return None;
+    }
+    // The audited target: the file written / the command run. Fall back through
+    // the same field names the PreToolUse parsing understands.
+    let target = payload
+        .tool_input
+        .file_path
+        .as_deref()
+        .or(payload.tool_input.command.as_deref())
+        .or(payload.tool_input.cmd.as_deref())
+        .or(payload.tool_input.script.as_deref())
+        .unwrap_or("");
+    // A pure AUDIT record: the decision is always `audit` (the tool already ran,
+    // nothing was gated); the reason carries the ok/failed outcome read off the
+    // tool response. No firing clause — this is evidence, not enforcement.
+    let reason = post_tool_outcome(&payload.tool_response);
+    record_tool_call(
+        project_root,
+        tool,
+        target,
+        "audit",
+        "",
+        reason,
+        &payload.session_id,
+        None,
+    )
+}
+
+/// Best-effort outcome string for a PostToolUse `tool_response`. claude-code's
+/// response shape varies by tool (an object with `success: bool` for Write/Edit,
+/// `{ stdout, stderr, interrupted }` for Bash, or a bare string), so this only
+/// reports a definite failure when the response explicitly says so; everything
+/// else (success, a string, an absent response) reads as `ok`. Never errors.
+fn post_tool_outcome(resp: &serde_json::Value) -> &'static str {
+    if resp.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+        return "failed";
+    }
+    if resp.get("interrupted").and_then(serde_json::Value::as_bool) == Some(true) {
+        return "failed";
+    }
+    let has_error = resp
+        .get("error")
+        .is_some_and(|e| !e.is_null() && e.as_str() != Some(""));
+    if has_error {
+        return "failed";
+    }
+    "ok"
+}
+
 pub fn print_decision(decision: &Decision) {
     let result = if decision.block {
         serde_json::json!({
@@ -373,6 +463,34 @@ struct PreToolUsePayload {
     tool_name: String,
     #[serde(default)]
     tool_input: ToolInput,
+}
+
+/// Claude Code PostToolUse stdin payload. It extends the PreToolUse shape with
+/// `tool_response` (the result of the tool that just ran) and the top-level
+/// `session_id` claude passes on every hook event. Every field defaults so a
+/// missing / reshaped field never fails the parse (fail-open: the audit hook
+/// must never error the base).
+///
+/// ## Claude Code PostToolUse payload shape (simplified)
+/// ```json
+/// {
+///   "session_id": "abc123",
+///   "hook_event_name": "PostToolUse",
+///   "tool_name": "Write",
+///   "tool_input": { "file_path": "src/App.tsx", "content": "…" },
+///   "tool_response": { "filePath": "src/App.tsx", "success": true }
+/// }
+/// ```
+#[derive(Debug, Deserialize)]
+struct PostToolUsePayload {
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    tool_input: ToolInput,
+    #[serde(default)]
+    tool_response: serde_json::Value,
+    #[serde(default)]
+    session_id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -446,6 +564,10 @@ pub fn install_claude_hook(
         |p| p.to_string_lossy().to_string(),
     );
     let bash_hook_cmd = format!("{bin} hook pre-bash");
+    // The PostToolUse AUDIT hook (UD-EVID-002, spec §7.3 `tool-audit`). Records
+    // every executed tool call to the audit JSONL — it NEVER blocks (the tool
+    // has already run by the time PostToolUse fires).
+    let post_hook_cmd = format!("{bin} hook tool-audit");
 
     // Load existing settings (or start fresh) so we don't clobber user config.
     let mut settings: serde_json::Value = std::fs::read_to_string(&settings_path)
@@ -488,7 +610,9 @@ pub fn install_claude_hook(
     // settings so Claude Code execs a nonexistent binary on every write.
     let is_ours = |c: &str| {
         let c = c.trim_end();
-        c.ends_with("hook pre-write") || c.ends_with("hook pre-bash")
+        c.ends_with("hook pre-write")
+            || c.ends_with("hook pre-bash")
+            || c.ends_with("hook tool-audit")
     };
     matchers.retain(|m| {
         m.get("hooks").and_then(|h| h.as_array()).is_none_or(|arr| {
@@ -509,6 +633,35 @@ pub fn install_claude_hook(
     matchers.push(serde_json::json!({
         "matcher": "Bash",
         "hooks": [{"type": "command", "command": bash_hook_cmd}]
+    }));
+    // The PreToolUse `matchers` borrow ends here; reborrow `hooks_obj` for the
+    // PostToolUse AUDIT hook (Layer-3 governance: "PostToolUse hooks audit
+    // results"). It records every executed Write/Edit/MultiEdit/Bash to the
+    // tool-call JSONL — it is a pure evidence write, it NEVER blocks. Same
+    // self-healing install as PreToolUse: purge any stale UmaDev entry (matched
+    // by command suffix, so an upgraded binary path is replaced not duplicated)
+    // then add the current-binary hook, so a re-install / upgrade stays idempotent.
+    let post_use = hooks_obj
+        .entry("PostToolUse")
+        .or_insert_with(|| serde_json::json!([]));
+    if !post_use.is_array() {
+        *post_use = serde_json::json!([]);
+    }
+    let Some(post_matchers) = post_use.as_array_mut() else {
+        return Ok(Some(settings_path));
+    };
+    post_matchers.retain(|m| {
+        m.get("hooks").and_then(|h| h.as_array()).is_none_or(|arr| {
+            !arr.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_ours)
+            })
+        })
+    });
+    post_matchers.push(serde_json::json!({
+        "matcher": "Write|Edit|MultiEdit|Bash",
+        "hooks": [{"type": "command", "command": post_hook_cmd}]
     }));
 
     let json = serde_json::to_string_pretty(&settings)?;
@@ -534,23 +687,29 @@ pub fn uninstall_claude_hook(project_root: &std::path::Path) -> std::io::Result<
     // now-dead hook with no CLI way to clean it up).
     let is_ours = |c: &str| {
         let c = c.trim_end();
-        c.ends_with("hook pre-write") || c.ends_with("hook pre-bash")
+        c.ends_with("hook pre-write")
+            || c.ends_with("hook pre-bash")
+            || c.ends_with("hook tool-audit")
     };
 
-    if let Some(matchers) = settings
-        .get_mut("hooks")
-        .and_then(|h| h.get_mut("PreToolUse"))
-        .and_then(|p| p.as_array_mut())
-    {
-        matchers.retain(|m| {
-            m.get("hooks").and_then(|h| h.as_array()).is_none_or(|arr| {
-                !arr.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(is_ours)
+    // Strip our entries from BOTH lifecycle phases: the PreToolUse guards and the
+    // PostToolUse audit hook. A retain that leaves a user's own hooks untouched.
+    for phase in ["PreToolUse", "PostToolUse"] {
+        if let Some(matchers) = settings
+            .get_mut("hooks")
+            .and_then(|h| h.get_mut(phase))
+            .and_then(|p| p.as_array_mut())
+        {
+            matchers.retain(|m| {
+                m.get("hooks").and_then(|h| h.as_array()).is_none_or(|arr| {
+                    !arr.iter().any(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(is_ours)
+                    })
                 })
-            })
-        });
+            });
+        }
     }
     let json = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, json + "\n")?;
@@ -584,6 +743,12 @@ mod tests {
     /// Run the bash hook AS IF UmaDev is driving a run (scope present).
     fn pre_bash(payload: &str) -> Decision {
         run_pre_bash_scoped(payload, true)
+    }
+
+    /// Run the PostToolUse audit hook AS IF UmaDev is driving a run rooted at
+    /// `root` (scope present) — the production gate is the same `driving` flag.
+    fn post_tool_in(payload: &str, root: &Path) -> Option<ToolCallRecord> {
+        run_post_tool_scoped(payload, root, true)
     }
 
     // --- self-limiting: UmaDev only governs ITS OWN runs ------------------
@@ -713,12 +878,17 @@ mod tests {
         assert!(settings.contains("hook pre-write"));
         // The Bash guard is registered alongside the write guard.
         assert!(settings.contains("hook pre-bash"));
+        // The PostToolUse audit hook is registered alongside the PreToolUse
+        // guards — and is idempotent: exactly ONE entry after a double install.
+        assert!(settings.contains("\"PostToolUse\""));
+        assert_eq!(settings.matches("hook tool-audit").count(), 1);
         // Uninstall twice — second should be a no-op.
         uninstall_claude_hook(tmp.path()).unwrap();
         uninstall_claude_hook(tmp.path()).unwrap();
         let settings2 = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
         assert!(!settings2.contains("hook pre-write"));
         assert!(!settings2.contains("hook pre-bash"));
+        assert!(!settings2.contains("hook tool-audit"));
     }
 
     #[test]
@@ -726,7 +896,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
-        // settings.json left by a PRIOR binary path (an upgrade) + the user's hook.
+        // settings.json left by a PRIOR binary path (an upgrade) + the user's
+        // hooks in BOTH lifecycle phases.
         std::fs::write(
             claude.join("settings.json"),
             concat!(
@@ -734,6 +905,9 @@ mod tests {
                 "{\"matcher\":\"Write\",\"hooks\":[{\"type\":\"command\",\"command\":\"/old/p/umadev hook pre-write\"}]},",
                 "{\"matcher\":\"Bash\",\"hooks\":[{\"type\":\"command\",\"command\":\"/old/p/umadev hook pre-bash\"}]},",
                 "{\"matcher\":\"Write\",\"hooks\":[{\"type\":\"command\",\"command\":\"echo USERHOOK\"}]}",
+                "],\"PostToolUse\":[",
+                "{\"matcher\":\"Write\",\"hooks\":[{\"type\":\"command\",\"command\":\"/old/p/umadev hook tool-audit\"}]},",
+                "{\"matcher\":\"Edit\",\"hooks\":[{\"type\":\"command\",\"command\":\"echo USERPOST\"}]}",
                 "]},\"theme\":\"dark\"}"
             ),
         )
@@ -741,11 +915,12 @@ mod tests {
         install_claude_hook(tmp.path()).unwrap();
         let s = std::fs::read_to_string(claude.join("settings.json")).unwrap();
         // Stale /old/p hook purged (no dead-binary orphan); exactly one current
-        // pre-write + pre-bash; user's hook + config survive.
+        // pre-write + pre-bash + tool-audit; user's hooks + config survive.
         assert!(!s.contains("/old/p/umadev"), "stale hook must be purged");
         assert_eq!(s.matches("hook pre-write").count(), 1);
         assert_eq!(s.matches("hook pre-bash").count(), 1);
-        assert!(s.contains("USERHOOK") && s.contains("\"theme\""));
+        assert_eq!(s.matches("hook tool-audit").count(), 1);
+        assert!(s.contains("USERHOOK") && s.contains("USERPOST") && s.contains("\"theme\""));
     }
 
     #[test]
@@ -913,6 +1088,88 @@ mod tests {
         let payload = r#"{"tool_name":"exec","tool_input":{"cmd":"chmod 777 /tmp"}}"#;
         let d = pre_bash(payload);
         assert!(d.block);
+    }
+
+    // --- PostToolUse audit hook (UD-EVID-002 / Layer-3 "audit results") ----
+
+    #[test]
+    fn post_tool_audits_an_executed_write() {
+        // A PostToolUse Write payload (with claude's tool_response + session_id)
+        // produces an AUDIT record (decision=`audit`, never a block) and lands a
+        // line in tool-calls.jsonl under the run root.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let payload = concat!(
+            r#"{"hook_event_name":"PostToolUse","session_id":"sess-99",""#,
+            r#"tool_name":"Write","tool_input":{"file_path":"src/App.tsx","content":"export const x = 1"},"#,
+            r#""tool_response":{"filePath":"src/App.tsx","success":true}}"#
+        );
+        let rec = post_tool_in(payload, root).expect("a record is written");
+        assert_eq!(rec.tool, "Write");
+        assert_eq!(rec.file, "src/App.tsx");
+        assert_eq!(rec.decision, "audit", "PostToolUse records, never gates");
+        assert_eq!(rec.reason, "ok");
+        assert_eq!(rec.session_id, "sess-99");
+        assert!(rec.clause.is_empty(), "an audit record fires no clause");
+        let log = root.join(".umadev/audit/tool-calls.jsonl");
+        let body = std::fs::read_to_string(&log).unwrap();
+        assert!(body.contains("src/App.tsx") && body.contains("\"audit\""));
+    }
+
+    #[test]
+    fn post_tool_audits_a_bash_command() {
+        // A Bash PostToolUse call records the COMMAND as the target (file_path is
+        // absent, so it falls back to `command`).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = concat!(
+            r#"{"tool_name":"Bash","tool_input":{"command":"npm run build"},"#,
+            r#""tool_response":{"stdout":"ok","interrupted":false}}"#
+        );
+        let rec = post_tool_in(payload, tmp.path()).unwrap();
+        assert_eq!(rec.tool, "Bash");
+        assert_eq!(rec.file, "npm run build");
+        assert_eq!(rec.reason, "ok");
+    }
+
+    #[test]
+    fn post_tool_marks_a_failed_outcome() {
+        // A tool_response that explicitly reports failure is audited as `failed`,
+        // but it is STILL only an audit record — never a block.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = concat!(
+            r#"{"tool_name":"Bash","tool_input":{"command":"false"},"#,
+            r#""tool_response":{"interrupted":true,"stderr":"boom"}}"#
+        );
+        let rec = post_tool_in(payload, tmp.path()).unwrap();
+        assert_eq!(rec.decision, "audit");
+        assert_eq!(rec.reason, "failed");
+    }
+
+    #[test]
+    fn post_tool_records_nothing_when_not_driving() {
+        // Not driving (env unset) → the user is driving the base directly; UmaDev
+        // does NOT audit the user's other tools. No record, no file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"x.ts"},"tool_response":{"success":true}}"#;
+        assert!(run_post_tool_scoped(payload, tmp.path(), false).is_none());
+        assert!(!tmp.path().join(".umadev").exists());
+        // The public entry reads the (unset, in this test process) env → also None.
+        assert!(run_post_tool(payload, tmp.path()).is_none());
+    }
+
+    #[test]
+    fn post_tool_fails_open_on_garbage() {
+        // Malformed payload → no record, no panic, no block (fail-open).
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(post_tool_in("not json at all", tmp.path()).is_none());
+    }
+
+    #[test]
+    fn post_tool_skips_empty_tool_name() {
+        // A payload with no tool name is nothing to audit.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = r#"{"tool_input":{"file_path":"x.ts"},"tool_response":{}}"#;
+        assert!(post_tool_in(payload, tmp.path()).is_none());
     }
 
     // --- project-context-aware pre-write hook (#13 wired into the real-time

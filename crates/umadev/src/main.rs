@@ -568,8 +568,11 @@ enum Command {
     /// hook registered by `umadev install`.
     #[command(hide = true)]
     Hook {
-        /// Which governance check to run: `pre-write` (all code rules) or
-        /// `check-emoji` / `check-color` / `check-slop` (individual).
+        /// Which governance check to run: `pre-write` (all code rules) /
+        /// `pre-bash` (dangerous-command guard) / `check-emoji` / `check-color`
+        /// / `check-slop` for the PreToolUse guards, or `tool-audit` for the
+        /// PostToolUse audit (UD-EVID-002 — records the executed call, never
+        /// blocks).
         check: String,
     },
     /// Install the UmaDev pre-write governance hook into a base CLI.
@@ -941,6 +944,21 @@ fn cmd_hook(check: String) -> Result<()> {
     // Load the per-project policy from .umadev/rules.toml (fail-open default).
     let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
+    // ── PostToolUse AUDIT path (UD-EVID-002 / Layer-3 "PostToolUse hooks audit
+    // results", spec §7.3 `tool-audit`) ──────────────────────────────────────
+    // By the time PostToolUse fires the tool has ALREADY run, so there is nothing
+    // to gate — we only record the executed call to the audit trail, then exit 0.
+    // claude-code ignores a PostToolUse hook's stdout for permission purposes, so
+    // a clean exit with no JSON simply lets the base proceed. Fail-open: the whole
+    // record is wrapped in `catch_unwind` so even a panic in the recorder can
+    // never block or error the base. (`post-tool` is accepted as a friendly alias.)
+    if check == "tool-audit" || check == "post-tool" {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook::run_post_tool(&stdin, &project_root);
+        }));
+        return Ok(());
+    }
+
     // ── P0-1: fail-open is a HARD CONTRACT, not a hope ────────────────────
     // The whole rule book (≈110 `check_*` content scanners) runs on arbitrary
     // base-authored content INSIDE this hook subprocess. If ANY rule panics on
@@ -1023,7 +1041,7 @@ fn compute_hook_decision(
             // decision — NOT exit non-zero with empty stdout, which a host may
             // treat as a hard block. Warn on stderr for diagnosability.
             eprintln!(
-                "umadev: unknown hook check `{check}` — passing through (expected: pre-write, pre-bash)"
+                "umadev: unknown hook check `{check}` — passing through (expected: pre-write, pre-bash, tool-audit)"
             );
             umadev_governance::Decision::pass()
         }
@@ -1044,6 +1062,11 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("  • AI-slop / placeholders     (UD-CODE-002)");
                 println!(
                     "  • sensitive-path writes      (UD-SEC-001) — .git/.env/.ssh bypass-immune"
+                );
+                println!();
+                println!("A PostToolUse audit hook also records every executed Write/Edit/Bash");
+                println!(
+                    "to .umadev/audit/tool-calls.jsonl (UD-EVID-002 — audit only, never blocks)."
                 );
                 println!();
                 println!("To remove: umadev uninstall --host claude-code");
