@@ -70,6 +70,7 @@
 "trust.cap.write" = "编辑文件(受控)"
 "trust.cap.shell" = "执行 shell 命令(确认)"
 "trust.cap.network" = "网络访问(白名单)"
+"trust.approval_remembered" = "[trust] 已为本项目记住该批准 —— UmaDev 不会再次询问这一类操作。"
 "trust.branch_isolated" = "[trust] 已在隔离分支 `{}` 上工作(从 `{}` 派生)—— 你的分支原封不动;满意后由你自己审核并合并。UmaDev 绝不自动合并或推送。"
 "chat.build_detected" = "[build] 本轮开始写真实文件——切入构建:占用单写锁并隔离工作分支。需要完整的计划 + 团队 + 交付流程,请用 /run。"
 "trust.circuit_open" = "[trust] 已暂停:短时间内连续 {} 次失败 —— 有问题在反复出错。请查看日志,准备好后再重试(这个安全刹车避免运行在失败循环里空耗)。"
@@ -526,6 +527,10 @@
 "base.fail.exited" = "底座进程已退出(code {})"
 "base.fail.turn_failed" = "底座本轮失败(无更多信息)— 请重试,或换个底座"
 "base.fail.idle" = "底座 {}s 无输出且未在跑工具 — 疑似卡死,或已到运行预算上限。工具运行期间只要底座存活,UmaDev 会一直等待;非工具的空闲窗口可调高 UMADEV_IDLE_TIMEOUT_SECS,或重试 / 换底座"
+# 可见重试:底座遇到临时错误(429 / 过载 / 网络)会退避后带倒计时重试(绝不静默等待);
+# 非工具的静默卡死且底座仍存活时,放弃前会重新驱动一次该回合。"{}/{}" 是稳定的次数标记。
+"tui.retry.countdown" = "底座遇到临时错误 — {}s 后重试(第 {}/{} 次)"
+"tui.retry.silent_redrive" = "底座静默无输出 — 在放弃前重新驱动一次该回合"
 
 # 预览 dev server / 部署(后台任务,走进程级当前语言)
 "preview.dev_starting" = "[wait] dev server 启动中,等待端口就绪…"

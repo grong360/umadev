@@ -425,6 +425,88 @@ impl TaskStatus {
     pub fn is_active(self) -> bool {
         matches!(self, TaskStatus::Running)
     }
+
+    /// Stable, language-agnostic id used to PERSIST this status to
+    /// `.umadev/tasks.json` (distinct from [`label_key`](Self::label_key), which
+    /// is an i18n key for display). Storage ids must never localize.
+    #[must_use]
+    fn persist_id(self) -> &'static str {
+        match self {
+            TaskStatus::Running => "running",
+            TaskStatus::Done => "done",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Stopped => "stopped",
+        }
+    }
+
+    /// Inverse of [`persist_id`](Self::persist_id): parse a stored status id back
+    /// to a [`TaskStatus`], or `None` for an unrecognized value (fail-open — the
+    /// caller settles an unknown row to a safe terminal status).
+    #[must_use]
+    fn from_persist_id(s: &str) -> Option<Self> {
+        match s {
+            "running" => Some(TaskStatus::Running),
+            "done" => Some(TaskStatus::Done),
+            "failed" => Some(TaskStatus::Failed),
+            "stopped" => Some(TaskStatus::Stopped),
+            _ => None,
+        }
+    }
+}
+
+/// Serde DTO for persisting one [`BackgroundTask`] row to `.umadev/tasks.json`.
+/// Mirrors the in-memory task but stores `started_at` as a wall-clock unix stamp
+/// (an `Instant` isn't serializable across launches) and the status as its
+/// stable [`TaskStatus::persist_id`] string.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedTask {
+    /// Short display id (`t1`, `t2`, …).
+    id: String,
+    /// One-line requirement summary.
+    requirement: String,
+    /// Stable status id (`running` | `done` | `failed` | `stopped`).
+    status: String,
+    /// Unix seconds at registration (`0` if unknown). All `#[serde(default)]` so
+    /// a partially-written / older file still deserializes (fail-open).
+    #[serde(default)]
+    started_at_unix: u64,
+    /// Completed plan steps.
+    #[serde(default)]
+    done: usize,
+    /// Total plan steps.
+    #[serde(default)]
+    total: usize,
+}
+
+/// Serde DTO for the whole persisted task registry (`.umadev/tasks.json`): the
+/// `t<n>` id sequence plus the bounded list of recent task rows.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedTasks {
+    /// The last-minted `task_seq` so reloaded ids never collide with new ones.
+    #[serde(default)]
+    seq: u64,
+    /// Recent task rows, newest last (bounded by [`TASKS_CAP`]).
+    #[serde(default)]
+    tasks: Vec<PersistedTask>,
+}
+
+/// Current wall-clock time in unix seconds, `0` if the clock is before the epoch
+/// (never panics — fail-open).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Rebuild an [`std::time::Instant`] for a task registered at `started_at_unix`
+/// wall-clock seconds, offset back from now by the task's age so the elapsed
+/// readout stays roughly right after a relaunch. Fail-open: a future/garbage
+/// stamp (or a checked-sub underflow) collapses to "now" (elapsed 0).
+fn instant_from_age(started_at_unix: u64) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    let age = unix_now().saturating_sub(started_at_unix);
+    now.checked_sub(std::time::Duration::from_secs(age))
+        .unwrap_or(now)
 }
 
 /// One background run in the task registry — the manageable surface that turns a
@@ -443,6 +525,12 @@ pub struct BackgroundTask {
     pub status: TaskStatus,
     /// When the run was registered — for the live elapsed readout.
     pub started_at: std::time::Instant,
+    /// Wall-clock unix-seconds stamp of registration. An [`std::time::Instant`]
+    /// can't be serialized (no portable epoch), so this is what
+    /// [`App::persist_tasks`] writes; on reload [`App::load_tasks`] turns it back
+    /// into a `started_at` offset by the task's age. `0` when the clock is
+    /// unavailable (fail-open).
+    pub started_at_unix: u64,
     /// Completed plan steps (the `X` in `X/Y`); `0` until a plan posts.
     pub done: usize,
     /// Total plan steps (the `Y` in `X/Y`); `0` until a plan posts.
@@ -2240,6 +2328,9 @@ impl App {
             last_intent_class: None,
         };
         app.load_history();
+        // Reload the persisted background-task registry so recent / interrupted
+        // runs survive a relaunch (fail-open: missing/corrupt file → no-op).
+        app.load_tasks();
         if app.mode == AppMode::Chat {
             app.push_greeting();
             // Wave 5 / G11: reopen the most-recent saved chat so a restart keeps
@@ -2902,6 +2993,8 @@ impl App {
         if let Some(active) = self.active_task_mut() {
             if active.requirement.is_empty() && !summary.is_empty() {
                 active.requirement = summary;
+                // The filled-in summary is worth persisting so a relaunch keeps it.
+                self.persist_tasks();
             }
             return;
         }
@@ -2911,6 +3004,7 @@ impl App {
             requirement: summary,
             status: TaskStatus::Running,
             started_at: std::time::Instant::now(),
+            started_at_unix: unix_now(),
             done: 0,
             total: 0,
         });
@@ -2922,6 +3016,102 @@ impl App {
                 break;
             }
         }
+        // Persist so a relaunch surfaces this run (a `Running` row reloads as an
+        // interrupted task that can be resumed). Fail-open.
+        self.persist_tasks();
+    }
+
+    /// Path of the persisted task registry: `<root>/.umadev/tasks.json`.
+    fn tasks_path(&self) -> std::path::PathBuf {
+        self.project_root.join(".umadev").join("tasks.json")
+    }
+
+    /// Persist the task registry to `.umadev/tasks.json` so an interrupted /
+    /// recent run survives a relaunch. Atomic (write a PID-qualified temp, then
+    /// rename), bounded to [`TASKS_CAP`] rows, and fully **fail-open**: any IO /
+    /// serialization error is swallowed so the registry never blocks a run.
+    fn persist_tasks(&self) {
+        let path = self.tasks_path();
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        // Bounded: keep only the most-recent TASKS_CAP rows (the in-memory list
+        // is already capped, but guard regardless so a corrupt over-long list
+        // can't grow the file without bound).
+        let start = self.tasks.len().saturating_sub(TASKS_CAP);
+        let rows: Vec<PersistedTask> = self.tasks[start..]
+            .iter()
+            .map(|t| PersistedTask {
+                id: t.id.clone(),
+                requirement: t.requirement.clone(),
+                status: t.status.persist_id().to_string(),
+                started_at_unix: t.started_at_unix,
+                done: t.done,
+                total: t.total,
+            })
+            .collect();
+        let snapshot = PersistedTasks {
+            seq: self.task_seq,
+            tasks: rows,
+        };
+        let Ok(body) = serde_json::to_string_pretty(&snapshot) else {
+            return;
+        };
+        // PID-qualify the temp name so two umadev processes in the same workspace
+        // can't clobber each other's partial write before the rename.
+        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        if std::fs::write(&tmp, body).is_err() {
+            return;
+        }
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Reload the task registry from `.umadev/tasks.json` at launch so recent runs
+    /// survive a relaunch. A row that was still `Running` when the app last exited
+    /// is no longer live (the single-writer run-lock is gone), so it reloads as
+    /// [`TaskStatus::Stopped`] — an interrupted run, surfaced for resume (resume
+    /// itself is driven off the on-disk workflow state, not this row). Fully
+    /// **fail-open**: a missing / corrupt / empty file leaves the registry as-is.
+    fn load_tasks(&mut self) {
+        let Ok(body) = std::fs::read_to_string(self.tasks_path()) else {
+            return;
+        };
+        let Ok(snapshot) = serde_json::from_str::<PersistedTasks>(&body) else {
+            return;
+        };
+        let mut max_seq = self.task_seq.max(snapshot.seq);
+        let mut restored = Vec::new();
+        for p in snapshot.tasks.into_iter().take(TASKS_CAP) {
+            let status = match TaskStatus::from_persist_id(&p.status) {
+                // A previously-live run can't still be running after a relaunch.
+                Some(TaskStatus::Running) | None => TaskStatus::Stopped,
+                Some(s) => s,
+            };
+            // Keep ids monotonic so a freshly-minted `t<n>` never reuses an old id.
+            if let Some(n) = p.id.strip_prefix('t').and_then(|s| s.parse::<u64>().ok()) {
+                max_seq = max_seq.max(n);
+            }
+            restored.push(BackgroundTask {
+                id: p.id,
+                requirement: p.requirement,
+                status,
+                started_at: instant_from_age(p.started_at_unix),
+                started_at_unix: p.started_at_unix,
+                done: p.done,
+                total: p.total,
+            });
+        }
+        // Only adopt the restored rows if we parsed any — never wipe the current
+        // (usually empty at construction) in-memory list with nothing.
+        if !restored.is_empty() {
+            self.tasks = restored;
+        }
+        self.task_seq = max_seq;
     }
 
     /// Refresh the live task's `done/total` from the current plan checklist so
@@ -2946,6 +3136,9 @@ impl App {
     fn mark_active_task(&mut self, status: TaskStatus) {
         if let Some(active) = self.active_task_mut() {
             active.status = status;
+            // A terminal settle is worth persisting so a relaunch sees the run's
+            // real outcome (done/failed/stopped), not a stale `running`. Fail-open.
+            self.persist_tasks();
         }
     }
 
@@ -9829,6 +10022,15 @@ impl App {
             );
             return Action::None;
         }
+        // The user explicitly approved running this command — remember the
+        // approval for this project's trust ledger so the same reversible action
+        // class isn't re-asked. Fail-open + floor-safe: an irreversible (network)
+        // class records nothing, and the deploy preflight floor above uses an
+        // always-escalating `git push` probe regardless, so a deploy itself is
+        // never skipped by this ledger entry.
+        if confirmed {
+            self.record_action_approval(&cmd, "");
+        }
         self.push(
             ChatRole::UmaDev,
             umadev_i18n::tf(self.lang, "deploy.starting", &[&cmd]),
@@ -10108,6 +10310,35 @@ impl App {
     fn record_trust_revision(&mut self, gate_id: &str) {
         self.trust_ledger.record_revision(gate_id);
         self.trust_ledger.save(&self.project_root);
+    }
+
+    /// Record that the user **approved** a guarded confirmation for `command` /
+    /// `target`'s reversible action class, scoped to THIS project, so the same
+    /// class isn't re-asked. Persists to the per-project trust ledger
+    /// (`.umadev/trust.json`) via the ready
+    /// [`umadev_agent::trust::remember_project_approval`] API and mirrors the new
+    /// rule into the in-memory ledger so [`TrustLedger::remembers`] is true for
+    /// the rest of this session too (without a disk re-read).
+    ///
+    /// Fully **fail-open** and floor-safe: an irreversible-floor action (`.git`
+    /// internals / network / destructive verb) records nothing and returns
+    /// `false`, so the safety floor always re-confirms; any IO error is swallowed
+    /// so trust learning never blocks a run. Returns `true` when a NEW rule was
+    /// recorded, and surfaces a one-time localized note so the user knows the
+    /// approval was remembered.
+    fn record_action_approval(&mut self, command: &str, target: &str) -> bool {
+        let recorded =
+            umadev_agent::trust::remember_project_approval(&self.project_root, command, target);
+        // Keep the in-memory ledger in lockstep with disk (the disk helper does a
+        // fresh load+save; this avoids re-reading just to stay consistent).
+        self.trust_ledger.remember_approval(command, target);
+        if recorded {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "trust.approval_remembered").to_string(),
+            );
+        }
+        recorded
     }
 
     /// Toggle mouse capture. ON (default) lets the wheel page the history AND
@@ -13603,6 +13834,106 @@ mod tests {
             "the live run",
             "the live run is never evicted"
         );
+    }
+
+    // ---- Task-registry persistence (relaunch survival) -----------------------
+
+    fn cfg_offline() -> UserConfig {
+        UserConfig {
+            backend: Some("offline".to_string()),
+            lang: Some("zh-CN".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn task_registry_persists_and_reloads_across_a_relaunch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        // First session: one settled run + one still-running run.
+        {
+            let mut app = App::new(
+                "demo",
+                cfg_offline(),
+                root.join("config.toml"),
+                root.clone(),
+            );
+            app.register_run_task("first run");
+            app.mark_active_task(TaskStatus::Done);
+            app.register_run_task("second run"); // stays Running at exit
+            assert_eq!(app.tasks.len(), 2);
+        }
+        // Relaunch: a fresh App on the SAME root reloads the registry from disk.
+        let app2 = App::new(
+            "demo",
+            cfg_offline(),
+            root.join("config.toml"),
+            root.clone(),
+        );
+        assert_eq!(app2.tasks.len(), 2, "recent tasks survive a relaunch");
+        // Order preserved (newest last); the settled one kept its outcome.
+        assert_eq!(app2.tasks[0].requirement, "first run");
+        assert_eq!(app2.tasks[0].status, TaskStatus::Done);
+        // The interrupted run is surfaced as Stopped (no live writer after relaunch)
+        // — resumable, but not counted as an active run.
+        assert_eq!(app2.tasks[1].requirement, "second run");
+        assert_eq!(app2.tasks[1].status, TaskStatus::Stopped);
+        assert!(!app2.has_active_run());
+        // The id sequence advanced past the reloaded ids (no id reuse).
+        assert!(
+            app2.task_seq >= 2,
+            "task_seq carried forward across relaunch"
+        );
+    }
+
+    #[test]
+    fn task_registry_load_is_fail_open_with_no_file() {
+        // temp_app builds on a fresh tempdir with no tasks.json → empty, no panic.
+        let (app, _tmp) = temp_app();
+        assert!(app.tasks.is_empty());
+        assert_eq!(app.task_seq, 0);
+    }
+
+    #[test]
+    fn task_registry_load_is_fail_open_on_a_corrupt_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        std::fs::write(root.join(".umadev").join("tasks.json"), "not json {{{").unwrap();
+        // A corrupt registry is ignored (fail-open), never a crash.
+        let app = App::new(
+            "demo",
+            cfg_offline(),
+            root.join("config.toml"),
+            root.clone(),
+        );
+        assert!(app.tasks.is_empty());
+    }
+
+    // ---- Trust record-on-approval --------------------------------------------
+
+    #[test]
+    fn approving_a_reversible_action_records_to_the_trust_ledger() {
+        let (mut app, _tmp) = temp_app();
+        // A plain shell command is a reversible class → remembered.
+        let recorded = app.record_action_approval("npm run build", "");
+        assert!(recorded, "a reversible action class is remembered");
+        // Consultable in-memory for the rest of this session…
+        assert!(app.trust_ledger.remembers("npm run build", ""));
+        // …and persisted to disk so a later session / consult sees it too.
+        let on_disk = umadev_agent::TrustLedger::load(&app.project_root);
+        assert!(on_disk.remembers("npm run build", ""));
+    }
+
+    #[test]
+    fn approving_an_irreversible_action_is_floor_safe_and_records_nothing() {
+        let (mut app, _tmp) = temp_app();
+        // A network push is the irreversible floor — never remembered (always re-asked).
+        let recorded = app.record_action_approval("git push origin main", "");
+        assert!(!recorded);
+        assert!(!app.trust_ledger.remembers("git push origin main", ""));
+        assert!(!umadev_agent::TrustLedger::load(&app.project_root)
+            .remembers("git push origin main", ""));
     }
 
     #[test]

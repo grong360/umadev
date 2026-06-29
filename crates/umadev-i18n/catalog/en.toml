@@ -70,6 +70,7 @@
 "trust.cap.write" = "edit files (guarded)"
 "trust.cap.shell" = "run shell commands (confirm)"
 "trust.cap.network" = "network access (allowlist)"
+"trust.approval_remembered" = "[trust] Approval remembered for this project — UmaDev won't re-ask for this action class."
 "trust.branch_isolated" = "[trust] Working on an isolated branch `{}` (derived from `{}`) — your branch is untouched; review and merge it yourself when you're happy. UmaDev never auto-merges or pushes."
 "chat.build_detected" = "[build] This turn is writing real files — switching into a build: holding the single-writer lock and isolating the work. For the full plan + team + delivery flow, use /run."
 "trust.circuit_open" = "[trust] Paused: {} failures in quick succession — something is repeatedly going wrong. Review the log and retry when ready (this safety brake stops a run from burning effort in a failure loop)."
@@ -526,6 +527,11 @@
 "base.fail.exited" = "Base process exited (code {})"
 "base.fail.turn_failed" = "Base turn failed (no further detail) — retry, or switch base"
 "base.fail.idle" = "Base produced no output for {}s with no tool running — it looks hung, or the run budget was reached. While a tool is running UmaDev keeps waiting as long as the base stays alive; for the no-tool idle window raise UMADEV_IDLE_TIMEOUT_SECS, or retry or switch base"
+# Visible retry: a transient base hiccup (429 / overloaded / network) is backed off and
+# retried with a COUNTDOWN (never a silent wait); a non-tool silent hang on a live base
+# is re-driven ONCE before failing. The "{}/{}" attempt/max is a stable marker.
+"tui.retry.countdown" = "Base hit a transient error — retrying in {}s (attempt {}/{})"
+"tui.retry.silent_redrive" = "Base went silent with no output — re-driving the turn once before giving up"
 
 # Preview dev server / deploy (background tasks, use the process-wide language)
 "preview.dev_starting" = "[wait] dev server starting, waiting for the port to be ready…"

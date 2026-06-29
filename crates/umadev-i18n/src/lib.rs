@@ -307,6 +307,11 @@ mod tests {
             // runs UmaDev keeps waiting as long as the base is alive (liveness-based, no
             // fixed cap). Phrased for that reality, not a misleading auth/login hint.
             "base.fail.idle",
+            // Visible retry: a transient base hiccup (429 / overloaded / network) is
+            // backed off + retried with a COUNTDOWN Note (never a silent wait); a
+            // non-tool silent hang on a live base is re-driven ONCE before failing.
+            "tui.retry.countdown",
+            "tui.retry.silent_redrive",
             "route.resume_retry",
             "base.empty_reply",
             "route.failed",
@@ -580,6 +585,9 @@ mod tests {
             "team.status.done",
             "team.handoff.header",
             "team.handoff.entry",
+            // Trust ledger: the one-time note shown when the user approves a
+            // guarded confirmation and the action class is remembered.
+            "trust.approval_remembered",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

@@ -89,7 +89,9 @@ impl LaunchOptions {
 /// Launch the TUI. Blocks until the user quits.
 pub async fn run(opts: LaunchOptions) -> Result<()> {
     let config_path = config::default_path();
-    let cfg = config::load_from(&config_path);
+    // Run the once-per-upgrade config migration runner at startup (fail-soft):
+    // repairs config drift across releases, then persists the bumped version.
+    let cfg = config::load_and_migrate(&config_path);
     let mut app = App::new(
         opts.effective_slug(),
         cfg,
