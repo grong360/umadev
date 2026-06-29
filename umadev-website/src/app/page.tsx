@@ -1275,28 +1275,17 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
         {view === "changelog" && (
           <section className={styles.logPage}>
             <PageHero title={t.logPage.title} sub={t.logPage.sub} />
-            <div className={styles.releaseList}>
+            <ol className={styles.releaseTimeline}>
               {releases[lang].map((release) => (
-                <article key={release.ver}>
-                  <header>
-                    <div>
-                      <span>{release.ver}</span>
-                      <time>{release.date}</time>
-                      {"current" in release && release.current && <em>{t.logPage.current}</em>}
-                    </div>
-                    <h2>{release.title}</h2>
-                  </header>
-                  <ul>
-                    {release.changes.map(([tag, text]) => (
-                      <li key={`${tag}-${text}`}>
-                        <span className={tagClass(tag)}>{tag}</span>
-                        <p>{text}</p>
-                      </li>
-                    ))}
-                  </ul>
-                </article>
+                <ReleaseEntry
+                  key={release.ver}
+                  release={release}
+                  latestLabel={t.logPage.current}
+                  moreLabel={t.logPage.more}
+                  lessLabel={t.logPage.less}
+                />
               ))}
-            </div>
+            </ol>
           </section>
         )}
 
@@ -1440,22 +1429,108 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
   function navClass(active: boolean) {
     return active ? styles.navActive : styles.navButton;
   }
+}
 
-  function tagClass(tag: string) {
-    const map: Record<string, string> = {
-      新增: styles.tagAdded,
-      Added: styles.tagAdded,
-      改进: styles.tagImproved,
-      Improved: styles.tagImproved,
-      安全: styles.tagSecurity,
-      Security: styles.tagSecurity,
-      修复: styles.tagFixed,
-      Fixed: styles.tagFixed,
-      平台: styles.tagPlatform,
-      Platform: styles.tagPlatform,
-    };
-    return `${styles.releaseTag} ${map[tag] ?? styles.tagImproved}`;
-  }
+/** Map a localized change tag (zh / en) to its colored chip class. */
+function tagClass(tag: string) {
+  const map: Record<string, string> = {
+    新增: styles.tagAdded,
+    Added: styles.tagAdded,
+    改进: styles.tagImproved,
+    Improved: styles.tagImproved,
+    安全: styles.tagSecurity,
+    Security: styles.tagSecurity,
+    修复: styles.tagFixed,
+    Fixed: styles.tagFixed,
+    平台: styles.tagPlatform,
+    Platform: styles.tagPlatform,
+    变更: styles.tagChanged,
+    Changed: styles.tagChanged,
+  };
+  return `${styles.releaseTag} ${map[tag] ?? styles.tagImproved}`;
+}
+
+/** One changelog release. `current` marks the latest, highlighted entry. */
+type Release = {
+  ver: string;
+  date: string;
+  title: string;
+  current?: boolean;
+  changes: readonly (readonly [string, string])[];
+};
+
+/** How many changes a release shows before the "show more" toggle appears,
+ *  and how many stay visible while collapsed — keeps long entries scannable. */
+const RELEASE_PEEK = 5;
+const RELEASE_COLLAPSE_AT = 6;
+
+/** A single changelog entry: a timeline node (version + date + Latest pill) on
+ *  the rail, a short title and well-spaced, tagged changes on the right. Long
+ *  entries collapse behind a "show more" toggle so the page stays scannable. */
+function ReleaseEntry({
+  release,
+  latestLabel,
+  moreLabel,
+  lessLabel,
+}: {
+  release: Release;
+  latestLabel: string;
+  moreLabel: string;
+  lessLabel: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const isCurrent = release.current === true;
+  const collapsible = release.changes.length > RELEASE_COLLAPSE_AT;
+  const shown = !collapsible || expanded ? release.changes : release.changes.slice(0, RELEASE_PEEK);
+  const hiddenCount = release.changes.length - shown.length;
+
+  return (
+    <li className={`${styles.releaseEntry} ${isCurrent ? styles.releaseEntryCurrent : ""}`}>
+      <div className={styles.releaseMeta}>
+        <div className={styles.releaseVer}>{release.ver}</div>
+        <time className={styles.releaseDate}>{release.date}</time>
+        {isCurrent && <span className={styles.releaseLatest}>{latestLabel}</span>}
+      </div>
+      <div className={styles.releaseBody}>
+        <h2 className={styles.releaseTitle}>{release.title}</h2>
+        <ul className={styles.releaseChanges}>
+          {shown.map(([tag, text]) => (
+            <li key={`${tag}-${text}`} className={styles.releaseChange}>
+              <span className={tagClass(tag)}>{tag}</span>
+              <p>{text}</p>
+            </li>
+          ))}
+        </ul>
+        {collapsible && (
+          <button
+            type="button"
+            className={styles.releaseToggle}
+            onClick={() => setExpanded((v) => !v)}
+            aria-expanded={expanded}
+          >
+            {expanded ? lessLabel : moreLabel.replace("{n}", String(hiddenCount))}
+            <Chevron up={expanded} />
+          </button>
+        )}
+      </div>
+    </li>
+  );
+}
+
+/** Small chevron used by the show-more toggle (rotates when expanded). */
+function Chevron({ up }: { up: boolean }) {
+  return (
+    <svg
+      aria-hidden="true"
+      width="11"
+      height="11"
+      viewBox="0 0 16 16"
+      fill="none"
+      className={up ? styles.chevronUp : styles.chevronDown}
+    >
+      <path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
 }
 
 function SectionIntro({ eyebrow, title, desc }: { eyebrow: string; title: string; desc: string }) {

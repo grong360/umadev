@@ -1594,8 +1594,7 @@
   border-left-color: var(--cyan);
 }
 
-.docArticle,
-.releaseList article {
+.docArticle {
   min-width: 0;
   padding: 38px 42px;
   background: linear-gradient(170deg, rgba(12, 22, 30, 0.72), rgba(8, 13, 18, 0.62));
@@ -1615,8 +1614,7 @@
   border-top: 1px solid rgba(1, 203, 241, 0.12);
 }
 
-.docArticle h2,
-.releaseList h2 {
+.docArticle h2 {
   margin: 0 0 24px;
   font-family: var(--font-space), sans-serif;
   font-size: 32px;
@@ -1681,97 +1679,249 @@
 }
 
 .logPage {
-  padding-bottom: 90px;
+  padding-bottom: 110px;
 }
 
-.releaseList {
+/* Changelog — a clean, big-tech timeline. A version/date rail on the left,
+   a short title + well-spaced tagged changes on the right, one connector line
+   threading the entries with a node dot per release, the latest highlighted.
+   No per-entry card chrome: whitespace and hierarchy carry the page. */
+.releaseTimeline {
+  max-width: 940px;
+  padding: 0;
+  margin: 10px 0 0;
+  list-style: none;
+}
+
+.releaseEntry {
   display: grid;
-  gap: 22px;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 40px;
 }
 
-.releaseList article header div {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  align-items: center;
-  margin-bottom: 8px;
+/* Left rail: version, date, Latest pill — sticky so it stays in view while a
+   tall entry scrolls past on wider screens. */
+.releaseMeta {
+  align-self: start;
+  padding-top: 1px;
 }
 
-.releaseList header span {
+@media (min-width: 900px) {
+  .releaseMeta {
+    position: sticky;
+    top: 104px;
+  }
+}
+
+.releaseVer {
+  color: var(--text);
+  font-family: var(--font-mono), monospace;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+
+.releaseDate {
+  display: block;
+  margin-top: 7px;
+  color: var(--muted-2);
+  font-family: var(--font-mono), monospace;
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+}
+
+.releaseLatest {
+  display: inline-block;
+  margin-top: 13px;
+  padding: 3px 11px;
   color: var(--cyan);
   font-family: var(--font-mono), monospace;
-  font-weight: 900;
-}
-
-.releaseList time {
-  color: #61727f;
-  font-family: var(--font-mono), monospace;
-  font-size: 13px;
-}
-
-.releaseList em {
-  padding: 3px 9px;
-  color: var(--green);
   font-size: 10.5px;
-  font-style: normal;
-  font-weight: 900;
+  font-weight: 800;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
-  background: rgba(95, 201, 138, 0.14);
-  border: 1px solid rgba(95, 201, 138, 0.34);
-  border-radius: 6px;
+  background: rgba(0, 210, 255, 0.1);
+  border: 1px solid rgba(0, 210, 255, 0.34);
+  border-radius: 999px;
 }
 
-.releaseList ul {
+/* The connector line is the body's left border; inter-entry spacing lives in
+   the body's padding so the line stays continuous between entries. */
+.releaseBody {
+  position: relative;
+  min-width: 0;
+  padding: 0 0 56px 34px;
+  border-left: 1px solid rgba(1, 203, 241, 0.18);
+}
+
+.releaseEntry:last-child .releaseBody {
+  padding-bottom: 6px;
+}
+
+.releaseBody::before {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: -5px;
+  width: 9px;
+  height: 9px;
+  background: var(--bg);
+  border: 2px solid var(--muted-2);
+  border-radius: 50%;
+}
+
+.releaseEntryCurrent .releaseVer {
+  color: var(--cyan);
+}
+
+.releaseEntryCurrent .releaseBody {
+  border-left-color: rgba(0, 210, 255, 0.4);
+}
+
+.releaseEntryCurrent .releaseBody::before {
+  background: var(--cyan);
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 4px rgba(0, 210, 255, 0.14), 0 0 14px rgba(0, 210, 255, 0.55);
+}
+
+.releaseTitle {
+  max-width: 42ch;
+  margin: 0 0 22px;
+  color: var(--text);
+  font-family: var(--font-space), sans-serif;
+  font-size: clamp(19px, 1.6vw, 23px);
+  font-weight: 600;
+  line-height: 1.32;
+  letter-spacing: -0.01em;
+}
+
+.releaseChanges {
   display: grid;
-  gap: 12px;
+  gap: 18px;
   padding: 0;
   margin: 0;
   list-style: none;
 }
 
-.releaseList li {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
+.releaseChange {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
 }
 
-.releaseList li p {
+.releaseChange p {
+  max-width: 66ch;
   margin: 0;
-  color: #b4d0da;
-  line-height: 1.55;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1.72;
 }
 
 .releaseTag {
-  flex: none;
-  padding: 3px 9px;
-  font-size: 11px;
-  font-weight: 900;
+  justify-self: start;
+  padding: 2px 9px;
+  font-family: var(--font-mono), monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
   border-radius: 6px;
 }
 
 .tagAdded {
   color: var(--green);
-  background: rgba(95, 201, 138, 0.13);
+  background: rgba(95, 201, 138, 0.12);
   border: 1px solid rgba(95, 201, 138, 0.28);
 }
 
 .tagImproved {
   color: var(--cyan);
-  background: rgba(1, 203, 241, 0.12);
+  background: rgba(1, 203, 241, 0.1);
   border: 1px solid rgba(1, 203, 241, 0.26);
 }
 
 .tagSecurity {
   color: var(--gold);
-  background: rgba(229, 168, 75, 0.12);
+  background: rgba(229, 168, 75, 0.11);
   border: 1px solid rgba(229, 168, 75, 0.28);
 }
 
 .tagFixed,
 .tagPlatform {
   color: #6fb5d9;
-  background: rgba(111, 181, 217, 0.12);
+  background: rgba(111, 181, 217, 0.11);
   border: 1px solid rgba(111, 181, 217, 0.26);
+}
+
+.tagChanged {
+  color: var(--muted);
+  background: rgba(174, 191, 208, 0.08);
+  border: 1px solid rgba(174, 191, 208, 0.22);
+}
+
+.releaseToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 24px;
+  padding: 7px 15px;
+  color: var(--cyan);
+  font-family: var(--font-mono), monospace;
+  font-size: 12.5px;
+  font-weight: 700;
+  background: rgba(0, 210, 255, 0.06);
+  border: 1px solid rgba(1, 203, 241, 0.22);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+
+.releaseToggle:hover {
+  background: rgba(0, 210, 255, 0.12);
+  border-color: rgba(0, 210, 255, 0.42);
+  transform: translateY(-1px);
+}
+
+.chevronDown,
+.chevronUp {
+  transition: transform 0.2s ease;
+}
+
+.chevronUp {
+  transform: rotate(180deg);
+}
+
+@media (max-width: 860px) {
+  .releaseEntry {
+    grid-template-columns: 1fr;
+    gap: 13px;
+  }
+
+  .releaseMeta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 9px 13px;
+  }
+
+  .releaseDate,
+  .releaseLatest {
+    margin-top: 0;
+  }
+
+  .releaseBody {
+    padding-left: 20px;
+    padding-bottom: 44px;
+  }
+}
+
+@media (max-width: 520px) {
+  .releaseChange {
+    grid-template-columns: 1fr;
+    gap: 9px;
+  }
 }
 
 .footer {
@@ -1966,8 +2116,7 @@
     flex-direction: column;
   }
 
-  .docArticle,
-  .releaseList article {
+  .docArticle {
     padding: 26px 20px;
   }
 
@@ -2097,7 +2246,6 @@
 .govGrid article,
 .docsNav,
 .docArticle,
-.releaseList article,
 .cta {
   border-radius: 8px;
 }
@@ -2389,8 +2537,7 @@
 .stageDetail,
 .modePanel,
 .docsNav,
-.docArticle,
-.releaseList article {
+.docArticle {
   background: rgba(2, 8, 12, 0.72);
   border-color: rgba(1, 203, 241, 0.16);
   box-shadow: 0 20px 54px -44px rgba(0, 0, 0, 0.95);
