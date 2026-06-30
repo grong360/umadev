@@ -205,7 +205,32 @@ const DESTRUCTIVE_TOKENS: &[&str] = &[
 /// plain `rm file`, `mv a b` (overwrites `b`), or `unlink x` deletes/overwrites
 /// without a recursive flag, so it escalates to a confirmation rather than
 /// running silently under Auto.
-const BARE_DESTRUCTIVE_VERBS: &[&str] = &["rm", "mv", "unlink"];
+///
+/// The list is cross-platform: the Unix verbs are joined by the **Windows /
+/// PowerShell** destructive verbs so the irreversible floor is not Windows-blind
+/// (otherwise `del /f /s /q x`, `rd /s /q dir` (the `rmdir` alias), `format c:`,
+/// `erase x`, PowerShell `Remove-Item -Recurse -Force` / its alias `ri`, and
+/// `Clear-Disk` would execute under [`TrustMode::Auto`] WITHOUT the always-on
+/// confirmation the floor exists to force). Matched the same whole-token way, so
+/// a benign word that merely *contains* one of them (`deliver`/`format-source` ⊃
+/// `del`/`format`, a path segment `…/del/…`, `cargo build`, `npm ci`) is never
+/// mis-flagged. The lower-case forms suffice because [`reversibility_class`]
+/// lower-cases the command first — and Windows commands are case-insensitive, so
+/// `DEL`/`Remove-Item`/`RD` all fold onto these entries.
+const BARE_DESTRUCTIVE_VERBS: &[&str] = &[
+    // Unix.
+    "rm",
+    "mv",
+    "unlink",
+    // Windows / PowerShell (case-insensitive; the command is lower-cased first).
+    "del",
+    "erase",
+    "rd", // the `rmdir` alias (`rmdir` itself is a DESTRUCTIVE_TOKENS substring).
+    "format",
+    "remove-item",
+    "ri", // PowerShell `Remove-Item` alias.
+    "clear-disk",
+];
 
 /// Whether `verb` is invoked as a command (not merely a substring of an
 /// argument/word) anywhere in the already-lowercased `cmd`. A command position
@@ -1445,6 +1470,69 @@ mod tests {
         assert_eq!(
             reversibility_class("git rm tracked.ts", ""),
             Reversibility::VersionControl
+        );
+    }
+
+    #[test]
+    fn windows_destructive_verbs_escalate_but_not_lookalikes() {
+        // Cross-platform floor: the Windows / PowerShell destructive verbs must
+        // escalate on EVERY tier exactly like their Unix peers — otherwise the
+        // always-on irreversible floor is Windows-blind and these run silently
+        // under Auto. Matched at a command position, case-insensitively (Windows
+        // commands are case-insensitive; the classifier lower-cases first).
+        for cmd in [
+            "del /f /s /q x",
+            "DEL /F /S /Q x", // case-insensitive
+            "rd /s /q dir",   // the `rmdir` alias
+            "format c:",
+            "Remove-Item -Recurse -Force x",
+            "remove-item -recurse -force x",
+            "ri -Recurse build", // PowerShell `Remove-Item` alias
+            "erase x",
+            "Clear-Disk -Number 1",
+            "cd build && del /q *.obj", // after a shell separator
+        ] {
+            assert_eq!(
+                reversibility_class(cmd, ""),
+                Reversibility::Destructive,
+                "{cmd} must escalate as destructive"
+            );
+            assert!(
+                requires_confirmation(TrustMode::Auto, cmd, ""),
+                "{cmd} must confirm even in Auto"
+            );
+            assert!(requires_confirmation(TrustMode::Guarded, cmd, ""));
+            assert!(requires_confirmation(TrustMode::Plan, cmd, ""));
+        }
+        // Look-alikes that merely CONTAIN a Windows verb as a substring (not at a
+        // command position / not whole-token) must NOT be mis-classed as
+        // destructive — no new false-positive that wedges otherwise-reversible work.
+        for cmd in [
+            "deliver", // "deliver" ⊃ del, not a command-position del
+            "npm run deliver",
+            "format-output --json", // "format-output" ⊃ format
+            "format-source src/",
+            "cargo build",
+            "npm ci",
+            "node card-sorter.js", // "card" ⊃ rd at a non-command position
+        ] {
+            assert_ne!(
+                reversibility_class(cmd, ""),
+                Reversibility::Destructive,
+                "{cmd} must NOT be mis-classed as a Windows destructive verb"
+            );
+        }
+        // A path that merely contains 'del' is not a destructive command (the
+        // verb scan only looks at the command, and only at command positions).
+        assert_ne!(
+            reversibility_class("", "src/components/del/index.ts"),
+            Reversibility::Destructive,
+            "a path containing 'del' must not be destructive"
+        );
+        assert_ne!(
+            reversibility_class("cat src/model/del.rs", ""),
+            Reversibility::Destructive,
+            "reading a file under a 'del' path must not be destructive"
         );
     }
 
