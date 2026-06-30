@@ -307,8 +307,17 @@ fn set_terminal_title(backend: &str) {
 }
 
 /// Split a worker-recorded run command like `cd web && npm run dev` into
-/// (`working_dir`, `program`, `args`). Falls back to running the whole string via
-/// `sh -c` when it does not match the `cd X && ...` shape.
+/// (`working_dir`, `program`, `args`), ready to feed a raw
+/// `tokio::process::Command::new(program).args(args)`.
+///
+/// Windows-aware (mirrors `deploy.rs` / `verify.rs` / `runtime_proof.rs`): the
+/// `cd X && <prog> ...` shape routes the bare program through
+/// [`umadev_host::spawn_parts`], so a Windows npm/pnpm `.cmd` shim runs via
+/// `cmd /c <prog>.cmd ...` instead of failing `CreateProcess` with os error 193;
+/// the catch-all fallback shells out via `cmd /c` on Windows and `sh -c` on Unix
+/// (Windows has no `sh`). Without this the preview dev-server never booted on
+/// Windows — `npm run dev` spawned a non-existent `sh`, and `cd web && npm run
+/// dev` spawned a bare `npm` that `CreateProcess` can't find.
 fn parse_run_command(
     command: &str,
     project_root: &std::path::Path,
@@ -325,16 +334,26 @@ fn parse_run_command(
             let rest = rest.trim();
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
-                let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
-                return (resolved, prog.to_string(), args);
+                // Route the bare program through `spawn_parts` (resolves the real
+                // binary + routes a Windows `.cmd`/`.bat` shim through `cmd /c`),
+                // then append the original args after whatever lead it produced.
+                let (program, mut spawn_args) = umadev_host::spawn_parts(prog);
+                spawn_args.extend(args.iter().map(std::string::ToString::to_string));
+                return (resolved, program, spawn_args);
             }
         }
     }
-    // Fallback: shell out with `sh -c "<command>"` in the workspace root.
+    // Fallback: shell out via `cmd /c` (Windows) / `sh -c` (Unix) in the
+    // workspace root, so the whole multi-token command runs as written.
+    let (shell, shell_arg) = if cfg!(windows) {
+        ("cmd", "/c")
+    } else {
+        ("sh", "-c")
+    };
     (
         project_root.to_path_buf(),
-        "sh".to_string(),
-        vec!["-c".to_string(), command.to_string()],
+        shell.to_string(),
+        vec![shell_arg.to_string(), command.to_string()],
     )
 }
 
@@ -7100,8 +7119,13 @@ mod tests {
         let root = std::path::PathBuf::from("/proj");
         let (dir, prog, args) = parse_run_command("cd web && npm run dev", &root);
         assert_eq!(dir, std::path::PathBuf::from("/proj/web"));
-        assert_eq!(prog, "npm");
-        assert_eq!(args, vec!["run".to_string(), "dev".into()]);
+        // The program is routed through `spawn_parts` (resolves the real binary +
+        // `cmd /c`-routes a Windows `.cmd` shim), so assert against it directly
+        // rather than the bare name (which would be a full path where npm exists).
+        let (exp_prog, mut exp_args) = umadev_host::spawn_parts("npm");
+        exp_args.extend(["run".to_string(), "dev".into()]);
+        assert_eq!(prog, exp_prog);
+        assert_eq!(args, exp_args);
     }
 
     #[test]
@@ -7109,18 +7133,53 @@ mod tests {
         let root = std::path::PathBuf::from("/proj");
         let (dir, prog, args) = parse_run_command("cd /abs/app && pnpm dev", &root);
         assert_eq!(dir, std::path::PathBuf::from("/abs/app"));
-        assert_eq!(prog, "pnpm");
-        assert_eq!(args, vec!["dev".to_string()]);
+        let (exp_prog, mut exp_args) = umadev_host::spawn_parts("pnpm");
+        exp_args.extend(["dev".to_string()]);
+        assert_eq!(prog, exp_prog);
+        assert_eq!(args, exp_args);
     }
 
     #[test]
     fn parse_run_command_fallback_shells() {
         let root = std::path::PathBuf::from("/proj");
         let (dir, prog, args) = parse_run_command("npm run dev", &root);
-        // No `cd &&` prefix → fallback to sh -c in the workspace root.
+        // No `cd &&` prefix → fallback to the platform shell in the workspace root:
+        // `cmd /c` on Windows (which has no `sh`), `sh -c` elsewhere.
         assert_eq!(dir, root);
-        assert_eq!(prog, "sh");
-        assert_eq!(args, vec!["-c".to_string(), "npm run dev".into()]);
+        let (shell, shell_arg) = if cfg!(windows) {
+            ("cmd", "/c")
+        } else {
+            ("sh", "-c")
+        };
+        assert_eq!(prog, shell);
+        assert_eq!(args, vec![shell_arg.to_string(), "npm run dev".into()]);
+    }
+
+    #[test]
+    fn parse_run_command_picks_cmd_on_windows_sh_on_unix() {
+        // Regression (HIGH): the preview dev-server never booted on Windows because
+        // the fallback hardcoded `sh -c` (no `sh` on Windows) and the `cd` path
+        // spawned a bare `npm` (CreateProcess can't find `npm.cmd`). The fallback
+        // must pick `cmd /c` on Windows / `sh -c` on Unix...
+        let root = std::path::PathBuf::from("/proj");
+        let (_, prog, args) = parse_run_command("npm run dev", &root);
+        if cfg!(windows) {
+            assert_eq!(prog, "cmd");
+            assert_eq!(args.first().map(String::as_str), Some("/c"));
+        } else {
+            assert_eq!(prog, "sh");
+            assert_eq!(args.first().map(String::as_str), Some("-c"));
+        }
+        // ...and the `cd <dir> && <prog>` path must route the program through
+        // `spawn_parts` so a Windows `.cmd` shim runs via `cmd /c` (its lead prefix)
+        // instead of failing the spawn. `vite` is unlikely to be installed, so on
+        // every platform spawn_parts fail-opens to the bare name — but the contract
+        // (parse routes through spawn_parts) is still pinned.
+        let (_, prog2, args2) = parse_run_command("cd web && vite --host", &root);
+        let (exp_prog, mut exp_args) = umadev_host::spawn_parts("vite");
+        exp_args.extend(["--host".to_string()]);
+        assert_eq!(prog2, exp_prog);
+        assert_eq!(args2, exp_args);
     }
 
     /// Build a chat-mode App rooted at a fresh temp dir for the build-complete
@@ -7262,8 +7321,16 @@ mod tests {
         let root = std::path::PathBuf::from("/proj");
         let (dir, prog, args) = parse_run_command("npx vercel --prod", &root);
         assert_eq!(dir, root);
-        assert_eq!(prog, "sh");
-        assert_eq!(args, vec!["-c".to_string(), "npx vercel --prod".into()]);
+        let (shell, shell_arg) = if cfg!(windows) {
+            ("cmd", "/c")
+        } else {
+            ("sh", "-c")
+        };
+        assert_eq!(prog, shell);
+        assert_eq!(
+            args,
+            vec![shell_arg.to_string(), "npx vercel --prod".into()]
+        );
     }
 
     #[test]
@@ -7272,8 +7339,10 @@ mod tests {
         let root = std::path::PathBuf::from("/proj");
         let (dir, prog, args) = parse_run_command("cd web && npm exec -- vite", &root);
         assert_eq!(dir, std::path::PathBuf::from("/proj/web"));
-        assert_eq!(prog, "npm");
-        assert_eq!(args, vec!["exec".to_string(), "--".into(), "vite".into()]);
+        let (exp_prog, mut exp_args) = umadev_host::spawn_parts("npm");
+        exp_args.extend(["exec".to_string(), "--".into(), "vite".into()]);
+        assert_eq!(prog, exp_prog);
+        assert_eq!(args, exp_args);
     }
 
     #[test]
@@ -7289,7 +7358,7 @@ mod tests {
         let root = std::path::PathBuf::from("/proj");
         let (dir, prog, _) = parse_run_command("cd 'my app' && npm run dev", &root);
         assert_eq!(dir, std::path::PathBuf::from("/proj/my app"));
-        assert_eq!(prog, "npm");
+        assert_eq!(prog, umadev_host::spawn_parts("npm").0);
     }
 
     #[test]

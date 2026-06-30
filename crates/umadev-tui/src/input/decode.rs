@@ -29,6 +29,14 @@ const ESC: u8 = 0x1b;
 const PASTE_START: &[u8] = b"\x1b[200~";
 /// Bracketed-paste end marker (`CSI 201 ~`).
 const PASTE_END: &[u8] = b"\x1b[201~";
+/// Upper bound on an in-flight bracketed-paste body before it is force-closed.
+/// Any legitimate human paste is far below this; only a terminator that NEVER
+/// arrives (a disconnect, or a terminal that opened `CSI 200 ~` but never sent
+/// `CSI 201 ~`) grows the buffer unbounded. Without a ceiling `in_paste` would
+/// wedge `true` forever and silently swallow every later keystroke — the input
+/// box goes dead with no backstop. 8 MiB is generous headroom for a real paste
+/// yet bounds the failure. See [`Decoder::after_in_paste_append`].
+const PASTE_BUF_CAP: usize = 8 * 1024 * 1024;
 
 /// One decoded input event. Mirrors the surface the TUI event loop already
 /// switches on; [`InputEvent::Response`] is a terminal reply to a query we sent
@@ -80,7 +88,7 @@ impl Decoder {
                     // A split end marker can arrive as plain text AFTER a flushed
                     // partial (see `close_paste_if_terminated`), so re-check the
                     // accumulated tail here — not only on a clean PASTE_END token.
-                    self.close_paste_if_terminated()
+                    self.after_in_paste_append()
                 } else {
                     decode_text(&text)
                 }
@@ -105,7 +113,7 @@ impl Decoder {
             // it is (the start of) an end marker the reader's flush split apart,
             // which `close_paste_if_terminated` recognises once the tail is whole.
             self.paste_buf.push_str(&String::from_utf8_lossy(bytes));
-            return self.close_paste_if_terminated();
+            return self.after_in_paste_append();
         }
         decode_sequence(bytes)
     }
@@ -135,6 +143,32 @@ impl Decoder {
                 self.in_paste = false;
                 return vec![InputEvent::Paste(body)];
             }
+        }
+        Vec::new()
+    }
+
+    /// Shared tail for both in-paste append branches (text + literal sequence):
+    /// first try to close on a recognised end marker (clean or flush-split via
+    /// [`Self::close_paste_if_terminated`]); failing that, FORCE-CLOSE when the
+    /// accumulated body has grown past [`PASTE_BUF_CAP`] with no terminator in
+    /// sight.
+    ///
+    /// This is the fail-open backstop for an unterminated bracketed paste: a
+    /// `CSI 200 ~` whose matching `CSI 201 ~` never arrives (a disconnect or a
+    /// misbehaving terminal) would otherwise wedge `in_paste = true` forever and
+    /// swallow every later keystroke into the buffer — the input box dead-ends
+    /// with no way out. Force-close delivers what was buffered as a `Paste` (no
+    /// input is lost) and returns the decoder to the normal state so keys flow
+    /// again. Returns the completed/forced paste, or empty if neither fired.
+    fn after_in_paste_append(&mut self) -> Vec<InputEvent> {
+        let closed = self.close_paste_if_terminated();
+        if !closed.is_empty() {
+            return closed;
+        }
+        if self.paste_buf.len() > PASTE_BUF_CAP {
+            let body = std::mem::take(&mut self.paste_buf);
+            self.in_paste = false;
+            return vec![InputEvent::Paste(body)];
         }
         Vec::new()
     }
@@ -693,6 +727,35 @@ mod tests {
             other => panic!("expected the paste to close with a clean body, got {other:?}"),
         }
         // And the decoder is no longer wedged: ordinary text decodes to keys again.
+        assert_eq!(
+            one_key(&d.feed_token(Token::Text("x".into()))).code,
+            KeyCode::Char('x')
+        );
+    }
+
+    #[test]
+    fn unterminated_paste_force_closes_past_the_cap_and_frees_input() {
+        // Suspect/Low: a bracketed paste whose `\x1b[201~` end marker NEVER arrives
+        // (disconnect / misbehaving terminal) would wedge `in_paste = true` forever
+        // and swallow every later keystroke into the buffer — the input box dead-ends
+        // with no backstop. The size-cap must force-close the paste (delivering the
+        // buffered body) so input can never wedge.
+        let mut d = Decoder::new();
+        assert!(d
+            .feed_token(Token::Sequence(PASTE_START.to_vec()))
+            .is_empty());
+        // A chunk safely UNDER the cap keeps the paste open (no premature close).
+        assert!(d.feed_token(Token::Text("x".repeat(1024))).is_empty());
+        // Push the buffer past the cap with NO end marker in sight → force-close.
+        let out = d.feed_token(Token::Text("a".repeat(PASTE_BUF_CAP + 1)));
+        match out.as_slice() {
+            [InputEvent::Paste(body)] => assert!(
+                body.len() > PASTE_BUF_CAP,
+                "the force-closed paste delivers the buffered body, not nothing"
+            ),
+            other => panic!("expected a force-closed paste, got {} events", other.len()),
+        }
+        // The decoder is no longer wedged: a later keystroke decodes to a key again.
         assert_eq!(
             one_key(&d.feed_token(Token::Text("x".into()))).code,
             KeyCode::Char('x')

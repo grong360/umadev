@@ -3956,10 +3956,21 @@ impl App {
         if self.input_len() >= INPUT_CAP {
             return;
         }
+        // Chip-aware: typing/overtyping STRICTLY interior to a `[图片 N]` /
+        // `[粘贴 N 行]` chip splits the token so `expand_attachments` can no longer
+        // match it — the image/paste would be silently dropped on submit (the
+        // delete paths are chip-aware; insert was the gap). Decide on the pre-insert
+        // caret, then reconcile after the splice so the now-broken chip drops its
+        // backing ref instead of mis-submitting the corrupted literal.
+        let split_chip = (!self.attachments.is_empty() || !self.text_stash.is_empty())
+            && self.cursor_inside_chip(self.input_cursor);
         self.snapshot_for_undo();
         let pos = self.byte_index(self.input_cursor);
         self.input.insert(pos, c);
         self.input_cursor += 1;
+        if split_chip {
+            self.reconcile_attachments();
+        }
         // The slash palette re-filters as you type — reset the highlight to the
         // best (first) match so Enter runs a predictable command.
         self.palette_selected = 0;
@@ -3997,10 +4008,19 @@ impl App {
             added += 1;
         }
         if !buf.is_empty() {
+            // Chip-aware (see `insert_at_cursor`): a paste landing STRICTLY interior
+            // to a `[图片 N]` / `[粘贴 N 行]` chip splits its token, so reconcile after
+            // the splice to drop the now-broken chip's backing ref rather than
+            // silently mis-submitting the corrupted literal.
+            let split_chip = (!self.attachments.is_empty() || !self.text_stash.is_empty())
+                && self.cursor_inside_chip(self.input_cursor);
             self.snapshot_for_undo();
             let pos = self.byte_index(self.input_cursor);
             self.input.insert_str(pos, &buf);
             self.input_cursor += added;
+            if split_chip {
+                self.reconcile_attachments();
+            }
         }
         self.input_history_idx = None;
         self.palette_selected = 0;
@@ -4580,6 +4600,18 @@ impl App {
         self.chip_spans()
             .into_iter()
             .find(|&(start, _)| start == cursor)
+    }
+
+    /// `true` when char `cursor` sits STRICTLY interior to a chip span — between
+    /// its edges, where an insert/overtype would split the `[图片 N]` /
+    /// `[粘贴 N 行]` token so [`Self::expand_attachments`] can no longer match it
+    /// and the backing image/paste would be silently dropped on submit. The edges
+    /// (`cursor == start` or `cursor == end`) are adjacent, not interior, and keep
+    /// the token intact, so they return `false`.
+    fn cursor_inside_chip(&self, cursor: usize) -> bool {
+        self.chip_spans()
+            .into_iter()
+            .any(|(start, end)| start < cursor && cursor < end)
     }
 
     /// Re-sync `attachments` / `text_stash` to the chips that survive in `input`
@@ -8706,7 +8738,15 @@ impl App {
         // (b) make the NEXT resume/continue open a session on a base the run was
         // never built against — a silent backend mismatch. Reject and tell the user
         // to cancel first; the run, its parked session, and config all stay coherent.
-        if self.is_pipeline_active() {
+        //
+        // A streaming CHAT turn is `agentic_in_flight` but NOT `is_pipeline_active()`
+        // (the chat Route never registers a run task), so a pipeline-only guard would
+        // let a `/codex` mid-chat-turn commit the new backend + preload a new-base
+        // session while the old turn keeps running and unconditionally parks its
+        // OLD-base session — racing the preload into either a leaked/dropped session
+        // (never `end()`ed) or a holder pinned to the OLD base while config/UI claim
+        // the new one. Guard on both, mirroring the `/cancel` arm.
+        if self.is_pipeline_active() || self.agentic_in_flight {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "backend.busy_no_switch"),
@@ -14257,6 +14297,65 @@ mod tests {
     }
 
     #[test]
+    fn typing_inside_a_chip_drops_the_broken_attachment_instead_of_mis_submitting() {
+        // Low/Med: overtyping INTERIOR to a `[图片 1]` chip splits its token so
+        // `expand_attachments` can no longer match it. Before the fix the corrupted
+        // literal was submitted verbatim and the image silently dropped. The insert
+        // paths are now chip-aware: an interior insert reconciles, dropping the
+        // now-broken chip's backing ref so submit can't mis-send a corrupted token.
+        let mut app = fresh_app(Some("offline"));
+        let _dir = attach_one_image(&mut app); // "[图片 1] "
+        assert_eq!(app.attachments.len(), 1);
+        // Caret between `图` (1) and `片` (2) — strictly interior to span (0,6).
+        app.input_cursor = 2;
+        app.insert_at_cursor('X');
+        // The backing image ref is dropped (no orphaned attachment left behind).
+        assert!(
+            app.attachments.is_empty(),
+            "interior insert into a chip must drop its broken ref, got: {:?}",
+            app.attachments
+        );
+        // Submit no longer mis-expands a corrupted token to a real `@path`.
+        let expanded = app.expand_attachments(app.input.trim());
+        assert!(
+            !expanded.contains('@'),
+            "the corrupted chip must not mis-submit a path, got: {expanded}"
+        );
+    }
+
+    #[test]
+    fn pasting_inside_a_chip_drops_the_broken_attachment() {
+        // Same hazard via the bulk `insert_str_at_cursor` (bracketed paste / IME).
+        let mut app = fresh_app(Some("offline"));
+        let _dir = attach_one_image(&mut app); // "[图片 1] "
+        app.input_cursor = 3; // interior (between `片` and the space inside the token)
+        app.insert_str_at_cursor("zzz");
+        assert!(
+            app.attachments.is_empty(),
+            "interior paste into a chip must drop its broken ref"
+        );
+        assert!(!app.expand_attachments(app.input.trim()).contains('@'));
+    }
+
+    #[test]
+    fn typing_at_a_chip_edge_keeps_the_attachment_intact() {
+        // Guard the boundary: inserting AT an edge (cursor == start or == end) is
+        // adjacent, not interior — the `[图片 N]` token stays whole and the image
+        // must survive (the fix must not over-reconcile a still-valid chip).
+        let mut app = fresh_app(Some("offline"));
+        let _dir = attach_one_image(&mut app); // "[图片 1] "
+        let chip_end = app.image_chip(1).chars().count(); // == 6, the `]` boundary
+        app.input_cursor = chip_end; // flush against the right edge, not interior
+        app.insert_at_cursor('Z');
+        assert_eq!(app.attachments.len(), 1, "an edge insert keeps the chip");
+        let expanded = app.expand_attachments(app.input.trim());
+        assert!(
+            expanded.contains('@'),
+            "the intact chip still expands to its path, got: {expanded}"
+        );
+    }
+
+    #[test]
     fn middle_chip_delete_renumbers_remaining_chips_in_lockstep() {
         // Two images: deleting the FIRST must renumber the second to `[图片 1]`
         // and keep it bound to its OWN path (a naive Vec::remove would submit the
@@ -17110,6 +17209,35 @@ mod tests {
             "mid-run base switch is a rejected no-op"
         );
         assert_eq!(a.backend, before, "the backend must be unchanged mid-run");
+        assert!(
+            a.history.iter().any(|m| m.body().contains("/cancel")),
+            "the rejection tells the user to /cancel first"
+        );
+    }
+
+    #[test]
+    fn slash_backend_is_rejected_during_an_agentic_chat_turn() {
+        // A streaming chat turn is `agentic_in_flight` but NOT `is_pipeline_active()`.
+        // A `/codex` here must be refused the same as during a pipeline — otherwise it
+        // would commit the new backend + preload a new session while the old turn parks
+        // its old-base session, racing into a leaked session or a silent base mismatch.
+        let mut a = fresh_app(Some("offline"));
+        a.agentic_in_flight = true;
+        assert!(!a.is_pipeline_active());
+        let before = a.backend.clone();
+        for c in "/codex".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let action = a.apply_key(KeyCode::Enter);
+        assert_eq!(
+            action,
+            Action::None,
+            "a mid-agentic-turn base switch is a rejected no-op"
+        );
+        assert_eq!(
+            a.backend, before,
+            "the backend must be unchanged during an agentic chat turn"
+        );
         assert!(
             a.history.iter().any(|m| m.body().contains("/cancel")),
             "the rejection tells the user to /cancel first"
