@@ -747,14 +747,17 @@ fn parse_control_request(v: &Value) -> Vec<SessionEvent> {
     }]
 }
 
-/// Truncated preview of a tool_result `content` (string or block array).
+/// Truncated preview of a tool_result `content` (string or block array). The cap
+/// widens to the full captured output when the user opts into process logs
+/// (`UMADEV_SHOW_PROCESS_LOGS`), so a long-running command's build log reaches the
+/// transcript instead of a 200-char clip; OFF (the default) keeps the tight clip.
 fn summarize_tool_content(content: Option<&Value>) -> String {
     let raw = match content {
         Some(Value::String(s)) => s.clone(),
         Some(other) => other.to_string(),
         None => String::new(),
     };
-    truncate(&raw, 200)
+    truncate(&raw, crate::process_logs::tool_output_cap())
 }
 
 /// A short, human-readable target for an approval prompt (file path / command).

@@ -58,6 +58,12 @@ pub(crate) const FOLD_HEAD_SHELL: usize = 10;
 /// (hundreds/thousands of lines) output ever trips it, so normal replies are
 /// untouched.
 pub(crate) const FOLD_HARD_CAP: usize = 120;
+/// Ingest cap (chars) for a long-running command row's result when process-log
+/// visibility (`/logs`) is on — generous enough to carry a real build log's tail
+/// (the host already bounds the output), while the renderer's [`FOLD_HARD_CAP`]
+/// line fold still keeps a multi-thousand-line log from dominating the transcript.
+/// OFF, the tight 200-char clip is kept (so a normal tool result never balloons).
+pub(crate) const PROCESS_LOG_PREVIEW_CHARS: usize = 8 * 1024;
 /// FIFO **fail-open floor** for the in-memory working transcript: when a
 /// token-budgeted compaction can't run (the summary `complete()` failed / the
 /// base is offline / the circuit breaker is tripped), the working view falls back
@@ -2292,6 +2298,16 @@ pub struct App {
     /// reveal-all gesture, so older collapsed output is never stranded with no
     /// way to expand it. Defaults to `false` (collapsed).
     pub verbose: bool,
+    /// Process-log visibility (`/logs`): when `true`, a long-running command row
+    /// (a Maven / Gradle build, `spring-boot:run`, a dependency install) keeps its
+    /// FULL captured output and stays EXPANDED in the transcript so the user sees
+    /// the build progressing — instead of a 200-char clip that auto-collapses to a
+    /// checkmark. The renderer reads THIS field (not the env) so the behaviour is
+    /// deterministic + testable; the matching `UMADEV_SHOW_PROCESS_LOGS` env is what
+    /// the out-of-process base drivers read. Seeded at construction from the saved
+    /// preference / an external env override, flipped live by `/logs`. Default
+    /// `false`.
+    pub show_process_logs: bool,
     /// `true` when the user asked to quit.
     pub should_quit: bool,
 
@@ -2482,6 +2498,10 @@ impl App {
         // Export per-phase model tiers (if configured) so the in-process worker
         // loop drives each phase with the right-sized model.
         config.apply_model_tiers();
+        // Publish the saved process-log preference (`/logs`) into the env the base
+        // drivers read, so a build's long-running command output is surfaced from
+        // the first turn. Off by default; an external env override wins.
+        config.apply_process_logs();
         // Publish the project's Codex launch-sandbox choice (`.umadevrc`
         // `[codex] sandbox_mode`) into `UMADEV_CODEX_SANDBOX` so the codex driver
         // honors it, mirroring the model-tier export above. Default stays the safe
@@ -2598,6 +2618,10 @@ impl App {
             tick: 0,
             animations: animations_enabled_default(),
             verbose: false,
+            // Seed from the env `apply_process_logs()` just published — captures BOTH
+            // the saved `/logs` preference and an external `UMADEV_SHOW_PROCESS_LOGS`
+            // override, so the renderer agrees with the base drivers from turn one.
+            show_process_logs: umadev_host::process_logs::show_process_logs(),
             should_quit: false,
             run_started_at: None,
             phase_started_at: None,
@@ -3053,11 +3077,23 @@ impl App {
         // set without overlapping the `&mut self.history` borrow.
         let mut batch: Option<(String, u32)> = None;
         let mut handled = false;
+        // Process-log visibility (`/logs`): for a long-running command row, keep the
+        // FULL captured output (the renderer still folds it to a head preview) and
+        // leave the row EXPANDED so the streamed build log stays visible instead of
+        // auto-collapsing to a checkmark. OFF (the default) keeps the tight 200-char
+        // clip + auto-collapse, exactly as before.
+        let show_logs = self.show_process_logs;
         if let Some(last) = self.history.back_mut() {
             if last.role == ChatRole::Host {
                 if let MessageBody::Tool(t) = &mut last.kind {
                     t.status = status;
-                    let preview: String = summary.chars().take(200).collect();
+                    let verbose_cmd = show_logs && t.name == "Bash";
+                    let cap = if verbose_cmd {
+                        PROCESS_LOG_PREVIEW_CHARS
+                    } else {
+                        200
+                    };
+                    let preview: String = summary.chars().take(cap).collect();
                     if t.merged {
                         // The headline stays the running count; only fold the
                         // metric in (e.g. `(3 matches)`), never the raw dump.
@@ -3084,8 +3120,10 @@ impl App {
                             Some(preview)
                         };
                     }
-                    // Auto-collapse a finished OK call; a failure stays open.
-                    t.collapsed = ok;
+                    // Auto-collapse a finished OK call; a failure stays open. With
+                    // process logs on, a command row stays EXPANDED so its live /
+                    // full output is visible (the user asked to see it).
+                    t.collapsed = ok && !verbose_cmd;
                     handled = true;
                 }
             }
@@ -4810,6 +4848,7 @@ impl App {
             "tui.cmd.animations",
         ),
         Self::cmd("mouse", &[], None, CmdGroup::System, "tui.cmd.mouse"),
+        Self::cmd("logs", &[], None, CmdGroup::System, "tui.cmd.logs"),
         Self::cmd(
             "redraw",
             &["repaint"],
@@ -8208,6 +8247,7 @@ impl App {
             "usage" => self.slash_usage(),
             "animations" => self.slash_toggle_animations(),
             "mouse" => self.slash_toggle_mouse(),
+            "logs" => self.slash_logs(),
             "redraw" => {
                 // Force a full repaint to recover from any accumulated render
                 // desync (stale cells / bled long lines). The event loop owns the
@@ -11169,6 +11209,33 @@ impl App {
         // transcript; OFF actually issues DisableMouseCapture so native
         // click-drag selection works again. The event loop owns `terminal`.
         Action::SetMouseCapture(self.mouse_scroll)
+    }
+
+    /// `/logs` — toggle **process-log visibility** for the base's long-running
+    /// commands. A multi-minute Maven/Gradle/`spring-boot:run` build is captured by
+    /// the base's own sandbox and only handed back as a tight 200-char clip on
+    /// completion, so during the build the user sees a silent "thinking." ON makes
+    /// the base drivers surface the FULL command output — and, for codex, stream it
+    /// as it runs — so the live build log reaches the transcript and the user can
+    /// see it progressing. Flips the env the host drivers read (live, picked up on
+    /// the next turn/session) and persists the preference so it survives a restart.
+    fn slash_logs(&mut self) -> Action {
+        let now_on = !self.show_process_logs;
+        self.show_process_logs = now_on;
+        self.config.show_process_logs = now_on;
+        // Publish to the env the (out-of-process) base drivers read on their next
+        // turn/session — the TUI renderer reads `self.show_process_logs` directly.
+        UserConfig::publish_process_logs(now_on);
+        // Persist so the choice survives a restart (fail-open: a write error still
+        // leaves the session env set; we just note it didn't save).
+        let _ = crate::config::save_to(&self.config, &self.config_path);
+        let key = if now_on {
+            "slash.logs_on"
+        } else {
+            "slash.logs_off"
+        };
+        self.push(ChatRole::System, umadev_i18n::t(self.lang, key));
+        Action::None
     }
 
     fn slash_toggle_animations(&mut self) -> Action {
@@ -19668,6 +19735,75 @@ mod tests {
         };
         assert_eq!(t.status, ToolStatus::Fail);
         assert!(!t.collapsed, "a failed call must never hide its error");
+    }
+
+    #[test]
+    fn logs_toggle_keeps_command_output_visible_and_off_clips_it() {
+        // `/logs` ON: a long-running command's full output stays in the row AND the
+        // row stays expanded, so the build log is visible as it streams. OFF (the
+        // default): the tight 200-char clip + auto-collapse, exactly as before.
+        // The renderer reads `self.show_process_logs` (a field, not the env), so this
+        // is deterministic and never races a parallel test on the process env.
+        let long_log: String = (0..60)
+            .map(|_| "[INFO] compiling module")
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // ── OFF (default) ──
+        let mut off = fresh_app(Some("offline"));
+        assert!(!off.show_process_logs, "off by default");
+        off.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::tool_use("Bash", "mvn -q install"),
+        });
+        off.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolResult {
+                ok: true,
+                summary: long_log.clone(),
+            },
+        });
+        let MessageBody::Tool(t) = &off.history.back().unwrap().kind else {
+            panic!("Tool row");
+        };
+        assert!(t.collapsed, "OFF: a finished OK command auto-collapses");
+        assert!(
+            t.result.as_deref().unwrap_or("").chars().count() <= 200,
+            "OFF: output is clipped to the tight preview"
+        );
+
+        // ── ON (via /logs) ──
+        let mut on = fresh_app(Some("offline"));
+        let _ = on.slash_logs();
+        assert!(on.show_process_logs, "/logs turned it on");
+        on.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::tool_use("Bash", "mvn -q install"),
+        });
+        on.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolResult {
+                ok: true,
+                summary: long_log.clone(),
+            },
+        });
+        let MessageBody::Tool(t) = &on.history.back().unwrap().kind else {
+            panic!("Tool row");
+        };
+        assert!(
+            !t.collapsed,
+            "ON: the command row stays expanded so the build log is visible"
+        );
+        let shown = t.result.as_deref().unwrap_or("");
+        assert!(
+            shown.contains("[INFO] compiling module"),
+            "ON: the full build log reaches the transcript: {shown:?}"
+        );
+        assert!(
+            shown.chars().count() > 200,
+            "ON: the output is NOT clipped to 200 chars"
+        );
+
+        // Toggling /logs again turns it back off (and clears the published env).
+        let _ = on.slash_logs();
+        assert!(!on.show_process_logs, "/logs toggles back off");
+        std::env::remove_var(umadev_host::process_logs::SHOW_PROCESS_LOGS_ENV);
     }
 
     /// Helper: a tool row whose `status` is whatever the caller passes, so the

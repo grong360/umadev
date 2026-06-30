@@ -898,13 +898,16 @@ fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEv
             vec![SessionEvent::ToolCall { name, input }]
         }
         "completed" => {
+            // The cap widens to the full captured output when the user opts into
+            // process logs (`UMADEV_SHOW_PROCESS_LOGS`), so a long-running command's
+            // build log reaches the transcript; OFF keeps the tight 200-char clip.
             let summary = state
                 .get("title")
                 .and_then(Value::as_str)
                 .or_else(|| state.get("output").and_then(Value::as_str))
                 .unwrap_or("")
                 .chars()
-                .take(200)
+                .take(crate::process_logs::tool_output_cap())
                 .collect();
             backfilled_tool_events(
                 tracker,
@@ -920,7 +923,7 @@ fn translate_tool_part(part: &Value, tracker: &mut PartTracker) -> Vec<SessionEv
                 .and_then(Value::as_str)
                 .unwrap_or("tool error")
                 .chars()
-                .take(200)
+                .take(crate::process_logs::tool_output_cap())
                 .collect();
             backfilled_tool_events(
                 tracker,

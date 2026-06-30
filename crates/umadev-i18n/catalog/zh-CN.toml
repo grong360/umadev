@@ -846,6 +846,7 @@
 "tui.cmd.guide" = "回到上手向导(/setup 的别名)"
 "tui.cmd.animations" = "开 / 关加载动画"
 "tui.cmd.mouse" = "开 / 关鼠标滚轮滚动(关 = 原生文本选择)"
+"tui.cmd.logs" = "实时显示底座长时间运行的构建 / 进程日志"
 "tui.cmd.redraw" = "强制整屏重绘(清除残留 / 乱码单元格)"
 # 事件流渲染(app.rs apply_engine)
 "event.phase_done" = "[ok] {}"
@@ -868,6 +869,8 @@
 "slash.skill_header" = "[skill] 技能包:\n\n{}"
 "slash.mouse_on" = "鼠标滚轮滚动已开启 —— Shift+拖拽可用终端原生文本选择"
 "slash.mouse_off" = "鼠标滚轮滚动已关闭 —— 已恢复终端原生文本选择"
+"slash.logs_on" = "进程日志已开启 —— 底座长时间运行的构建 / 命令输出会实时流入对话(codex 边跑边流;所有底座在命令结束时显示完整日志),不再是静默等待"
+"slash.logs_off" = "进程日志已关闭 —— 长时间命令输出恢复为简短结果预览"
 # 当鼠标捕获开启(原生选择被接管)时,用户在记录区以外(如输入框)拖拽选择会触发一次此提示,指向复制的兜底方式。
 "tui.copy_hint" = "要复制文字(包括这个输入框):按住 Shift 拖拽用终端原生选择,或输入 /mouse 关闭鼠标捕获。粘贴照常即可 —— 文字会整段插入。"
 "slash.redraw" = "已重绘屏幕 —— 清除了残留或错乱的字符单元"

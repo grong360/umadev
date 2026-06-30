@@ -1093,21 +1093,33 @@ async fn handle_notification(
 ) {
     let method = v.get("method").and_then(Value::as_str).unwrap_or("");
     let params = v.get("params").cloned().unwrap_or(Value::Null);
+    // Resolve the process-log toggle ONCE per line and thread it down, so the leaf
+    // translators don't re-read (or race on) the env — and stay unit-testable.
+    let show_logs = crate::process_logs::show_process_logs();
     match method {
         // Capture the in-flight turn id so interrupt / steer can target it.
         "turn/started" => set_turn_id(turn_id, turn_id_of(&params)).await,
         // Streamed assistant text.
         "item/agentMessage/delta" => emit_text_delta(&params, event_tx),
+        // Process-log visibility (opt-in): a long-running command's lifecycle.
+        // codex emits `item/started` when the command BEGINS and `item/updated`
+        // as its captured output grows — surfacing those turns a multi-minute,
+        // silent build into a live, progressing log (the `commandExecution` item
+        // only `item/completed`s when it FINISHES, so without this the user sees
+        // nothing until the build is over). Gated so OFF behaviour is unchanged.
+        "item/started" if show_logs => emit_started_item(&params, event_tx),
+        "item/updated" if show_logs => emit_updated_item(&params, event_tx),
         // A completed item — the SOURCE OF TRUTH for produced work.
-        "item/completed" => emit_completed_item(&params, event_tx),
+        "item/completed" => emit_completed_item(&params, show_logs, event_tx),
         // F3: codex streams per-turn token usage in this dedicated notification
         // (kept separate from `turn/completed` so the protocol shape stays stable).
         // Stash the latest parse so `emit_turn_done` can attach the REAL usage.
         "thread/tokenUsage/updated" => capture_usage(&params, latest_usage).await,
         // The turn ended — the authoritative phase-done boundary.
         "turn/completed" => emit_turn_done(&params, turn_id, latest_usage, event_tx).await,
-        // turn/diff/updated, thread/started, item/started, fs/changed, … carry
-        // no event we surface — ignored (fail-open).
+        // turn/diff/updated, thread/started, fs/changed, an `item/started` /
+        // `item/updated` while process logs are OFF, … carry no event we surface —
+        // ignored (fail-open).
         _ => {}
     }
 }
@@ -1221,12 +1233,15 @@ fn emit_text_delta(params: &Value, event_tx: &EventTx) {
     }
 }
 
-/// Dispatch an `item/completed` payload to the per-item translators.
-fn emit_completed_item(params: &Value, event_tx: &EventTx) {
+/// Dispatch an `item/completed` payload to the per-item translators. `show_logs`
+/// (resolved once in [`handle_notification`]) carries the process-log toggle so a
+/// completed command surfaces its full output without the `ToolCall` already
+/// streamed on `item/started`.
+fn emit_completed_item(params: &Value, show_logs: bool, event_tx: &EventTx) {
     let Some(item) = params.get("item") else {
         return;
     };
-    emit_item(item, event_tx);
+    emit_item(item, show_logs, event_tx);
 }
 
 /// Map a completed `item` to a [`SessionEvent::ToolCall`] (+ `ToolResult`).
@@ -1239,21 +1254,29 @@ fn emit_completed_item(params: &Value, event_tx: &EventTx) {
 ///
 /// `agentMessage` / `reasoning` / `plan` / `webSearch` / `mcpToolCall` etc. are
 /// not surfaced here (text already streams via `item/agentMessage/delta`).
-fn emit_item(item: &Value, event_tx: &EventTx) {
+fn emit_item(item: &Value, show_logs: bool, event_tx: &EventTx) {
     match item.get("type").and_then(Value::as_str).unwrap_or("") {
-        "commandExecution" => emit_command_execution(item, event_tx),
+        "commandExecution" => emit_command_execution(item, show_logs, event_tx),
         "fileChange" => emit_file_change(item, event_tx),
         _ => {}
     }
 }
 
 /// Translate a completed `commandExecution` item → Bash `ToolCall` + result.
-fn emit_command_execution(item: &Value, event_tx: &EventTx) {
-    let command = command_of(item);
-    let _ = event_tx.try_send(SessionEvent::ToolCall {
-        name: "Bash".to_string(),
-        input: json!({ "command": command }),
-    });
+///
+/// When process logs are ON, the running command's `ToolCall` was already emitted
+/// on its `item/started` frame ([`emit_started_item`]), so we surface ONLY the
+/// final result here (no duplicate row) and carry the FULL captured output up to
+/// [`crate::process_logs::cap_for`]. When OFF, behaviour is unchanged: the
+/// `ToolCall` + a tightly-clipped result, both on completion.
+fn emit_command_execution(item: &Value, show_logs: bool, event_tx: &EventTx) {
+    if !show_logs {
+        let command = command_of(item);
+        let _ = event_tx.try_send(SessionEvent::ToolCall {
+            name: "Bash".to_string(),
+            input: json!({ "command": command }),
+        });
+    }
     // status: completed | failed | declined.
     let status = item.get("status").and_then(Value::as_str).unwrap_or("");
     let exit_ok = item
@@ -1266,7 +1289,58 @@ fn emit_command_execution(item: &Value, event_tx: &EventTx) {
         .unwrap_or(status);
     let _ = event_tx.try_send(SessionEvent::ToolResult {
         ok: status != "failed" && status != "declined" && exit_ok,
-        summary: truncate(summary, 200),
+        summary: truncate(summary, crate::process_logs::cap_for(show_logs)),
+    });
+}
+
+/// Process-log visibility: an `item/started` notification for a running
+/// `commandExecution` → emit the Bash `ToolCall` IMMEDIATELY, so the user sees
+/// "running `mvn …`" the moment the build starts instead of a multi-minute silent
+/// void. Only the `commandExecution` lifecycle is surfaced (a `fileChange` / text
+/// item already surfaces on completion / via deltas). Called only when process
+/// logs are ON (the `handle_notification` guard). Fail-open: a non-command /
+/// shapeless item is a no-op.
+fn emit_started_item(params: &Value, event_tx: &EventTx) {
+    let Some(item) = params.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("commandExecution") {
+        return;
+    }
+    let command = command_of(item);
+    let _ = event_tx.try_send(SessionEvent::ToolCall {
+        name: "Bash".to_string(),
+        input: json!({ "command": command }),
+    });
+}
+
+/// Process-log visibility: an `item/updated` notification for a running
+/// `commandExecution` → surface its growing `aggregatedOutput` as a streamed
+/// [`SessionEvent::ToolResult`], so the live build log reaches the transcript as
+/// it is produced (the consumer renders this as the in-progress command's body).
+/// Only the `commandExecution` lifecycle is surfaced. Called only when process
+/// logs are ON. Fail-open: a non-command item, or one with no output yet, is a
+/// no-op (no empty progress line).
+fn emit_updated_item(params: &Value, event_tx: &EventTx) {
+    let Some(item) = params.get("item") else {
+        return;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("commandExecution") {
+        return;
+    }
+    let output = item
+        .get("aggregatedOutput")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if output.trim().is_empty() {
+        return;
+    }
+    // Still running → a non-terminal progress frame is `ok: true`; the final
+    // success/failure verdict lands on `item/completed`. Only reached when process
+    // logs are ON, so the generous `cap_for(true)` carries the build log's tail.
+    let _ = event_tx.try_send(SessionEvent::ToolResult {
+        ok: true,
+        summary: truncate(output, crate::process_logs::cap_for(true)),
     });
 }
 
@@ -1940,11 +2014,14 @@ mod tests {
 
     #[tokio::test]
     async fn emit_item_translates_command_execution() {
+        // Process logs OFF (the default): a completed command surfaces the
+        // `ToolCall` + a tightly-clipped result on completion, exactly as before.
         let (tx, mut rx) = chan();
         emit_item(
             &v(
                 r#"{"type":"commandExecution","command":"cargo build","status":"completed","exitCode":0}"#,
             ),
+            false,
             &tx,
         );
         let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
@@ -1959,6 +2036,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_command_surfaces_only_result_when_process_logs_on() {
+        // Process logs ON: the running command's `ToolCall` was already streamed on
+        // its `item/started` frame, so completion surfaces ONLY the final result
+        // (no duplicate Bash row) — and carries the FULL output (a long build log),
+        // not the 200-char clip.
+        let (tx, mut rx) = chan();
+        let long_log = "x".repeat(900);
+        emit_item(
+            &json!({
+                "type": "commandExecution",
+                "command": "mvn -q install",
+                "status": "completed",
+                "exitCode": 0,
+                "aggregatedOutput": long_log,
+            }),
+            true,
+            &tx,
+        );
+        // FIRST (and only) event is the result — no leading ToolCall.
+        let SessionEvent::ToolResult { ok, summary } = rx.recv().await.unwrap() else {
+            panic!("expected ToolResult, not a duplicate ToolCall");
+        };
+        assert!(ok);
+        assert!(
+            summary.len() > 200,
+            "the full build log is surfaced, not a 200-char clip: {}",
+            summary.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn started_command_streams_running_indicator() {
+        // Process-log streaming: `item/started` for a running command emits the
+        // Bash `ToolCall` IMMEDIATELY so the user sees the build is underway — the
+        // root fix for the "silent multi-minute void" (codex's command only
+        // `item/completed`s when it FINISHES).
+        let (tx, mut rx) = chan();
+        emit_started_item(
+            &json!({
+                "item": { "type": "commandExecution", "command": "mvn -q install", "status": "running" }
+            }),
+            &tx,
+        );
+        let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
+            panic!("expected an immediate ToolCall on item/started");
+        };
+        assert_eq!(name, "Bash");
+        assert_eq!(input["command"], "mvn -q install");
+        // A non-command started item (text / fileChange) surfaces nothing here.
+        emit_started_item(&json!({ "item": { "type": "reasoning" } }), &tx);
+        assert!(rx.try_recv().is_err(), "only commandExecution starts a row");
+    }
+
+    #[tokio::test]
+    async fn updated_command_streams_growing_output_to_transcript() {
+        // The core toggle behaviour: a running command's growing `aggregatedOutput`
+        // reaches the transcript as a streamed ToolResult, so a multi-minute build's
+        // log lines are visible AS they are produced.
+        let (tx, mut rx) = chan();
+        emit_updated_item(
+            &json!({
+                "item": {
+                    "type": "commandExecution",
+                    "command": "mvn -q install",
+                    "status": "running",
+                    "aggregatedOutput": "[INFO] Building project 1/7\n[INFO] Compiling 42 sources",
+                }
+            }),
+            &tx,
+        );
+        let SessionEvent::ToolResult { ok, summary } = rx.recv().await.unwrap() else {
+            panic!("expected a streamed ToolResult for the running command output");
+        };
+        assert!(ok, "an in-progress frame is non-terminal (ok)");
+        assert!(
+            summary.contains("[INFO] Building project"),
+            "the live build log line reached the transcript: {summary}"
+        );
+        // An update with no output yet streams nothing (no empty progress line).
+        emit_updated_item(
+            &json!({ "item": { "type": "commandExecution", "aggregatedOutput": "   " } }),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err(), "an empty-output frame is a no-op");
+    }
+
+    #[tokio::test]
     async fn emit_item_translates_file_change_add_and_update() {
         let (tx, mut rx) = chan();
         // add → Write.
@@ -1966,6 +2130,7 @@ mod tests {
             &v(
                 r#"{"type":"fileChange","changes":[{"path":"src/app.tsx","kind":"add"}],"status":"completed"}"#,
             ),
+            false,
             &tx,
         );
         let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
@@ -1980,6 +2145,7 @@ mod tests {
             &v(
                 r#"{"type":"fileChange","changes":[{"path":"src/x.ts","kind":"update"}],"status":"completed"}"#,
             ),
+            false,
             &tx,
         );
         let SessionEvent::ToolCall { name, .. } = rx.recv().await.unwrap() else {
@@ -2022,6 +2188,7 @@ mod tests {
                     "diff": "+++ b/src/x.tsx\n@@ -0,0 +1,2 @@\n+const color = \"#ff0000\";\n+const ok = 1;\n",
                 }],
             }),
+            false,
             &tx,
         );
         let SessionEvent::ToolCall { name, input } = rx.recv().await.unwrap() else {
@@ -2052,6 +2219,7 @@ mod tests {
                 "status": "completed",
                 "changes": [{ "path": "a.md", "kind": "add", "content": format!("# Title {rocket} launch") }],
             }),
+            false,
             &tx,
         );
         let SessionEvent::ToolCall { input, .. } = rx.recv().await.unwrap() else {
@@ -2074,6 +2242,7 @@ mod tests {
             &v(
                 r#"{"type":"fileChange","status":"completed","changes":[{"path":"b.rs","kind":"update"}]}"#,
             ),
+            false,
             &tx,
         );
         let SessionEvent::ToolCall { input, .. } = rx.recv().await.unwrap() else {
@@ -2333,6 +2502,39 @@ mod tests {
     /// An empty `LatestUsage` accumulator for dispatch tests (F3).
     fn empty_usage() -> LatestUsage {
         Arc::new(Mutex::new(None))
+    }
+
+    #[tokio::test]
+    async fn dispatch_gates_item_started_on_the_process_log_toggle() {
+        // The env wiring: `item/started` is surfaced as a running ToolCall ONLY when
+        // the process-log toggle is on; OFF (the default) it is ignored exactly as
+        // before. This test owns the env var for its body and restores it after.
+        let prev = std::env::var(crate::process_logs::SHOW_PROCESS_LOGS_ENV).ok();
+        let pending = empty_pending();
+        let approvals = empty_approvals();
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let latest_usage = empty_usage();
+        let (tx, mut rx) = chan();
+        let line = r#"{"method":"item/started","params":{"item":{"type":"commandExecution","command":"mvn -q install","status":"running"}}}"#;
+
+        // OFF → ignored (no event).
+        std::env::remove_var(crate::process_logs::SHOW_PROCESS_LOGS_ENV);
+        dispatch_line(line, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        assert!(rx.try_recv().is_err(), "OFF: item/started is ignored");
+
+        // ON → the running command surfaces immediately.
+        std::env::set_var(crate::process_logs::SHOW_PROCESS_LOGS_ENV, "1");
+        dispatch_line(line, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
+        let got = rx.try_recv();
+        // Restore the env BEFORE asserting so a failure can't leak the toggle.
+        match prev {
+            Some(v) => std::env::set_var(crate::process_logs::SHOW_PROCESS_LOGS_ENV, v),
+            None => std::env::remove_var(crate::process_logs::SHOW_PROCESS_LOGS_ENV),
+        }
+        let Ok(SessionEvent::ToolCall { name, .. }) = got else {
+            panic!("ON: item/started must stream a running ToolCall, got {got:?}");
+        };
+        assert_eq!(name, "Bash");
     }
 
     #[tokio::test]

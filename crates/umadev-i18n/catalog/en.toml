@@ -857,6 +857,7 @@
 "tui.cmd.guide" = "back to the onboarding guide (alias of /setup)"
 "tui.cmd.animations" = "toggle spinner animation on / off"
 "tui.cmd.mouse" = "toggle mouse-wheel scrolling (off = native text selection)"
+"tui.cmd.logs" = "show the base's long-running build/process logs as they run"
 "tui.cmd.redraw" = "force a full repaint (clear stale / garbled cells)"
 # Event-stream render (app.rs apply_engine)
 "event.phase_done" = "[ok] {}"
@@ -879,6 +880,8 @@
 "slash.skill_header" = "[skill] Skills:\n\n{}"
 "slash.mouse_on" = "mouse-wheel scrolling on — Shift+drag for native text selection"
 "slash.mouse_off" = "mouse-wheel scrolling off — native text selection restored"
+"slash.logs_on" = "process logs on — the base's long-running build/command output now streams into the transcript as it runs (codex streams live; all bases show the full log on completion)"
+"slash.logs_off" = "process logs off — long-running command output collapses back to a short result preview"
 # Shown once when the user drags to select OUTSIDE the transcript (e.g. the input box) while mouse capture is on (which suppresses native selection) — points at the copy escape hatch.
 "tui.copy_hint" = "To copy text (including this input line): hold Shift and drag for your terminal's native selection, or run /mouse to turn mouse capture off. Pasting works as usual — the text is inserted as one block."
 "slash.redraw" = "screen repainted — cleared any stale or garbled cells"

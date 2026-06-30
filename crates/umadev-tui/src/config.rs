@@ -62,6 +62,15 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lang: Option<String>,
 
+    /// Show the base's long-running command (build / install / `spring-boot:run`)
+    /// output in the transcript as it runs, instead of the tight 200-char clip on
+    /// completion. Off by default. Toggled live via `/logs`; published to the
+    /// `UMADEV_SHOW_PROCESS_LOGS` env the host drivers read (see
+    /// [`Self::publish_process_logs`]). Only serialized when `true` so a default
+    /// config stays clean.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub show_process_logs: bool,
+
     /// Schema/migration version of this persisted config. Bumped by the ordered
     /// startup migration runner ([`run_migrations`]), which applies idempotent,
     /// fail-soft upgrade steps **once** per upgrade and then saves the new
@@ -187,6 +196,34 @@ impl UserConfig {
                 Some(m) if !m.is_empty() => std::env::set_var(var, m),
                 _ => std::env::remove_var(var),
             }
+        }
+    }
+
+    /// Publish the saved process-log preference into the `UMADEV_SHOW_PROCESS_LOGS`
+    /// env the base drivers read, so the choice takes effect on the next
+    /// turn/session. Call at startup (from [`Self::show_process_logs`]) and after a
+    /// live `/logs` toggle. A `false` value clears the env so it cleanly falls back
+    /// to the tight default. Associated (not `&self`) so the live toggle can publish
+    /// the new value without re-borrowing the whole config.
+    pub fn publish_process_logs(on: bool) {
+        if on {
+            std::env::set_var(umadev_host::process_logs::SHOW_PROCESS_LOGS_ENV, "1");
+        } else {
+            std::env::remove_var(umadev_host::process_logs::SHOW_PROCESS_LOGS_ENV);
+        }
+    }
+
+    /// Publish THIS config's saved process-log preference at startup (see
+    /// [`Self::publish_process_logs`]). An env already set externally (advanced /
+    /// CI) wins and is never cleared here; otherwise the saved preference is honored
+    /// only to TURN IT ON (a `false` config leaves the env untouched, so an external
+    /// override survives). The live `/logs` toggle still set/clears explicitly.
+    pub fn apply_process_logs(&self) {
+        if std::env::var(umadev_host::process_logs::SHOW_PROCESS_LOGS_ENV).is_ok() {
+            return;
+        }
+        if self.show_process_logs {
+            Self::publish_process_logs(true);
         }
     }
 
