@@ -60,6 +60,32 @@ pub const SURFACED_IDENTITIES_FILE: &str = "surfaced-identities.json";
 /// audit trail (the audit log already covers that).
 const MAX_REFLECTIONS_PER_SIG: usize = 3;
 
+/// Process-wide lock serialising **every** read-modify-write of
+/// [`DEV_ERRORS_FILE`] (`dev-errors.jsonl`) across all of its mutators
+/// ([`capture_dev_errors`], [`record_pitfall_strategy`],
+/// [`record_pitfall_injections`], [`mark_pitfalls_resolved`],
+/// [`apply_dev_error_trust`], [`apply_trust_for_signatures`]).
+///
+/// The temp-write-then-rename in [`write_atomic`] prevents a *torn* file, but a
+/// single atomic write does NOT prevent a *lost update*: two mutators running
+/// concurrently each read state S, mutate independently, and the later writer
+/// clobbers the earlier writer's record — silently dropping a captured pitfall
+/// or an efficacy/trust update and degrading the self-learning memory.
+/// Concurrency is real (the parallel docs fan-out drives two forked bases), so
+/// the read-mutate-write must be serialised ACROSS functions — a per-function
+/// lock only excludes a function against itself. One shared lock fixes that.
+static DEV_ERRORS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`DEV_ERRORS_LOCK`], recovering from poison so a panic in another
+/// holder never blocks or panics this fail-open path. The returned guard must
+/// be held for the WHOLE read-modify-write of `dev-errors.jsonl`. Callers are
+/// synchronous, so the guard is never held across an `await`.
+fn lock_dev_errors() -> std::sync::MutexGuard<'static, ()> {
+    DEV_ERRORS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The kind of captured experience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -663,14 +689,11 @@ pub fn capture_dev_errors(
     slug: &str,
     requirement: &str,
 ) -> usize {
-    // Process-wide lock serializing this KB read-modify-write so concurrent
-    // pipeline steps (the parallel docs fan-out's two forked bases) can't
-    // clobber each other. Recover from poison so a panic elsewhere never
-    // blocks or panics this fail-open path.
-    static DEV_KB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _kb_guard = DEV_KB_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Shared process-wide lock serialising this KB read-modify-write against
+    // EVERY other dev-errors.jsonl mutator (not just this function), so the
+    // parallel docs fan-out's two forked bases can't clobber each other's
+    // record. Held for the whole read-mutate-write below.
+    let _kb_guard = lock_dev_errors();
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     // The tech-stack fingerprint present *right now* — stamped onto each
     // pitfall so triggering can later match "same situation", not prose.
@@ -983,17 +1006,15 @@ only — a few sentences, imperative voice, no preamble, no code dump."
 /// classified signature. Returns `true` if a matching pitfall was updated.
 ///
 /// Fail-open: an empty strategy, a missing store, or any I/O error is a no-op —
-/// the caller falls back to the existing template path. Holds [`DEV_KB_LOCK`]
-/// for the dev-errors read-modify-write so it never races the capture path.
+/// the caller falls back to the existing template path. Holds
+/// [`DEV_ERRORS_LOCK`] for the dev-errors read-modify-write so it never races
+/// the capture path (or any other dev-errors mutator).
 pub fn record_pitfall_strategy(project_root: &Path, signature: &str, strategy: &str) -> bool {
     let strategy = strategy.trim();
     if strategy.is_empty() {
         return false;
     }
-    static DEV_KB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _kb_guard = DEV_KB_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _kb_guard = lock_dev_errors();
     let sig = normalize_signature(signature);
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
@@ -3318,6 +3339,9 @@ fn record_pitfall_injections(project_root: &Path, signatures: &[String], active_
     if signatures.is_empty() {
         return;
     }
+    // Shared dev-errors lock: this read-modify-write must not race the capture /
+    // strategy / resolve / trust paths and lose their concurrent update.
+    let _kb_guard = lock_dev_errors();
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
         return;
@@ -3364,6 +3388,9 @@ pub fn mark_pitfalls_resolved(project_root: &Path, raw_errors: &[String]) -> usi
     if want.is_empty() {
         return 0;
     }
+    // Shared dev-errors lock: keep this read-modify-write atomic against the
+    // other mutators so a concurrent capture/strategy update isn't clobbered.
+    let _kb_guard = lock_dev_errors();
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
         return 0;
@@ -3436,6 +3463,9 @@ pub fn apply_dev_error_trust(project_root: &Path, raw_errors: &[String], passed:
     if want.is_empty() {
         return 0;
     }
+    // Shared dev-errors lock: keep this read-modify-write atomic against the
+    // other mutators so a concurrent capture/strategy update isn't clobbered.
+    let _kb_guard = lock_dev_errors();
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
         return 0;
@@ -3468,6 +3498,9 @@ pub fn apply_trust_for_signatures(
     if want.is_empty() {
         return 0;
     }
+    // Shared dev-errors lock: keep this read-modify-write atomic against the
+    // other mutators so a concurrent capture/strategy update isn't clobbered.
+    let _kb_guard = lock_dev_errors();
     let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
     if store.is_empty() {
         return 0;
@@ -3870,6 +3903,95 @@ mod tests {
         );
         assert!(recall.contains("规避"));
         assert!(recall.contains("已踩 2 次"), "frequency shown: {recall}");
+    }
+
+    #[test]
+    fn concurrent_dev_error_mutators_do_not_lose_each_others_update() {
+        // CONFIRMED MED lost-update race: capture_dev_errors and
+        // record_pitfall_strategy each read the whole dev-errors store, mutate a
+        // DIFFERENT record, then rewrite the WHOLE store. Run concurrently
+        // WITHOUT a shared lock, the later writer's stale snapshot clobbers the
+        // earlier writer's record -> a silently dropped pitfall / strategy. The
+        // single DEV_ERRORS_LOCK around every read-modify-write must make the two
+        // functions mutually exclude so BOTH mutations survive in the final file.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // Pre-seed a SECOND, distinct pitfall that record_pitfall_strategy will
+        // mutate (it only writes when it finds a matching signature). Thread A
+        // captures react-router; Thread B sets this record's next_strategy.
+        let strat_sig = "build/type-error/seed-record";
+        let seed = Lesson {
+            kind: LessonKind::DevError,
+            domain: "build".into(),
+            title: format!("踩坑 [{strat_sig}]"),
+            body: String::new(),
+            fix: "fix the type".into(),
+            root_cause: "type mismatch".into(),
+            keywords: vec!["type".into()],
+            source_requirement: "r".into(),
+            first_seen: "2026-06-21T00:00:00Z".into(),
+            signature: strat_sig.into(),
+            occurrences: 1,
+            context: vec!["ts".into()],
+            efficacy: None,
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        };
+        write_raw_lessons(&root, DEV_ERRORS_FILE, std::slice::from_ref(&seed));
+
+        const ITERS: usize = 200;
+        let capture_err = "Error: Cannot find module 'react-router-dom'".to_string();
+        let capture_sig = "dependency/module-not-found/react-router-dom";
+
+        std::thread::scope(|s| {
+            // Thread A: capture the SAME error ITERS times. The first creates the
+            // record (occurrences=1); each recurrence bumps occurrences by 1, so a
+            // race-free run ends at exactly ITERS.
+            let root_a = root.clone();
+            let err_a = capture_err.clone();
+            s.spawn(move || {
+                for _ in 0..ITERS {
+                    let _ =
+                        capture_dev_errors(&root_a, std::slice::from_ref(&err_a), "demo", "需求");
+                }
+            });
+            // Thread B: set the seed record's next_strategy ITERS times. Each call
+            // is a full read-modify-write of the SAME file.
+            let root_b = root.clone();
+            s.spawn(move || {
+                for _ in 0..ITERS {
+                    let _ = record_pitfall_strategy(&root_b, strat_sig, "winning-strategy");
+                }
+            });
+        });
+
+        let store = read_raw_lessons(&root, DEV_ERRORS_FILE);
+
+        // Thread A's update survived in full: every increment is accounted for.
+        let captured = store
+            .iter()
+            .find(|l| l.signature == capture_sig)
+            .expect("captured pitfall present (thread A's record not clobbered)");
+        assert_eq!(
+            captured.hits(),
+            ITERS as u32,
+            "no capture increment was lost to a clobbering write"
+        );
+
+        // Thread B's update survived: the seed record still carries its strategy
+        // (a lost-update would have reverted next_strategy to empty / None).
+        let seeded = store
+            .iter()
+            .find(|l| l.signature == strat_sig)
+            .expect("seed pitfall present (thread B's record not clobbered)");
+        assert_eq!(
+            seeded.efficacy.as_ref().map(|e| e.next_strategy.as_str()),
+            Some("winning-strategy"),
+            "thread B's strategy write was not lost to a clobbering capture write"
+        );
     }
 
     #[test]
