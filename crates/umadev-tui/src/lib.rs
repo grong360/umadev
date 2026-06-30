@@ -8053,6 +8053,11 @@ mod tests {
         /// Mark the fake's base process as DEAD: [`BaseSession::try_exit_status`]
         /// then reports `Some(status)`, so a transient-failure path treats it as a
         /// genuine teardown (end + re-open) rather than a recoverable park.
+        // The sole caller is the unix-gated transient-failure test below
+        // (`ExitStatus::from_raw` has unix wait-status semantics), so this builder
+        // is dead code on Windows where `-D warnings` then fails the build. Gate it
+        // to match its caller.
+        #[cfg(unix)]
         fn with_exit_status(mut self, status: std::process::ExitStatus) -> Self {
             self.exit_status = Some(status);
             self
