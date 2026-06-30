@@ -1682,21 +1682,36 @@
   padding-bottom: 110px;
 }
 
+/* The changelog hero shares the centered axis of the centered release
+   timeline below it (big-tech changelog convention — Stripe / Vercel /
+   Linear), so the whole view reads as one intentional, centered column
+   instead of a left-jammed block with a void on the right. Scoped to
+   .logPage so the docs / gallery / contributors heroes stay left-aligned. */
+.logPage .pageHero {
+  text-align: center;
+}
+
+.logPage .pageHero h1,
+.logPage .pageHero p {
+  margin-left: auto;
+  margin-right: auto;
+}
+
 /* Changelog — a clean, big-tech timeline. A version/date rail on the left,
    a short title + well-spaced tagged changes on the right, one connector line
    threading the entries with a node dot per release, the latest highlighted.
    No per-entry card chrome: whitespace and hierarchy carry the page. */
 .releaseTimeline {
-  max-width: 940px;
+  max-width: 1040px;
   padding: 0;
-  margin: 10px 0 0;
+  margin: 10px auto 0;
   list-style: none;
 }
 
 .releaseEntry {
   display: grid;
-  grid-template-columns: 168px minmax(0, 1fr);
-  gap: 40px;
+  grid-template-columns: 184px minmax(0, 1fr);
+  gap: 48px;
 }
 
 /* Left rail: version, date, Latest pill — sticky so it stays in view while a
@@ -1762,6 +1777,14 @@
   content: "";
   position: absolute;
   top: 5px;
+  /* The connector line is the body's 1px border-left, so its center sits 0.5px
+     inside the border box. box-sizing MUST be set explicitly here: the global
+     reset is `* { box-sizing: border-box }`, and the universal selector does
+     NOT match ::before / ::after pseudo-elements — so without this the dot
+     falls back to content-box, making it 9 + 2 + 2 = 13px wide and pushing its
+     center ~2px to the right of the line. With border-box the dot is a true 9px
+     and left: -5px lands its center exactly on the line. */
+  box-sizing: border-box;
   left: -5px;
   width: 9px;
   height: 9px;
@@ -1785,7 +1808,7 @@
 }
 
 .releaseTitle {
-  max-width: 42ch;
+  max-width: 52ch;
   margin: 0 0 22px;
   color: var(--text);
   font-family: var(--font-space), sans-serif;
@@ -1805,13 +1828,13 @@
 
 .releaseChange {
   display: grid;
-  grid-template-columns: 84px minmax(0, 1fr);
-  gap: 16px;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 18px;
   align-items: start;
 }
 
 .releaseChange p {
-  max-width: 66ch;
+  max-width: 72ch;
   margin: 0;
   color: var(--muted);
   font-size: 15px;
