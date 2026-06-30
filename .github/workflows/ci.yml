@@ -78,6 +78,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release
         run: cargo build --release --bin umadev
+      # A startup-panic guard: the unit suite never runs the real TUI event loop,
+      # so a launch crash (e.g. an eager-evaluated `tokio::select!` branch arg)
+      # shipped in 1.0.17/1.0.18 undetected. PTY-launch the built binary and fail
+      # if it panics before/at the event loop.
+      - name: Launch smoke test (no startup panic)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          # A configured backend so the TUI skips the first-run picker and enters
+          # the main chat event loop — the exact path that panicked on launch.
+          mkdir -p "$HOME/.umadev"
+          printf 'backend = "offline"\nlang = "en"\n' > "$HOME/.umadev/config.toml"
+          BIN=target/release/umadev
+          echo "PTY-launching $BIN to verify it reaches the event loop without panicking..."
+          # `script` gives the TUI a PTY; stdin is held open ~6s so it enters and
+          # stays in the loop, then EOF -> a clean quit. `timeout` is a hard backstop.
+          OUT=$(timeout 25 script -q -e -c "$BIN" /dev/null < <(sleep 6) 2>&1 || true)
+          if printf '%s' "$OUT" | grep -qE 'panicked at'; then
+            echo "::error::umadev panicked on launch -- a startup crash must never ship"
+            printf '%s\n' "$OUT" | tail -60
+            exit 1
+          fi
+          echo "Launch smoke OK: no startup panic."
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
