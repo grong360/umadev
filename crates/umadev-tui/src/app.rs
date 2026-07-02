@@ -3645,6 +3645,26 @@ impl App {
         self.refresh_status();
     }
 
+    /// Push a visible "— continued —" divider into the transcript when a
+    /// blocked / interrupted run is resumed (`/continue`, `/tasks resume`).
+    ///
+    /// The resumed run APPENDS its output to the SAME durable [`Self::history`],
+    /// so the earlier steps' per-step notes (plan-posted memo, `push_critic_note`
+    /// verdicts, tool rows) stay in scrollback — a block only clears the LIVE
+    /// PANEL state ([`Self::clear_live_panels`]), never the transcript. Without a
+    /// marker, though, the transcript auto-sticks to the bottom on resume and the
+    /// user sees only the newest (resumed) steps, so the run *reads* as if the
+    /// earlier steps vanished (user-reported). This divider is the affordance: it
+    /// marks where the run picked back up AND points the user to the earlier steps
+    /// above, so the whole run reads as one continuous history to scroll back
+    /// through. Fail-open: a pure `push`, never panics.
+    fn push_resume_separator(&mut self) {
+        self.push(
+            ChatRole::System,
+            umadev_i18n::t(self.lang, "continue.separator"),
+        );
+    }
+
     // ---- transcript scrollback -------------------------------------------
     //
     // `transcript_scroll` is the number of wrapped rows the user has scrolled
@@ -8596,6 +8616,12 @@ impl App {
                     // requirement is read back from `.umadev/workflow-state.json` when
                     // the in-memory one is empty (a reopened TUI has none).
                     let req = self.resume_run_requirement();
+                    // Divider BEFORE the resuming note: the earlier steps stay in
+                    // scrollback (the block never cleared the transcript) and the
+                    // resumed run appends below this, so the whole run reads as one
+                    // continuous history instead of looking like the earlier steps
+                    // vanished.
+                    self.push_resume_separator();
                     self.push(
                         ChatRole::UmaDev,
                         umadev_i18n::t(self.lang, "continue.resuming"),
@@ -9352,6 +9378,9 @@ impl App {
                     // Re-attach to the persisted plan + drive the remaining steps
                     // (the same RESUME the `/continue` cross-session path uses).
                     let req = self.resume_run_requirement();
+                    // Same continuity affordance as `/continue`: the earlier steps
+                    // stay in scrollback, this divider marks where the run resumes.
+                    self.push_resume_separator();
                     self.push(
                         ChatRole::UmaDev,
                         umadev_i18n::t(self.lang, "continue.resuming"),
@@ -16548,6 +16577,131 @@ mod tests {
                 .skip(before)
                 .any(|m| m.body().contains("还没启动流水线")),
             "the restart hint is NOT shown"
+        );
+    }
+
+    #[test]
+    fn resuming_a_blocked_run_keeps_earlier_transcript_and_marks_a_continued_divider() {
+        // User-reported: after a run BLOCKS and the user `/continue`s, the earlier
+        // steps must NOT disappear from the transcript. The block only clears the
+        // LIVE PANEL (plan / verdict) state; the durable `history` (plan-posted
+        // memo + per-seat critic notes + the block message) is preserved, and the
+        // resume APPENDS a "— continued —" divider so the run reads as one
+        // continuous history the user can scroll back through.
+        let mut app = fresh_app(Some("claude-code"));
+
+        // ---- Earlier steps: a posted plan + two seat verdicts (one a BLOCK). ----
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold app (frontend-engineer)".into(),
+                "s2 · wire auth API (backend-engineer)".into(),
+            ],
+            done: 0,
+            total: 2,
+        });
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "architect".into(),
+            accepts: true,
+            blocking: vec![],
+            remediation: vec![],
+            advisory: vec![],
+        });
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "security".into(),
+            accepts: false,
+            blocking: vec!["step-2-auth-token-leak".into()],
+            remediation: vec!["scope the token to the session".into()],
+            advisory: vec![],
+        });
+        // The run hits a hard block and stops (clears the live panels, keeps the
+        // transcript).
+        app.mark_block_aborted("step-2-blocked-marker".into());
+
+        // The panels are gone, but the earlier per-step content is still in the
+        // scrollable transcript.
+        assert!(
+            app.plan_steps.is_empty(),
+            "block clears the live plan panel"
+        );
+        assert!(
+            app.critic_verdicts.is_empty(),
+            "block clears the live review panel"
+        );
+        // The per-step team-review notes (seat + blocking finding) and the block
+        // message are the durable transcript record that must survive the block.
+        // (Plan step TITLES live only in the panel, so they are re-posted on
+        // resume, not asserted here.)
+        let earlier_markers = [
+            "security",
+            "step-2-auth-token-leak",
+            "step-2-blocked-marker",
+        ];
+        for m in earlier_markers {
+            assert!(
+                app.history.iter().any(|row| row.body().contains(m)),
+                "earlier transcript content `{m}` is present after the block"
+            );
+        }
+
+        // A resumable run exists on disk (what an interrupted /run leaves behind).
+        let plan = umadev_agent::Plan {
+            steps: vec![umadev_agent::PlanStep {
+                id: "s2".into(),
+                title: "wire auth API".into(),
+                seat: umadev_agent::Seat::BackendEngineer,
+                kind: umadev_agent::StepKind::Build,
+                depends_on: vec![],
+                acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+                evidence: Vec::new(),
+                status: umadev_agent::StepStatus::Pending,
+            }],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Backend);
+        state.slug = "demo".into();
+        state.requirement = "做一个登录页".into();
+        state.backend = "claude-code".into();
+        umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+
+        // Snapshot the earlier transcript row bodies, then resume.
+        let earlier_bodies: Vec<String> =
+            app.history.iter().map(|m| m.body().to_string()).collect();
+        let len_before = app.history.len();
+        let action = app
+            .try_slash_command("/continue")
+            .expect("/continue is a slash command");
+        assert_eq!(action, Action::ResumeRun("做一个登录页".to_string()));
+
+        // Every earlier row is STILL present, in order (nothing was dropped).
+        let after_bodies: Vec<String> = app.history.iter().map(|m| m.body().to_string()).collect();
+        assert_eq!(
+            &after_bodies[..len_before],
+            &earlier_bodies[..],
+            "the earlier transcript is preserved, unmodified, as a prefix"
+        );
+
+        // The resume APPENDED a "— continued —" divider (the localized separator).
+        let separator = umadev_i18n::t(app.lang, "continue.separator");
+        let sep_idx = app
+            .history
+            .iter()
+            .position(|m| m.body() == separator)
+            .expect("a continued divider was appended on resume");
+        assert!(
+            sep_idx >= len_before,
+            "the divider is appended AFTER the preserved earlier transcript"
+        );
+        // The resuming note follows the divider (earlier steps · divider · resume).
+        let resume_idx = app
+            .history
+            .iter()
+            .rposition(|m| m.body().contains("续跑"))
+            .expect("the resuming note is shown");
+        assert!(
+            sep_idx < resume_idx,
+            "the divider precedes the resuming note"
         );
     }
 
