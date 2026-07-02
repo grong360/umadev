@@ -721,6 +721,189 @@ pub fn persona_for_role(role: &str) -> &'static str {
     }
 }
 
+/// The knowledge-corpus SUBDIRECTORIES a SEAT should draw from — the per-seat
+/// analogue of `umadev_knowledge::retrieve::phase_subdirs`, restoring the spirit
+/// of the LEGACY per-seat routing (`experts/frontend-lead`, `experts/backend-lead`,
+/// …) on the DEFAULT agentic path (which previously scoped knowledge only on the
+/// step instruction text, identical for every seat).
+///
+/// Each seat maps to the domains of its own discipline so a frontend step draws
+/// frontend + design knowledge, a security step draws the security / compliance
+/// KB, a backend step draws backend / api / architecture, and so on. The paths
+/// are corpus-relative segment names (matched against a chunk's `meta.path` by
+/// the seat-scoped digest). Case-insensitive + alias-tolerant (mirrors
+/// [`persona_for_role`] / `critic_for_role`).
+///
+/// Returns `&[]` for an UNKNOWN seat so a caller fail-opens to the plain
+/// instruction-keyed digest (an unknown seat scopes to nothing, never panics).
+#[must_use]
+pub fn seat_knowledge_domains(role: &str) -> &'static [&'static str] {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "product-manager" | "pm" | "product" | "product-researcher" | "researcher" => {
+            &["experts/product-manager", "product", "industries"]
+        }
+        "architect" | "architecture" | "tech-lead" => &[
+            "experts/architect",
+            "architecture",
+            "api",
+            "database",
+            "backend",
+            "development",
+        ],
+        "uiux-designer" | "uiux" | "designer" | "ui" | "ux" => &[
+            "experts/uiux-designer",
+            "design",
+            "design-systems",
+            "frontend",
+        ],
+        "frontend-engineer" | "frontend" | "fe" => &[
+            "experts/frontend-lead",
+            "experts/uiux-designer",
+            "frontend",
+            "design",
+            "cross-platform",
+        ],
+        "backend-engineer" | "backend" | "be" => &[
+            "experts/backend-lead",
+            "experts/architect",
+            "backend",
+            "api",
+            "database",
+            "architecture",
+            "security",
+        ],
+        "qa-engineer" | "qa" => &["experts/qa-lead", "testing", "performance", "observability"],
+        "security-engineer" | "security" => &["security", "compliance", "00-governance"],
+        "devops-engineer" | "devops" | "sre" | "release" => &[
+            "experts/devops",
+            "cicd",
+            "operations",
+            "release-engineering",
+            "cloud-native",
+        ],
+        // Unknown seat → no domains (fail-open to the plain digest).
+        _ => &[],
+    }
+}
+
+/// A short bag of DOMAIN QUERY TERMS for a SEAT — prepended to (blended with) the
+/// retrieval query so BM25 leans toward the seat's own vocabulary even before the
+/// subdir filter runs. This is what makes two DIFFERENT seats on the SAME step
+/// instruction pull DIFFERENT knowledge (the seat, not just the instruction text,
+/// drives retrieval). The step instruction is still appended, so step relevance is
+/// never discarded — the bias only re-weights.
+///
+/// Returns `""` for an unknown seat (fail-open: the query is then just the
+/// instruction, exactly today's behaviour).
+#[must_use]
+pub fn seat_query_bias(role: &str) -> &'static str {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "product-manager" | "pm" | "product" | "product-researcher" | "researcher" => {
+            "product requirements scope acceptance user story jobs to be done"
+        }
+        "architect" | "architecture" | "tech-lead" => {
+            "architecture API contract data model system design layering module boundaries"
+        }
+        "uiux-designer" | "uiux" | "designer" | "ui" | "ux" => {
+            "design system tokens typography color spacing component states icon library"
+        }
+        "frontend-engineer" | "frontend" | "fe" => {
+            "frontend UI component design tokens accessibility responsive fetch API state"
+        }
+        "backend-engineer" | "backend" | "be" => {
+            "backend API endpoint route database schema validation error handling layering"
+        }
+        "qa-engineer" | "qa" => "testing test coverage assertion regression edge case independence",
+        "security-engineer" | "security" => {
+            "security authentication authorization injection secret vulnerability session"
+        }
+        "devops-engineer" | "devops" | "sre" | "release" => {
+            "devops CI CD deploy pipeline build release rollback infrastructure"
+        }
+        _ => "",
+    }
+}
+
+/// The per-seat WORKING METHOD — the concrete evaluation criteria / method a seat
+/// applies to its own step, so a seat carries a specialist's discipline, not just
+/// a renamed persona line. Prepended (by [`crate::director::summon`]) after the
+/// persona and before the task, this deepens each doing seat with the checklist of
+/// its craft (frontend: contract-align fetch URLs + a11y + design tokens; security:
+/// authz / IDOR / injection / secret handling; QA: test independence + meaningful
+/// assertions; …). Generalised craft, no external source. Bounded (a few lines).
+///
+/// Returns `""` for an unknown seat (fail-open: just the persona + task, as today).
+#[must_use]
+pub fn seat_method(role: &str) -> &'static str {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "product-manager" | "pm" | "product" | "product-researcher" | "researcher" => {
+            "## Your working method\n\
+             Scope the requirement into who it's for, the jobs to be done, and \
+             acceptance criteria per feature — each traceable to a requirement id so \
+             coverage maps 1:1. Name the non-negotiables and what is explicitly \
+             out-of-scope; cut ambiguity rather than leave it for the build to guess."
+        }
+        "architect" | "architecture" | "tech-lead" => {
+            "## Your working method\n\
+             Define the API surface + data model as the BINDING contract the frontend \
+             and backend both align to (path, method, request/response shape, a \
+             consistent error envelope). Choose clean layering + clear module \
+             boundaries, name the non-negotiable patterns, and keep every decision \
+             traceable to a requirement id."
+        }
+        "uiux-designer" | "uiux" | "designer" | "ui" | "ux" => {
+            "## Your working method\n\
+             Deliver the design system as REAL files: a token source of truth \
+             (typographic scale, color palette, spacing, radii) and ONE declared icon \
+             library (Lucide / Heroicons / Tabler — never emoji), with every component \
+             state specified. It must read as intentional craft, never a template — no \
+             default-font-only, no purple/pink AI-slop gradient."
+        }
+        "frontend-engineer" | "frontend" | "fe" => {
+            "## Your working method\n\
+             Wire every data call to the architecture's API table — fetch/axios URLs \
+             and methods must match a REAL backend route exactly (never invent an \
+             endpoint). Use ONLY the declared icon library (never emoji) and design \
+             tokens (never hardcoded colors/spacing). Implement every component state \
+             (loading / empty / error / success), keyboard focus + ARIA labels on \
+             interactive elements, and a responsive layout."
+        }
+        "backend-engineer" | "backend" | "be" => {
+            "## Your working method\n\
+             Build in clean layers (thin controllers -> services -> repositories). \
+             Every endpoint matches the architecture's API table (path + method + \
+             shape). Validate + sanitize all inputs at the boundary, return a \
+             consistent error envelope, never leak internals in an error, and cover \
+             each route with a test."
+        }
+        "qa-engineer" | "qa" => {
+            "## Your working method\n\
+             Each test is INDEPENDENT (no shared mutable state, deterministic, \
+             order-free) and asserts real behaviour + edge cases, not merely that the \
+             code runs. Cover failure paths and boundaries, not just the happy path — \
+             a meaningful assertion per test. Run the project's REAL build / test / \
+             lint and sign off only on what actually passes."
+        }
+        "security-engineer" | "security" => {
+            "## Your working method\n\
+             Work a real attack-surface checklist: authentication + per-object \
+             authorization (no IDOR), injection (SQL / command / XSS / SSRF), secret \
+             handling (no hardcoded keys; secrets from env / a manager only), safe \
+             error handling (no stack traces or internals to the client), dependency + \
+             input validation, and a sound session/cookie posture. Report each \
+             exploitable finding with its file:line and the concrete fix."
+        }
+        "devops-engineer" | "devops" | "sre" | "release" => {
+            "## Your working method\n\
+             A reproducible build -> deploy pipeline: pin versions, parameterize env / \
+             config (no secrets baked into the image), a health check + a rollback \
+             path, and CI that runs build + test + lint on every change. Capture the \
+             EXACT deploy recipe; never mutate a remote system as a side effect."
+        }
+        _ => "",
+    }
+}
+
 /// The one-line ROLE PERSONA for a LEAN gateless phase (`Light` / `Bugfix` /
 /// `Refactor`). The lean fast-track has no document phases, so the role is a
 /// short "you are a senior engineer, just implement this" rather than the
@@ -1490,6 +1673,83 @@ mod tests {
             .contains("product manager"));
         // Unknown seat → empty (fail-open).
         assert!(persona_for_role("astrologer").is_empty());
+    }
+
+    #[test]
+    fn seat_knowledge_domains_route_each_seat_and_fail_open() {
+        // Per-seat knowledge routing: each seat scopes to ITS discipline's
+        // corpus subdirs (the legacy `experts/<seat>` spirit on the default path).
+        assert!(seat_knowledge_domains("frontend-engineer").contains(&"frontend"));
+        assert!(
+            seat_knowledge_domains("frontend").contains(&"design"),
+            "alias + design"
+        );
+        assert!(seat_knowledge_domains("security-engineer").contains(&"security"));
+        assert!(seat_knowledge_domains("backend-engineer").contains(&"backend"));
+        assert!(seat_knowledge_domains("backend").contains(&"api"));
+        assert!(seat_knowledge_domains("qa").contains(&"testing"));
+        assert!(seat_knowledge_domains("devops").contains(&"cicd"));
+        assert!(seat_knowledge_domains("architect").contains(&"architecture"));
+        assert!(seat_knowledge_domains("uiux-designer").contains(&"design"));
+        assert!(seat_knowledge_domains("product-manager").contains(&"product"));
+        // Two different seats route to DIFFERENT domain sets (seat, not name, drives it).
+        assert_ne!(
+            seat_knowledge_domains("frontend-engineer"),
+            seat_knowledge_domains("security-engineer"),
+            "distinct seats scope to distinct knowledge"
+        );
+        // Unknown seat → no domains (fail-open to the plain digest).
+        assert!(seat_knowledge_domains("astrologer").is_empty());
+    }
+
+    #[test]
+    fn seat_query_bias_differs_by_seat_and_fails_open() {
+        assert!(seat_query_bias("frontend")
+            .to_lowercase()
+            .contains("frontend"));
+        assert!(seat_query_bias("security")
+            .to_lowercase()
+            .contains("security"));
+        assert!(seat_query_bias("qa").to_lowercase().contains("test"));
+        // Distinct seats → distinct bias terms (drives divergent retrieval).
+        assert_ne!(seat_query_bias("frontend"), seat_query_bias("backend"));
+        // Unknown seat → empty bias (query is then just the instruction, as today).
+        assert!(seat_query_bias("astrologer").is_empty());
+    }
+
+    #[test]
+    fn seat_method_carries_specialty_criteria_and_fails_open() {
+        // The per-seat WORKING METHOD is concrete evaluation criteria, not a name.
+        let fe = seat_method("frontend-engineer").to_lowercase();
+        assert!(
+            fe.contains("api") && fe.contains("token"),
+            "frontend: contract-align + tokens"
+        );
+        let sec = seat_method("security").to_lowercase();
+        assert!(
+            sec.contains("authorization") && sec.contains("injection"),
+            "security: authz + injection checklist"
+        );
+        let qa = seat_method("qa").to_lowercase();
+        assert!(
+            qa.contains("independent") && qa.contains("assert"),
+            "qa: independence + assertions"
+        );
+        // Distinct seats carry distinct methods.
+        assert_ne!(seat_method("frontend"), seat_method("security"));
+        // Bounded: a method is a short checklist, not a corpus.
+        for r in [
+            "frontend",
+            "backend",
+            "security",
+            "qa",
+            "devops",
+            "architect",
+        ] {
+            assert!(seat_method(r).len() < 800, "seat_method({r}) stays bounded");
+        }
+        // Unknown seat → empty (fail-open: just the persona + task).
+        assert!(seat_method("astrologer").is_empty());
     }
 
     #[test]

@@ -218,6 +218,119 @@ pub fn agentic_knowledge_digest(
     out
 }
 
+/// A SEAT-SCOPED knowledge digest — the per-seat analogue of
+/// [`agentic_knowledge_digest`], so a doer step draws knowledge from ITS OWN
+/// discipline rather than only from the step-instruction text (which is identical
+/// regardless of which seat is wearing the step). Restores the spirit of the
+/// legacy per-seat knowledge routing (`experts/frontend-lead`, …) on the default
+/// agentic path.
+///
+/// Two levers, both from [`crate::experts`], make the SEAT — not just the
+/// instruction — drive retrieval:
+/// 1. the query is BLENDED: `seat_query_bias(role) + instruction` biases BM25
+///    toward the seat's vocabulary WITHOUT discarding step relevance; and
+/// 2. the results are FILTERED to `seat_knowledge_domains(role)` (plus the
+///    cross-cutting learned lessons), so a frontend seat keeps frontend/design
+///    chunks and a security seat keeps security/compliance chunks.
+///
+/// The retrieval over-fetches (bounded) so the domain filter has candidates, but
+/// still renders at most `max_chunks` short excerpts, so the character budget is
+/// IDENTICAL to [`agentic_knowledge_digest`] (the shared firmware budget is not
+/// blown).
+///
+/// **Fail-open at every step:** an unknown seat (no domains), an empty query, no
+/// `knowledge/` dir, a disabled KB, no match, or a filter that would empty the set
+/// each degrade to the plain [`agentic_knowledge_digest`] (or an empty string) —
+/// never a panic, and never WORSE than the seat-agnostic path.
+#[must_use]
+pub fn seat_scoped_knowledge_digest(
+    project_root: &Path,
+    role: &str,
+    instruction: &str,
+    max_chunks: usize,
+) -> String {
+    if instruction.trim().is_empty() || max_chunks == 0 {
+        return String::new();
+    }
+    // Unknown seat → no domains → today's instruction-keyed digest (fail-open).
+    let domains = crate::experts::seat_knowledge_domains(role);
+    if domains.is_empty() {
+        return agentic_knowledge_digest(project_root, instruction, max_chunks);
+    }
+    let base = knowledge_root(project_root);
+    if !base.is_dir() {
+        return String::new();
+    }
+    let project_cfg = crate::config::load_project_config(project_root);
+    let cfg = &project_cfg.knowledge;
+    if !cfg.enabled {
+        return String::new();
+    }
+    // Blend the seat's domain vocabulary with the step instruction: the bias leans
+    // BM25 toward the seat's domain, the instruction keeps step relevance.
+    let bias = crate::experts::seat_query_bias(role);
+    let query = if bias.is_empty() {
+        instruction.to_string()
+    } else {
+        format!("{bias} {instruction}")
+    };
+    // Over-fetch (bounded to 32) so the seat-domain post-filter has candidates to
+    // keep; only `max_chunks` short excerpts are rendered, so the rendered budget
+    // matches `agentic_knowledge_digest`.
+    let over_fetch = max_chunks.saturating_mul(5).clamp(max_chunks, 32);
+    let rcfg = umadev_knowledge::retrieve::RetrievalConfig {
+        enabled: true,
+        engine: match cfg.engine.as_str() {
+            "hybrid" => umadev_knowledge::retrieve::RetrievalEngine::Hybrid,
+            _ => umadev_knowledge::retrieve::RetrievalEngine::Bm25,
+        },
+        top_k: over_fetch,
+        custom_dirs: Vec::new(),
+    };
+    // Phase::Research scans the whole tree (no built-in phase filter); the seat
+    // filter below is applied here so it keys on the SEAT, not a pipeline phase.
+    let hits = umadev_knowledge::retrieve(&base, &base, &rcfg, &query, Phase::Research);
+    if hits.is_empty() {
+        // Nothing matched even unfiltered → fall back so a seat step is never
+        // WORSE off than the plain path.
+        return agentic_knowledge_digest(project_root, instruction, max_chunks);
+    }
+    // Keep only chunks under the seat's domain subdirs (plus cross-cutting learned
+    // lessons); a chunk path is a segment match so `design` matches `design/x` but
+    // not `design-systems/x` (mirrors the knowledge crate's `filter_by_phase`).
+    let in_domain = |path: &str| -> bool {
+        path.contains("lesson-")
+            || path.starts_with("learned")
+            || domains
+                .iter()
+                .any(|d| path == *d || path.starts_with(&format!("{d}/")))
+    };
+    let mut chosen: Vec<&umadev_knowledge::ScoredChunk> = hits
+        .iter()
+        .filter(|h| in_domain(&h.chunk.meta.path))
+        .take(max_chunks)
+        .collect();
+    if chosen.is_empty() {
+        // The seat filter wiped everything → keep the unfiltered top hits (better
+        // relevant-but-off-domain than empty).
+        chosen = hits.iter().take(max_chunks).collect();
+    }
+    let mut out = format!(
+        "\n\nYOUR TEAM'S EXPERIENCE ON THIS ({role} seat — patterns and practices \
+         from your discipline that match this step; draw on what's useful, your \
+         judgment decides):\n\n"
+    );
+    for hit in chosen {
+        out.push_str(&format!(
+            "- `{}` — {}: {}\n",
+            hit.chunk.meta.path,
+            hit.chunk.meta.section,
+            hit.chunk.excerpt(220)
+        ));
+    }
+    out
+}
+
 /// The pre-4.6 keyword-scoring digest, retained as the fallback when
 /// `knowledge.enabled = false`.
 #[must_use]
@@ -3734,6 +3847,114 @@ mod tests {
             assert!(d.contains("layering.md"), "names the matched source");
             assert!(d.contains("YOUR TEAM'S EXPERIENCE"), "empowering framing");
         }
+    }
+
+    /// Build a two-domain corpus (frontend + security) under a fresh project so the
+    /// seat-scoped digest has DISTINCT discipline knowledge to route between.
+    #[cfg(test)]
+    fn two_domain_corpus() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let fe = tmp.path().join("knowledge").join("frontend");
+        let sec = tmp.path().join("knowledge").join("security");
+        fs::create_dir_all(&fe).unwrap();
+        fs::create_dir_all(&sec).unwrap();
+        fs::write(
+            fe.join("ui.md"),
+            "# Frontend UI\n\n## Components and design tokens\n\nBuild the frontend UI \
+             from design tokens and the declared icon library; wire every fetch call to \
+             the API contract; cover accessibility and responsive component states.\n",
+        )
+        .unwrap();
+        fs::write(
+            sec.join("authz.md"),
+            "# Security review\n\n## Authorization and injection\n\nCheck authentication \
+             and per-object authorization for IDOR, guard against injection, and never \
+             hardcode a secret — load secrets from the environment or a manager.\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn seat_scoped_digest_routes_frontend_and_security_to_their_own_knowledge() {
+        let _no_corpus = NoBundledCorpus::new();
+        let tmp = two_domain_corpus();
+        let instr = "implement the account settings page";
+        // SAME step instruction, DIFFERENT seats → DIFFERENT knowledge: proving the
+        // SEAT (not just the instruction text) drives retrieval.
+        let fe = seat_scoped_knowledge_digest(tmp.path(), "frontend-engineer", instr, 4);
+        let sec = seat_scoped_knowledge_digest(tmp.path(), "security-engineer", instr, 4);
+        assert!(
+            !fe.is_empty() && !sec.is_empty(),
+            "both seats recall real knowledge"
+        );
+        assert_ne!(
+            fe, sec,
+            "two seats on the SAME instruction get DIFFERENT digests"
+        );
+        // The frontend seat draws the frontend/design chunk and filters OUT security.
+        assert!(
+            fe.contains("ui.md"),
+            "frontend seat surfaces frontend knowledge: {fe}"
+        );
+        assert!(
+            !fe.contains("authz.md"),
+            "frontend seat filters OUT security: {fe}"
+        );
+        assert!(
+            fe.contains("frontend-engineer seat"),
+            "header names the seat"
+        );
+        // The security seat draws the security chunk and filters OUT frontend.
+        assert!(
+            sec.contains("authz.md"),
+            "security seat surfaces security knowledge: {sec}"
+        );
+        assert!(
+            !sec.contains("ui.md"),
+            "security seat filters OUT frontend: {sec}"
+        );
+        assert!(
+            sec.contains("security-engineer seat"),
+            "header names the seat"
+        );
+    }
+
+    #[test]
+    fn seat_scoped_digest_unknown_seat_falls_open_to_the_plain_digest() {
+        let _no_corpus = NoBundledCorpus::new();
+        let tmp = two_domain_corpus();
+        let instr = "implement the account settings page";
+        // An unknown seat has no domains → byte-identical to the seat-agnostic digest
+        // (fail-open: never worse, never a panic).
+        let unknown = seat_scoped_knowledge_digest(tmp.path(), "astrologer", instr, 4);
+        let plain = agentic_knowledge_digest(tmp.path(), instr, 4);
+        assert_eq!(
+            unknown, plain,
+            "unknown seat == today's instruction-keyed digest"
+        );
+    }
+
+    #[test]
+    fn seat_scoped_digest_is_bounded_and_fails_open_on_edges() {
+        let _no_corpus = NoBundledCorpus::new();
+        let tmp = two_domain_corpus();
+        // Empty instruction / zero budget → empty (fail-open guards).
+        assert!(seat_scoped_knowledge_digest(tmp.path(), "frontend", "   ", 4).is_empty());
+        assert!(seat_scoped_knowledge_digest(tmp.path(), "frontend", "x", 0).is_empty());
+        // Bounded: even a generous max_chunks renders at most `max_chunks` short
+        // excerpts, so the digest stays a small overlay (never a corpus dump).
+        let big = seat_scoped_knowledge_digest(tmp.path(), "frontend", "build the ui", 4);
+        assert!(
+            big.chars().count() < 3_000,
+            "seat digest stays bounded: {}",
+            big.len()
+        );
+        // No knowledge dir → empty (fail-open), never a panic.
+        let bare = TempDir::new().unwrap();
+        assert!(
+            seat_scoped_knowledge_digest(bare.path(), "frontend", "build the ui", 4).is_empty()
+        );
     }
 
     #[test]

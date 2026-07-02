@@ -312,8 +312,13 @@ pub async fn summon(
 /// the existing prompt policy in `experts` / the knowledge digest in `phases` —
 /// the wording lives in one place.
 fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> String {
-    // Relevant accumulated experience for this slice (fail-open empty on a miss).
-    let knowledge = crate::phases::agentic_knowledge_digest(&options.project_root, instruction, 4);
+    // Relevant accumulated experience for this slice, SCOPED TO THE SEAT (not just
+    // the step-instruction text): the seat blends its own domain vocabulary into
+    // the query and filters the corpus to its discipline's subdirs, so a frontend
+    // step draws frontend/design knowledge and a security step draws security KB.
+    // Fail-open empty (or the plain instruction-keyed digest for an unknown seat).
+    let knowledge =
+        crate::phases::seat_scoped_knowledge_digest(&options.project_root, role, instruction, 4);
     let mut directive = String::new();
     directive.push_str(crate::experts::agentic_engineering_rules());
     directive.push_str("\n\n");
@@ -323,6 +328,16 @@ fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> Stri
     let persona = crate::experts::persona_for_role(role);
     if !persona.is_empty() {
         directive.push_str(persona);
+        directive.push_str("\n\n");
+    }
+    // The seat's concrete WORKING METHOD — the specialist checklist / evaluation
+    // criteria that makes the seat a differentiated discipline, not a renamed
+    // persona line (frontend: contract-align fetch URLs + a11y + tokens; security:
+    // authz / IDOR / injection / secrets; QA: test independence + real assertions).
+    // Fail-open: an unknown seat yields "" → just the persona + task, as before.
+    let method = crate::experts::seat_method(role);
+    if !method.is_empty() {
+        directive.push_str(method);
         directive.push_str("\n\n");
     }
     directive.push_str(&format!(
@@ -870,6 +885,54 @@ mod tests {
 
     fn sink() -> Arc<dyn EventSink> {
         Arc::new(RecordingSink::default())
+    }
+
+    #[test]
+    fn summon_directive_carries_seat_method_and_is_differentiated_per_seat() {
+        // A doer step's directive must carry the SEAT'S working method (a specialist
+        // checklist), so two seats on the SAME instruction are differentiated
+        // specialists, not one shared persona line. Isolate the corpus so the assert
+        // is about the seat method wiring, not incidental staged-corpus recall.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let instr = "build the account settings screen";
+        let fe = summon_directive(&o, "frontend-engineer", instr);
+        let sec = summon_directive(&o, "security-engineer", instr);
+        // Frontend directive carries the frontend method (contract-align fetch +
+        // design tokens) and NOT the security checklist.
+        let fe_l = fe.to_lowercase();
+        assert!(
+            fe_l.contains("fetch") && fe_l.contains("token"),
+            "frontend method: {fe}"
+        );
+        assert!(
+            !fe_l.contains("idor"),
+            "frontend directive is not the security one"
+        );
+        // Security directive carries the security checklist (authz / IDOR / injection).
+        let sec_l = sec.to_lowercase();
+        assert!(
+            sec_l.contains("idor") && sec_l.contains("injection"),
+            "security method: {sec}"
+        );
+        // Same instruction, DIFFERENT seat → DIFFERENT directive (seat drives it).
+        assert_ne!(
+            fe, sec,
+            "the seat, not just the instruction, shapes the directive"
+        );
+        // Both still carry the concrete task + the instruction (unchanged behaviour).
+        assert!(
+            fe.contains(instr) && sec.contains(instr),
+            "task + instruction preserved"
+        );
+        // Unknown seat: no persona, no method → still a valid non-empty directive
+        // (fail-open) carrying the instruction, never a panic or empty directive.
+        let unknown = summon_directive(&o, "astrologer", instr);
+        assert!(
+            !unknown.is_empty() && unknown.contains(instr),
+            "unknown seat fails open"
+        );
     }
 
     // ---- A scriptable fake BaseSession that records the directive it was driven

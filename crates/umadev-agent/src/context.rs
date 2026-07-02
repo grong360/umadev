@@ -349,6 +349,11 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     let root_buf = root.to_path_buf();
     let scope = route.scope.clone();
     let req = requirement.to_string();
+    // The lead seat (doers-first) names the DISCIPLINE this turn is about, so the
+    // JIT pitfall + knowledge layers are scoped to it — not keyed on the whole-run
+    // requirement identically for every seat. `None` (a teamless chat/explain turn)
+    // keeps the seat-agnostic behaviour; an unknown seat fails open the same way.
+    let seat = route.team.first().map(|s| s.role_id().to_string());
     let (repo_map, memory, knowledge) = tokio::task::spawn_blocking(move || {
         let repo_map = if want_repo {
             repo_map_layer(&root_buf, &scope)
@@ -356,12 +361,12 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
             String::new()
         };
         let memory = if want_jit {
-            memory_layer(&root_buf, &req)
+            memory_layer(&root_buf, &req, seat.as_deref())
         } else {
             String::new()
         };
         let knowledge = if want_jit {
-            knowledge_layer(&root_buf, &req)
+            knowledge_layer(&root_buf, &req, seat.as_deref())
         } else {
             String::new()
         };
@@ -427,17 +432,38 @@ fn identity_layer(route: &RoutePlan) -> String {
 /// ([`crate::lessons::relevant_lessons_for_prompt`]). Reused (not re-derived) so
 /// the firmware and the pipeline surface identical experience. Fail-open: a
 /// project with no learned lessons returns an empty string.
-fn memory_layer(root: &Path, requirement: &str) -> String {
-    crate::lessons::relevant_lessons_for_prompt(root, requirement)
+///
+/// When the turn names a lead `seat`, its domain vocabulary
+/// ([`crate::experts::seat_query_bias`]) is blended into the recall query so a
+/// security turn preferentially recalls security-fingerprinted lessons and a
+/// frontend turn recalls frontend ones — a bounded, additive seat relevance
+/// signal (the requirement's own terms stay in the query). `None` / an unknown
+/// seat → the plain requirement query, exactly as before.
+fn memory_layer(root: &Path, requirement: &str, seat: Option<&str>) -> String {
+    let query = match seat.map(crate::experts::seat_query_bias) {
+        Some(bias) if !bias.is_empty() => format!("{bias} {requirement}"),
+        _ => requirement.to_string(),
+    };
+    crate::lessons::relevant_lessons_for_prompt(root, &query)
 }
 
-/// The JIT-knowledge layer — a small, requirement-scoped curated-knowledge digest
-/// via the SAME compact retrieval the agentic path uses
-/// ([`crate::phases::agentic_knowledge_digest`], capped at [`JIT_KNOWLEDGE_CHUNKS`]
-/// short excerpts). Reused (not re-derived). Fail-open: no `knowledge/` dir, a
-/// disabled KB, or no match → empty string.
-fn knowledge_layer(root: &Path, requirement: &str) -> String {
-    crate::phases::agentic_knowledge_digest(root, requirement, JIT_KNOWLEDGE_CHUNKS)
+/// The JIT-knowledge layer — a small, requirement-scoped curated-knowledge digest.
+/// When the turn names a lead `seat`, retrieval is scoped to that seat's discipline
+/// via [`crate::phases::seat_scoped_knowledge_digest`] (blended query + domain
+/// filter); with no seat it falls back to the seat-agnostic
+/// [`crate::phases::agentic_knowledge_digest`]. Both are capped at
+/// [`JIT_KNOWLEDGE_CHUNKS`] short excerpts (identical budget). Fail-open: no
+/// `knowledge/` dir, a disabled KB, an unknown seat, or no match → empty string.
+fn knowledge_layer(root: &Path, requirement: &str, seat: Option<&str>) -> String {
+    match seat {
+        Some(role) => crate::phases::seat_scoped_knowledge_digest(
+            root,
+            role,
+            requirement,
+            JIT_KNOWLEDGE_CHUNKS,
+        ),
+        None => crate::phases::agentic_knowledge_digest(root, requirement, JIT_KNOWLEDGE_CHUNKS),
+    }
 }
 
 /// The brownfield repo-map layer — the [`project_context`] slice as a firmware
@@ -672,6 +698,70 @@ mod tests {
         assert!(
             fw.contains("login"),
             "the matched chunk path/body is surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn firmware_knowledge_is_routed_by_the_lead_seat() {
+        // Per-seat knowledge routing at the firmware seam: the SAME requirement with
+        // a DIFFERENT lead seat draws DIFFERENT curated knowledge — a frontend build
+        // gets the frontend/design chunk, a security build gets the security chunk.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fe = tmp.path().join("knowledge/frontend");
+        let sec = tmp.path().join("knowledge/security");
+        std::fs::create_dir_all(&fe).unwrap();
+        std::fs::create_dir_all(&sec).unwrap();
+        std::fs::write(
+            fe.join("ui.md"),
+            "# Frontend UI\n\n## Components\n\nBuild the frontend UI from design tokens \
+             and the icon library; wire fetch calls to the API; cover accessibility.",
+        )
+        .unwrap();
+        std::fs::write(
+            sec.join("authz.md"),
+            "# Security\n\n## Authorization\n\nCheck authorization for IDOR, guard \
+             injection, and never hardcode a secret.",
+        )
+        .unwrap();
+        let req = "build the account settings page";
+        let fe_fw = compose_firmware(
+            tmp.path(),
+            &route(
+                RouteClass::Build,
+                Depth::Standard,
+                vec![Seat::FrontendEngineer],
+            ),
+            req,
+        )
+        .await;
+        let sec_fw = compose_firmware(
+            tmp.path(),
+            &route(
+                RouteClass::Build,
+                Depth::Standard,
+                vec![Seat::SecurityEngineer],
+            ),
+            req,
+        )
+        .await;
+        // The frontend build draws the frontend chunk and filters OUT security.
+        assert!(
+            fe_fw.contains("ui.md"),
+            "frontend firmware surfaces frontend knowledge"
+        );
+        assert!(
+            !fe_fw.contains("authz.md"),
+            "frontend firmware filters OUT security"
+        );
+        // The security build draws the security chunk and filters OUT frontend.
+        assert!(
+            sec_fw.contains("authz.md"),
+            "security firmware surfaces security knowledge"
+        );
+        assert!(
+            !sec_fw.contains("ui.md"),
+            "security firmware filters OUT frontend"
         );
     }
 
