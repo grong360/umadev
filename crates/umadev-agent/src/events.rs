@@ -189,7 +189,15 @@ pub enum EngineEvent {
     PlanPosted {
         /// One summary line per step (`Plan::step_summaries`).
         steps: Vec<String>,
-        /// `done / total` at post time (always `0 / N` for a fresh plan).
+        /// Each step's CURRENT status id (`pending` / `active` / `done` /
+        /// `blocked`), index-aligned with `steps`. A fresh plan is all
+        /// `pending`; a cross-session RESUME re-post carries the persisted
+        /// truth so a UI re-renders already-`done` steps checked instead of
+        /// resetting the checklist. May be empty / shorter than `steps`
+        /// (fail-open: a missing entry renders as `pending`).
+        statuses: Vec<String>,
+        /// `done / total` at post time (`0 / N` for a fresh plan; the
+        /// persisted done-count on a resume re-post).
         done: usize,
         /// Total step count.
         total: usize,
@@ -253,11 +261,15 @@ impl EngineEvent {
     }
 
     /// Build an [`EngineEvent::PlanPosted`] from an owned [`crate::plan_state::Plan`].
+    /// Carries each step's CURRENT status alongside its summary, so a resume
+    /// re-post renders the persisted truth (already-done steps checked), not a
+    /// reset all-pending checklist.
     #[must_use]
     pub fn plan_posted(plan: &crate::plan_state::Plan) -> Self {
         let (done, total) = plan.progress();
         Self::PlanPosted {
             steps: plan.step_summaries(),
+            statuses: plan.step_statuses(),
             done,
             total,
         }
@@ -493,12 +505,20 @@ mod tests {
             open_questions: vec![],
         };
         let posted = EngineEvent::plan_posted(&plan);
-        let EngineEvent::PlanPosted { steps, done, total } = posted else {
+        let EngineEvent::PlanPosted {
+            steps,
+            statuses,
+            done,
+            total,
+        } = posted
+        else {
             panic!("wrong variant");
         };
         assert_eq!((done, total), (0, 1));
         assert_eq!(steps.len(), 1);
         assert!(steps[0].starts_with("scaffold"));
+        // A fresh plan posts every step `pending`.
+        assert_eq!(statuses, vec!["pending".to_string()]);
 
         let st = EngineEvent::plan_step_status(
             "scaffold",
@@ -513,6 +533,46 @@ mod tests {
                 status: "active".into(),
             }
         );
+    }
+
+    #[test]
+    fn plan_posted_carries_persisted_statuses_on_resume() {
+        // A RESUME re-post must carry the persisted per-step truth — the
+        // already-done steps stay done and the header count reflects reality
+        // (user-reported: after /continue the checklist showed 0/8 done with
+        // every earlier step blank).
+        let step = |id: &str, status: crate::plan_state::StepStatus| crate::plan_state::PlanStep {
+            id: id.to_string(),
+            title: format!("Step {id}"),
+            seat: crate::critics::Seat::BackendEngineer,
+            kind: crate::plan_state::StepKind::Build,
+            depends_on: vec![],
+            acceptance: crate::plan_state::AcceptanceSpec::TurnSettled,
+            evidence: Vec::new(),
+            status,
+        };
+        let plan = crate::plan_state::Plan {
+            steps: vec![
+                step("a", crate::plan_state::StepStatus::Done),
+                step("b", crate::plan_state::StepStatus::Done),
+                step("c", crate::plan_state::StepStatus::Blocked),
+                step("d", crate::plan_state::StepStatus::Pending),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        let EngineEvent::PlanPosted {
+            steps,
+            statuses,
+            done,
+            total,
+        } = EngineEvent::plan_posted(&plan)
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(steps.len(), 4);
+        assert_eq!(statuses, vec!["done", "done", "blocked", "pending"]);
+        assert_eq!((done, total), (2, 4));
     }
 
     #[test]

@@ -8259,10 +8259,27 @@ mod tests {
             "the remaining step is completed"
         );
 
-        // The checklist was re-rendered (PlanPosted) so the TUI shows the resume.
-        assert!(
-            rec.count(|e| matches!(e, EngineEvent::PlanPosted { .. })) >= 1,
-            "the checklist is re-rendered on resume"
+        // The checklist was re-rendered (PlanPosted) so the TUI shows the resume —
+        // and the re-post carries the PERSISTED statuses (alpha already done), so
+        // the panel renders "1/2" with alpha checked instead of resetting to
+        // all-pending / 0 done (user-reported after /continue).
+        let reposted = rec
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                EngineEvent::PlanPosted {
+                    statuses,
+                    done,
+                    total,
+                    ..
+                } => Some((statuses, done, total)),
+                _ => None,
+            })
+            .expect("the checklist is re-rendered on resume");
+        assert_eq!(
+            reposted,
+            (vec!["done".to_string(), "pending".to_string()], 1, 2),
+            "the resume re-post carries the persisted per-step truth"
         );
     }
 

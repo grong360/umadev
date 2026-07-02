@@ -6786,6 +6786,7 @@ mod tests {
     fn live_plan_panel_renders_checklist_with_ticks() {
         let mut app = app_with(Some("offline"));
         app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · scaffold (frontend)".into(),
                 "s2 · login route (backend)".into(),
@@ -6804,6 +6805,46 @@ mod tests {
         assert!(out.contains("login route"), "second step shown");
         // The done glyph is the check codepoint (no emoji).
         assert!(out.contains('\u{2713}'), "done tick rendered");
+    }
+
+    #[test]
+    fn resumed_plan_panel_shows_persisted_ticks_and_counts() {
+        // Cross-session resume (user-reported): the re-posted plan carries the
+        // persisted statuses, so the panel must show the earlier done steps
+        // checked and a truthful "done/total" header — not 0/N all-pending.
+        let mut app = app_with(Some("offline"));
+        app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold (frontend)".into(),
+                "s2 · login route (backend)".into(),
+                "s3 · login form (frontend)".into(),
+            ],
+            statuses: vec!["done".into(), "done".into(), "active".into()],
+            done: 2,
+            total: 3,
+        });
+        let text = panel_text(&app);
+        assert!(text.contains("2/3"), "header counts persisted done: {text}");
+        // Each restored step line carries its persisted glyph: the two
+        // pre-resume steps are checked, the in-flight one keeps its [~].
+        let line_of = |needle: &str| {
+            text.lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("step line {needle:?} missing: {text}"))
+                .to_string()
+        };
+        assert!(
+            line_of("scaffold").contains('\u{2713}'),
+            "first pre-resume step renders checked: {text}"
+        );
+        assert!(
+            line_of("login route").contains('\u{2713}'),
+            "second pre-resume step renders checked: {text}"
+        );
+        assert!(
+            line_of("login form").contains("[~]"),
+            "active step keeps its marker: {text}"
+        );
     }
 
     #[test]
@@ -6961,6 +7002,7 @@ mod tests {
         let mut app = app_with(Some("offline"));
         app.lang = umadev_i18n::Lang::En;
         app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · API contract (architect)".into(),
                 "s2 · login form (frontend)".into(),
@@ -7049,6 +7091,7 @@ mod tests {
             .map(|i| format!("s{i} · step number {i} (frontend)"))
             .collect();
         app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            statuses: vec![],
             steps,
             done: 0,
             total: 20,
@@ -7073,6 +7116,7 @@ mod tests {
             .map(|i| format!("s{i} · step number {i} (frontend)"))
             .collect();
         app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            statuses: vec![],
             steps,
             done: 0,
             total: 20,

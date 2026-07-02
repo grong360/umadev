@@ -489,6 +489,18 @@ impl Plan {
             .collect()
     }
 
+    /// Each step's CURRENT status id, index-aligned with [`Self::step_summaries`]
+    /// — carried on the [`crate::events::EngineEvent::PlanPosted`] card so a
+    /// cross-session RESUME re-post renders the persisted truth (already-`done`
+    /// steps checked) instead of resetting the checklist to all-pending.
+    #[must_use]
+    pub fn step_statuses(&self) -> Vec<String> {
+        self.steps
+            .iter()
+            .map(|s| s.status.as_str().to_string())
+            .collect()
+    }
+
     /// The steps whose dependencies are ALL [`StepStatus::Done`] and which are not
     /// themselves finished/blocked — the set the director may drive next. A step
     /// with an unknown dependency id is treated as not-ready (conservative).

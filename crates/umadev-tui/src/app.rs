@@ -5894,12 +5894,23 @@ impl App {
     }
 
     /// Initialise the **live plan checklist** ([`EngineEvent::PlanPosted`]) from
-    /// the freshly synthesised plan. Each `PlanPosted` summary is `id · title
-    /// (seat)`; we keep the id + title and start every step `pending`. The panel
-    /// (rendered above the prompt) then ticks off live via `PlanStepStatus`,
-    /// replacing the frozen 0/9 dot bar on the director path. A one-line "posted
-    /// N steps" memo also lands in the transcript so scrollback records it.
-    fn apply_plan_posted(&mut self, steps: &[String], _done: usize, total: usize) {
+    /// the posted plan. Each `PlanPosted` summary is `id · title (seat)`; we keep
+    /// the id + title and seed each step with the status the event carries —
+    /// all-`pending` for a fresh plan, the persisted truth on a cross-session
+    /// RESUME re-post (already-`done` steps stay checked, a `blocked` step stays
+    /// `[!]`, and the done/total header counts reflect reality instead of
+    /// resetting to 0/N). A missing/short `statuses` falls back to `pending`
+    /// per step (fail-open). The panel (rendered above the prompt) then ticks
+    /// off live via `PlanStepStatus`, replacing the frozen 0/9 dot bar on the
+    /// director path. A one-line "posted N steps" memo also lands in the
+    /// transcript so scrollback records it.
+    fn apply_plan_posted(
+        &mut self,
+        steps: &[String],
+        statuses: &[String],
+        _done: usize,
+        total: usize,
+    ) {
         self.plan_steps = steps
             .iter()
             .enumerate()
@@ -5911,7 +5922,9 @@ impl App {
                 PlanStepRow {
                     id,
                     title,
-                    status: "pending".to_string(),
+                    status: statuses
+                        .get(i)
+                        .map_or_else(|| "pending".to_string(), Clone::clone),
                     seat: parse_seat(summary),
                 }
             })
@@ -6164,8 +6177,13 @@ impl App {
                 est_tool_calls,
                 rationale,
             } => self.apply_intent_decided(&class, &depth, &team, est_tool_calls, &rationale),
-            EngineEvent::PlanPosted { steps, done, total } => {
-                self.apply_plan_posted(&steps, done, total);
+            EngineEvent::PlanPosted {
+                steps,
+                statuses,
+                done,
+                total,
+            } => {
+                self.apply_plan_posted(&steps, &statuses, done, total);
             }
             EngineEvent::PlanStepStatus { id, title, status } => {
                 self.apply_plan_step_status(&id, &title, &status);
@@ -15859,6 +15877,7 @@ mod tests {
     fn plan_posted_then_step_status_drives_the_checklist() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · scaffold the app (frontend)".into(),
                 "s2 · login route (backend)".into(),
@@ -15889,12 +15908,73 @@ mod tests {
         assert_eq!(app.plan_steps[3].id, "s9");
     }
 
+    #[test]
+    fn resumed_plan_post_restores_persisted_step_statuses() {
+        // Cross-session resume (user-reported): after /continue the re-posted
+        // plan must render the persisted truth — earlier done steps stay
+        // checked, the blocked one stays flagged — instead of resetting the
+        // checklist to all-pending with a 0/N done count.
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold (frontend)".into(),
+                "s2 · login route (backend)".into(),
+                "s3 · login form (frontend)".into(),
+                "s4 · e2e review (qa)".into(),
+            ],
+            statuses: vec![
+                "done".into(),
+                "done".into(),
+                "blocked".into(),
+                "pending".into(),
+            ],
+            done: 2,
+            total: 4,
+        });
+        let statuses: Vec<&str> = app.plan_steps.iter().map(|s| s.status.as_str()).collect();
+        assert_eq!(statuses, vec!["done", "done", "blocked", "pending"]);
+        // The panel header + `/plan` derive the done-count from the rows: 2/4.
+        assert_eq!(
+            app.plan_steps.iter().filter(|s| s.status == "done").count(),
+            2
+        );
+        // Pre-resume completions are NOT replayed as fresh handoffs.
+        assert!(app.handoffs.is_empty(), "no handoff invented on a resume");
+        // The transcript `/plan` card matches the restored panel.
+        let _ = app.try_slash_command("/plan").unwrap();
+        let card = app.history.back().unwrap().body().clone();
+        assert!(card.contains("2/4"), "card counts restored steps: {card}");
+        assert!(card.contains("[x] s1"), "done step checked: {card}");
+        assert!(card.contains("[!] s3"), "blocked step flagged: {card}");
+        assert!(card.contains("[ ] s4"), "pending step blank: {card}");
+    }
+
+    #[test]
+    fn plan_post_with_short_statuses_falls_open_to_pending() {
+        // Fail-open: a statuses list shorter than the steps (or absent, as on a
+        // fresh post) leaves the uncovered steps `pending` — never a panic or a
+        // dropped row.
+        let mut app = fresh_app(Some("offline"));
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold (frontend)".into(),
+                "s2 · login route (backend)".into(),
+            ],
+            statuses: vec!["done".into()],
+            done: 1,
+            total: 2,
+        });
+        assert_eq!(app.plan_steps[0].status, "done");
+        assert_eq!(app.plan_steps[1].status, "pending");
+    }
+
     // ---- Wave C: live team roster + handoff timeline ----------------------
 
     #[test]
     fn convened_roster_shows_only_seated_steps_with_live_status() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · API contract (architect)".into(),
                 "s2 · login form (frontend)".into(),
@@ -15941,6 +16021,7 @@ mod tests {
     fn step_done_marks_seat_done_and_records_a_handoff() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec!["s1 · API contract (architect)".into()],
             done: 0,
             total: 1,
@@ -15977,6 +16058,7 @@ mod tests {
     fn roster_verdict_chip_reflects_critic_verdict_only_for_convened_seats() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · API contract (architect)".into(),
                 "s2 · login form (frontend)".into(),
@@ -16073,6 +16155,7 @@ mod tests {
     fn team_command_surfaces_convened_roster_and_handoff_timeline() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · API contract (architect)".into(),
                 "s2 · login form (frontend)".into(),
@@ -16112,6 +16195,7 @@ mod tests {
     fn a_blocked_step_makes_its_seat_read_blocked() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec!["s1 · login form (frontend)".into()],
             done: 0,
             total: 1,
@@ -16142,6 +16226,7 @@ mod tests {
         assert_eq!((t.done, t.total), (0, 0));
         // A posted plan + a step tick drive the X/Y progress.
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · scaffold (frontend)".into(),
                 "s2 · login route (backend)".into(),
@@ -16170,6 +16255,7 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         app.requirement = "做一个登录页".into();
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec!["s1 · 登录页 (frontend)".into()],
             done: 0,
             total: 1,
@@ -16480,6 +16566,7 @@ mod tests {
     fn slash_plan_skip_folds_into_queued_steer() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · scaffold (frontend)".into(),
                 "s2 · login route (backend)".into(),
@@ -16500,6 +16587,7 @@ mod tests {
     fn slash_plan_unknown_step_does_not_queue() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec!["s1 · only step (frontend)".into()],
             done: 0,
             total: 1,
@@ -16536,6 +16624,7 @@ mod tests {
     fn new_run_clears_the_plan_and_review_panels() {
         let mut app = fresh_app(Some("offline"));
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec!["s1 · do a thing (frontend)".into()],
             done: 0,
             total: 1,
@@ -16650,6 +16739,7 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         app.run_started = true;
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec!["s1 · ship it (frontend)".into()],
             done: 0,
             total: 1,
@@ -16690,6 +16780,7 @@ mod tests {
         let mut app = fresh_app(Some("offline"));
         app.run_started = true;
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec!["s1 · do a thing (frontend)".into()],
             done: 0,
             total: 1,
@@ -17007,6 +17098,7 @@ mod tests {
 
         // ---- Earlier steps: a posted plan + two seat verdicts (one a BLOCK). ----
         app.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · scaffold app (frontend-engineer)".into(),
                 "s2 · wire auth API (backend-engineer)".into(),
@@ -20110,6 +20202,7 @@ mod tests {
     fn slash_plan_includes_full_team_review_section() {
         let mut a = fresh_app(Some("offline"));
         a.apply_engine(EngineEvent::PlanPosted {
+            statuses: vec![],
             steps: vec![
                 "s1 · scaffold (frontend)".into(),
                 "s2 · login route (backend)".into(),

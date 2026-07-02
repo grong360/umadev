@@ -2272,10 +2272,23 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
             };
             eprintln!("◆ intent: {class} ({depth}){who} — {rationale}");
         }
-        EngineEvent::PlanPosted { steps, done, total } => {
+        EngineEvent::PlanPosted {
+            steps,
+            statuses,
+            done,
+            total,
+        } => {
             eprintln!("◆ plan ({done}/{total}):");
-            for s in steps {
-                eprintln!("    [ ] {s}");
+            for (i, s) in steps.iter().enumerate() {
+                // A resume re-post carries the persisted per-step truth; a
+                // fresh plan (or a short/missing statuses list) prints pending.
+                let mark = match statuses.get(i).map(String::as_str) {
+                    Some("done") => "✓",
+                    Some("active") => "~",
+                    Some("blocked") => "!",
+                    _ => " ",
+                };
+                eprintln!("    [{mark}] {s}");
             }
         }
         EngineEvent::PlanStepStatus { id, title, status } => {
