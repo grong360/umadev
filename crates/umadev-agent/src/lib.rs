@@ -73,6 +73,7 @@ pub mod runner;
 pub mod runtime_proof;
 pub mod scaffolding;
 pub mod security;
+pub mod self_evolve;
 pub mod sizing_calibration;
 pub mod skills;
 pub mod state;

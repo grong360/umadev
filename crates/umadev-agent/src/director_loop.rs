@@ -1155,6 +1155,10 @@ async fn drive_plan_steps(
     // so a build where the base keeps failing the same way STOPS with a diagnosis
     // instead of grinding to MAX_STEP_TRANSITIONS burning effort. A Done step resets it.
     let mut failure_breaker = crate::trust::ConsecutiveFailureBreaker::new();
+    // SELF-EVOLUTION: run-scoped set of recurring-pitfall signatures a reflection has
+    // already been attempted for, so `drive_build_step` fires the (forked, fail-open)
+    // reflection consult AT MOST ONCE per signature per run. Bounded by construction.
+    let mut reflected: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Walk the DAG by readiness: drive each ready step, mark it, repeat. A step that
     // can't be accepted (after its bounded fix budget) is marked Blocked so it stops
@@ -1226,6 +1230,7 @@ async fn drive_plan_steps(
                     &plan_progress,
                     blast_radius,
                     deadline,
+                    &mut reflected,
                 )
                 .await
             }
@@ -1388,6 +1393,15 @@ async fn drive_plan_steps(
     // finalize from emitting a proof-pack + delivery scorecard for an INCOMPLETE build
     // (blocked / stranded steps), which would disguise it as success. Fail-open inside.
     director::finalize(options, events, Some(route), clean);
+    // SELF-EVOLUTION at delivery (a SIDE EFFECT of a clean deliberate delivery, never
+    // a driver): reconcile the lesson library — ask the brain (read-only fork,
+    // fail-open) to judge each fresh lesson against its similar priors (ADD / UPDATE /
+    // INVALIDATE) so memory is CURATED, not just appended. Gated to a clean deliberate
+    // delivery (finalize already ran the plain append-sediment); offline / no-fork
+    // degrades to a no-op. Runs next to finalize where the session is still live.
+    if clean && route.depth.is_deliberate() {
+        crate::self_evolve::reconcile_at_delivery(session, &options.project_root, events).await;
+    }
     // SIZING calibration: a step-driven build is ALWAYS a deliberate route (predicted
     // HEAVY). Measure the ACTUAL heaviness by how many Build steps did real work — a
     // deliberate route that finished in <=1 real build step OVER-sized the turn (the
@@ -1536,6 +1550,11 @@ async fn drive_build_step(
     // budget. See [`HIGH_BLAST_RADIUS`].
     blast_radius: usize,
     deadline: std::time::Instant,
+    // Run-scoped set of recurring-pitfall signatures a reflection has already been
+    // ATTEMPTED for this run — threaded from the scheduler so self-evolution's
+    // reflection consult fires AT MOST ONCE per signature per run (see
+    // [`crate::self_evolve::reflect_on_recurring_failure`]).
+    reflected: &mut std::collections::HashSet<String>,
 ) -> StepOutcome {
     let seat_id = step.seat.role_id();
     // Verification RIGOR weighted by blast radius: an expensive-to-unwind upstream step
@@ -1584,6 +1603,11 @@ async fn drive_build_step(
 
     let mut drove = false;
     let mut last_reply = String::new();
+    // SELF-EVOLUTION accounting across this step's fix rounds (a SIDE EFFECT of the
+    // deterministic acceptance verdict, never a driver of it). Carries the previous
+    // round's FAILING evidence so a pass that RECOVERS from it can reward + mark
+    // resolved the pitfall whose recorded fix just held. Empty on a clean first pass.
+    let mut prior_fail_errors: Vec<String> = Vec::new();
     for round in 0..=max_fix_rounds {
         // Wall-clock ceiling (graceful): an EXTRA fix round past the budget is
         // abandoned — round 0 (the actual work) always runs, only the re-drives are
@@ -1656,6 +1680,12 @@ async fn drive_build_step(
         // honestly left unaccepted (→ the caller marks it Blocked), so a dead session
         // can't silently tick steps 2..N Done over an empty build.
         if verdict.accepted && (drove || verdict.has_positive_evidence) {
+            // SELF-EVOLUTION (a SIDE EFFECT of the PASS verdict; best-effort +
+            // fail-open, never changes the outcome below): the recalled lessons were
+            // in front of the doer and the step PASSED — reward their trust. If this
+            // pass RECOVERED from a recorded failing round, that IS proof the pitfall's
+            // recorded fix held: reward its dev-error trust and mark it resolved.
+            crate::self_evolve::reward_on_pass(&options.project_root, &prior_fail_errors);
             // FIRST-PASS ACCEPTANCE signal (advisory self-evolution, fail-open):
             // this proposal PASSED verification — record whether it did so on the
             // FIRST attempt (round 0, no rework) or only after one or more fix
@@ -1671,22 +1701,48 @@ async fn drive_build_step(
                 made_progress: true,
             };
         }
+        // SELF-EVOLUTION (a SIDE EFFECT of this FAILING verdict — never a driver of
+        // it, never touches loop control or the verdict): the recalled lessons were in
+        // front of the doer and the step did NOT pass. Penalise their trust + the
+        // dev-error pitfall that matches this failure, and — ONLY on a TRUE recurrence
+        // — ask the brain (read-only fork, fail-open, at most once per signature per
+        // run) for a higher-level corrective strategy. All best-effort: a store or
+        // consult error NEVER fails the step.
+        let evidence_line = verdict.evidence_line();
+        let fail_errors = verdict.evidence.clone();
+        crate::self_evolve::penalise_on_fail(&options.project_root, &fail_errors);
+        crate::self_evolve::reflect_on_recurring_failure(
+            session,
+            &options.project_root,
+            events,
+            &evidence_line,
+            reflected,
+        )
+        .await;
+        // Remember this round's failing evidence so a recovery on a LATER round can
+        // reward + mark-resolved the pitfall whose recorded fix then holds.
+        prior_fail_errors = fail_errors;
         // Out of fix budget → leave the step unaccepted (the caller marks it Blocked
         // and the final gate still has the last word). Bounded — never an open grind.
         if round >= max_fix_rounds {
             break;
         }
+        // Highest-precision FAILURE-TIME recall: prior lessons with the SAME error
+        // signature ("you hit this N times before; here's what worked; it keeps
+        // recurring") + any base-reflected strategy. Fingerprint-gated + abstaining, so
+        // an unclassifiable failure injects nothing. Fail-open (empty string on a miss).
+        let prior = crate::lessons::lessons_for_error(&options.project_root, &evidence_line);
         // Fold this step's failing acceptance into the NEXT re-drive's directive so
         // the same seat fixes the cause with raw evidence, in the same session. The
         // overall-goal frame is re-prepended so a fix turn keeps the product context.
         instruction = format!(
-            "{}{} — {}\n\n## This step did not pass its acceptance check yet — fix the cause\n{}\n\
+            "{}{} — {}\n\n## This step did not pass its acceptance check yet — fix the cause\n{}{prior}\n\
              Edit the real files, run any build/test you need, and make this step's \
              acceptance ({}) actually pass.",
             step_goal_frame(options),
             step.title,
             route_focus_line(route),
-            verdict.evidence_line(),
+            evidence_line,
             step_criterion_label(step),
         );
         // Re-recite the plan position on a fix re-drive too, so a long fix sequence
@@ -7559,6 +7615,7 @@ mod tests {
             "", // no plan-progress recitation in this single-step unit test
             0,  // a leaf step (no dependents) → base fix budget, no rigor bonus
             std::time::Instant::now() + Duration::from_secs(3_600),
+            &mut std::collections::HashSet::new(),
         )
         .await;
         assert!(
@@ -7672,6 +7729,7 @@ mod tests {
             "", // no plan-progress recitation in this single-step unit test
             0,  // leaf step → base fix budget (MAX_STEP_FIX_ROUNDS), no rigor bonus
             std::time::Instant::now() + Duration::from_secs(3_600),
+            &mut std::collections::HashSet::new(),
         )
         .await;
 
@@ -7723,11 +7781,78 @@ mod tests {
             "", // no plan-progress recitation in this single-step unit test
             0,
             std::time::Instant::now() + Duration::from_secs(3_600),
+            &mut std::collections::HashSet::new(),
         )
         .await;
         assert!(
             outcome.accepted,
             "an un-gamed build (tests left intact) must pass — the guard is silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_passing_build_step_rewards_the_recalled_lesson_trust() {
+        // SELF-EVOLUTION (relocated onto the default path): a Build step whose
+        // acceptance PASSES must lift the trust of the lessons that were recalled into
+        // it — the previously-dead feedback the runner-only path used to strand. Seed
+        // one non-pitfall lesson (a quality failure), drive a step that passes on round
+        // 0 (source is present), and assert the recalled lesson's trust rose. The
+        // update is a pure SIDE EFFECT of the pass verdict — the step still accepts.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // source present → SourcePresent acceptance passes
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个登录系统".to_string();
+        // Seed one recallable non-pitfall lesson at neutral trust.
+        crate::lessons::capture_quality_failures(
+            tmp.path(),
+            &[crate::phases::QualityCheck {
+                name: "coverage".to_string(),
+                category: "quality".to_string(),
+                description: "test".to_string(),
+                status: "failed".to_string(),
+                score: 20,
+                details: "coverage below the bar for the login system".to_string(),
+                weight: 2.0,
+            }],
+            "demo",
+            &o.requirement,
+        );
+        let trust_of = |t: &std::path::Path| {
+            crate::lessons::read_raw_lessons(t, "quality-failures.jsonl")
+                .into_iter()
+                .next()
+                .map(|l| l.trust())
+        };
+        let before = trust_of(tmp.path()).unwrap();
+        assert!(
+            (before - crate::lessons::NEUTRAL_TRUST).abs() < f32::EPSILON,
+            "the lesson seeds at neutral trust"
+        );
+
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(
+            vec![text_turn("Implemented the login system. Done.")],
+            false,
+            "",
+        );
+        let route = build_route();
+        let step = one_failing_build_plan().steps.into_iter().next().unwrap();
+        let outcome = drive_build_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            "",
+            0,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+            &mut std::collections::HashSet::new(),
+        )
+        .await;
+        assert!(outcome.accepted, "the step passes (source present)");
+        assert!(
+            trust_of(tmp.path()).unwrap() > before,
+            "a passing step lifts the recalled lesson's trust (the relocated reward)"
         );
     }
 
