@@ -2902,10 +2902,12 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                     .fg(theme::SECONDARY())
                     .add_modifier(Modifier::BOLD),
             )));
+            let mut any_blocking = false;
             for c in &app.critic_verdicts {
                 let (mark, color) = if c.accepts {
                     (review_accept_glyph(), theme::SUCCESS())
                 } else {
+                    any_blocking = true;
                     (review_block_glyph(), theme::ERROR())
                 };
                 let verdict = if c.accepts {
@@ -2936,6 +2938,33 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                         Style::default().fg(theme::TEXT()),
                     ),
                 ]));
+                // The seat's suggested FIX for its first blocking finding, surfaced
+                // inline — a blocked run shows WHAT-TO-DO, not just what is wrong.
+                // Fail-open: no suggestion → nothing extra (the blocker still shows
+                // above; the full per-blocker set is in the transcript note).
+                if !c.accepts {
+                    if let Some(fix) = c.fix_for(0) {
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "      {}",
+                                umadev_i18n::tf(
+                                    app.lang,
+                                    "plan.review.fix",
+                                    &[&truncate_display(fix, 56)],
+                                )
+                            ),
+                            Style::default().fg(theme::TEXT_MUTED()),
+                        )));
+                    }
+                }
+            }
+            // When the team blocked, spell out the concrete NEXT STEP (run to fix /
+            // revise) so the user isn't left at a bare "re-enter your requirement".
+            if any_blocking {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", umadev_i18n::t(app.lang, "plan.review.next_step")),
+                    Style::default().fg(theme::WARNING()),
+                )));
             }
         }
     }
@@ -6821,18 +6850,109 @@ mod tests {
             seat: "architect".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
             seat: "qa".into(),
             accepts: false,
             blocking: vec!["no tests".into()],
+            remediation: vec![],
             advisory: vec![],
         });
         let out = render_chat_to_string(&app, 100, 30);
         assert!(out.contains("[architect]"), "accepting seat shown: {out}");
         assert!(out.contains("[qa]"), "blocking seat shown");
         assert!(out.contains("no tests"), "first must-fix inlined");
+    }
+
+    /// Flatten the live plan / team-review panel to a single string for assertions.
+    fn panel_text(app: &App) -> String {
+        plan_panel_lines(app, 100)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn blocked_review_surfaces_resolution_suggestion_and_next_step() {
+        // The user's ask: a blocked run should show WHAT-TO-DO, not just what is
+        // wrong. A blocking seat that emitted a per-blocker fix (`remediation`) must
+        // surface that fix + a concrete next-step in the review panel.
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
+            seat: "security-engineer".into(),
+            accepts: false,
+            blocking: vec!["Authentication is effectively bypassed".into()],
+            remediation: vec![
+                "add a signed session token + a real identity provider; remove the hardcoded session id".into(),
+            ],
+            advisory: vec![],
+        });
+        let panel = panel_text(&app);
+        // The problem is still shown…
+        assert!(
+            panel.contains("Authentication is effectively bypassed"),
+            "problem shown: {panel}"
+        );
+        // …AND the concrete fix (the seat's remediation) is surfaced to the user…
+        assert!(
+            panel.contains("signed session token"),
+            "resolution suggestion surfaced: {panel}"
+        );
+        // …AND a WHAT-TO-DO-NEXT hint (run to fix / revise) guides the user out.
+        assert!(
+            panel.contains("/run") && panel.contains("/revise"),
+            "next-step hint shown: {panel}"
+        );
+    }
+
+    #[test]
+    fn blocked_review_without_remediation_is_fail_open() {
+        // A blocker with NO suggestion falls back to today's behaviour: the problem
+        // shows, NO fabricated fix, and the next-step hint still guides the user.
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
+            seat: "qa-engineer".into(),
+            accepts: false,
+            blocking: vec!["login failure path has no test".into()],
+            remediation: vec![], // fail-open: none available
+            advisory: vec![],
+        });
+        let panel = panel_text(&app);
+        assert!(
+            panel.contains("login failure path has no test"),
+            "problem shown: {panel}"
+        );
+        // No suggestion line since none was provided — never a fabricated fix. The
+        // remediation line (when present) is the ONLY line whose trimmed form starts
+        // with the `fix:` prefix (the block line reads `… must-fix: …`, which is not
+        // a line-leading `fix:`), so a line-based check is precise here.
+        let has_fix_line = plan_panel_lines(&app, 100).iter().any(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .trim_start()
+                .starts_with("fix:")
+        });
+        assert!(
+            !has_fix_line,
+            "no fabricated fix when none available: {panel}"
+        );
+        // The next-step hint still shows so the user isn't stranded at the blocker.
+        assert!(
+            panel.contains("/run"),
+            "next-step hint still shown: {panel}"
+        );
     }
 
     #[test]
@@ -6859,6 +6979,7 @@ mod tests {
             seat: "architect".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         let out = render_chat_to_string(&app, 100, 30);

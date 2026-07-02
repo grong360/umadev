@@ -624,6 +624,11 @@ mod tests {
             // surfaced (not a bare stub) and the user's reply is relayed back.
             "ask.prompt.header",
             "ask.prompt.relay_hint",
+            // Blocked-run resolution: the per-blocker suggested fix (the seat's "how
+            // to fix" surfaced to the user) and the what-to-do-next hint rendered in
+            // the team-review panel when the team raised must-fix findings.
+            "plan.review.fix",
+            "plan.review.next_step",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

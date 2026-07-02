@@ -169,6 +169,16 @@ pub struct RoleVerdict {
     /// folded into the existing revision path, but never govern termination.
     #[serde(default)]
     pub blocking: Vec<String>,
+    /// A suggested one-line FIX per blocking finding — the "how to fix" the seat
+    /// emits alongside each must-fix problem, INDEX-ALIGNED with `blocking` (the
+    /// critic already read the artifact, so it costs no extra brain call). Surfaced
+    /// to the USER so a blocked run shows a concrete next-step, not just what is
+    /// wrong. Advisory only + fully fail-open: absent / shorter than `blocking` →
+    /// the missing entries simply carry no suggestion (the blocker is shown as
+    /// before). NEVER drives loop control (invariant 2). The `fix` alias lets a
+    /// terser base reply use either key.
+    #[serde(default, alias = "fix")]
+    pub remediation: Vec<String>,
     /// Nice-to-have observations that don't block.
     #[serde(default)]
     pub advisory: Vec<String>,
@@ -188,9 +198,23 @@ impl RoleVerdict {
             role: role.to_string(),
             accepts: true,
             blocking: Vec::new(),
+            remediation: Vec::new(),
             advisory: Vec::new(),
             evidence: Vec::new(),
         }
+    }
+
+    /// The suggested one-line fix for the blocking finding at `idx`, if the seat
+    /// emitted one (`remediation` is index-aligned with `blocking`). `None` when no
+    /// matching suggestion exists — the caller then surfaces the blocker alone,
+    /// never a fabricated fix (fail-open: an absent remediation is simply absent).
+    #[must_use]
+    pub fn fix_for(&self, idx: usize) -> Option<&str> {
+        self.remediation
+            .get(idx)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// Tag the verdict with its role (the model's JSON usually omits it) and
@@ -207,6 +231,16 @@ impl RoleVerdict {
                 .collect::<Vec<_>>()
         };
         self.blocking = clean(self.blocking);
+        // `remediation` is INDEX-ALIGNED with `blocking`, so — unlike the other
+        // lists — its blank slots are TRIMMED IN PLACE (not dropped): dropping an
+        // empty middle entry would shift every later suggestion onto the wrong
+        // blocker. `fix_for` filters the blanks to `None` at read time instead. A
+        // trailing run of empties is harmless (no blocker maps to it).
+        self.remediation = self
+            .remediation
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .collect();
         self.advisory = clean(self.advisory);
         self.evidence = clean(self.evidence);
         self
@@ -310,8 +344,11 @@ impl RoleCritic for PmCritic {
              whether the PRD actually serves the requirement and the user: clear goal, \
              coherent scope (in/out), testable acceptance criteria that cover the core \
              features, and whether anything a user would care about is MISSING. Only flag \
-             REAL gaps; ignore wording nits. JSON shape: \
+             REAL gaps; ignore wording nits. For EACH must-fix item, ALSO give ONE \
+             concrete one-line fix in \"remediation\" in the SAME order (what to \
+             change / add — a next step, not a restatement of the problem). JSON shape: \
              {\"accepts\": <true|false>, \"blocking\": [\"<must-fix gap>\", …], \
+             \"remediation\": [\"<1-line fix for the matching blocking item>\", …], \
              \"advisory\": [\"<nice-to-have>\", …], \"evidence\": [\"<where/why>\", …]}";
         let user = format!(
             "## Requirement\n{}\n\n## PRD\n{}\n\n## Architecture (context)\n{}",
@@ -345,8 +382,11 @@ impl RoleCritic for ArchitectureCritic {
              judge whether the architecture is buildable: a real + complete API surface (every \
              core feature has endpoints), a coherent data model, auth / error conventions, and \
              no contract gap between what the PRD promises and what the architecture serves. \
-             Only flag REAL gaps; ignore style. JSON shape: \
+             Only flag REAL gaps; ignore style. For EACH must-fix item, ALSO give ONE \
+             concrete one-line fix in \"remediation\" in the SAME order (what to \
+             change / add — a next step, not a restatement of the problem). JSON shape: \
              {\"accepts\": <true|false>, \"blocking\": [\"<must-fix gap>\", …], \
+             \"remediation\": [\"<1-line fix for the matching blocking item>\", …], \
              \"advisory\": [\"<nice-to-have>\", …], \"evidence\": [\"<where/why>\", …]}";
         let user = format!(
             "## Requirement\n{}\n\n## Architecture\n{}\n\n## PRD (context)\n{}",
@@ -387,8 +427,11 @@ impl RoleCritic for QaCritic {
              exercise the CRITICAL paths (not just the happy line), are error / edge / \
              boundary cases handled, is the core feature meaningfully covered rather than \
              smoke-tested. Only flag REAL test/quality gaps that would ship a broken or \
-             untested core path; ignore style. JSON shape: \
+             untested core path; ignore style. For EACH must-fix item, ALSO give ONE \
+             concrete one-line fix in \"remediation\" in the SAME order (what to \
+             change / add — a next step, not a restatement of the problem). JSON shape: \
              {\"accepts\": <true|false>, \"blocking\": [\"<must-fix gap>\", …], \
+             \"remediation\": [\"<1-line fix for the matching blocking item>\", …], \
              \"advisory\": [\"<nice-to-have>\", …], \"evidence\": [\"<where/why>\", …]}";
         let floor = if artifacts.qa_floor.trim().is_empty() {
             "(deterministic QA floor: no gaps found)".to_string()
@@ -436,8 +479,13 @@ impl RoleCritic for SecurityCritic {
              broken AUTHENTICATION, AUTHORIZATION / object-level access (IDOR) holes, \
              INJECTION surfaces (SQL / command / template / XSS), hardcoded secrets, and \
              unsafe input / output handling. Name the file/function and the concrete risk. \
-             Only flag REAL exploitable gaps; ignore style. JSON shape: \
+             Only flag REAL exploitable gaps; ignore style. For EACH must-fix risk, \
+             ALSO give ONE concrete one-line fix in \"remediation\" in the SAME order \
+             (the specific control to add — e.g. a signed session token + a real \
+             identity provider, or an authorization check — not a restatement). \
+             JSON shape: \
              {\"accepts\": <true|false>, \"blocking\": [\"<must-fix risk>\", …], \
+             \"remediation\": [\"<1-line fix for the matching blocking item>\", …], \
              \"advisory\": [\"<harden later>\", …], \"evidence\": [\"<file/why>\", …]}";
         let floor = if artifacts.security_floor.trim().is_empty() {
             "(deterministic security floor: no violations found)".to_string()
@@ -492,8 +540,12 @@ impl RoleCritic for UiuxCritic {
              AI-generated template. BLOCK on: no design-token system, emoji used as \
              functional icons / placeholders, default-system-font-only, a purple/pink-gradient \
              AI-template shell, or a decorative hero standing in for a real task flow. Only \
-             flag REAL design gaps; ignore wording nits. JSON shape: \
+             flag REAL design gaps; ignore wording nits. For EACH must-fix item, ALSO \
+             give ONE concrete one-line fix in \"remediation\" in the SAME order (what \
+             to change / add — a next step, not a restatement of the problem). \
+             JSON shape: \
              {\"accepts\": <true|false>, \"blocking\": [\"<must-fix design gap>\", …], \
+             \"remediation\": [\"<1-line fix for the matching blocking item>\", …], \
              \"advisory\": [\"<nice-to-have>\", …], \"evidence\": [\"<where/why>\", …]}";
         // Read the UIUX doc as the primary surface; at the preview gate the runner
         // also fills `code`, so the same critic can review the delivered frontend.
@@ -549,8 +601,12 @@ impl RoleCritic for FrontendCritic {
              fetch / axios call hits a path + verb the architecture's API contract actually \
              defines (no drifted or invented endpoint); (5) no hardcoded colors / magic \
              values where a token should be used. Only flag REAL gaps that would ship a \
-             broken, inaccessible, or contract-mismatched UI; ignore style. JSON shape: \
+             broken, inaccessible, or contract-mismatched UI; ignore style. For EACH \
+             must-fix item, ALSO give ONE concrete one-line fix in \"remediation\" in \
+             the SAME order (what to change / add — a next step, not a restatement). \
+             JSON shape: \
              {\"accepts\": <true|false>, \"blocking\": [\"<must-fix gap>\", …], \
+             \"remediation\": [\"<1-line fix for the matching blocking item>\", …], \
              \"advisory\": [\"<nice-to-have>\", …], \"evidence\": [\"<file/why>\", …]}";
         let user = format!(
             "## Requirement\n{}\n\n## UI/UX spec (intent)\n{}\n\n## Architecture API contract (context)\n{}\n\n## Delivered frontend code\n{}",
@@ -600,7 +656,11 @@ impl RoleCritic for BackendCritic {
              BASELINE — no obvious injection surface, every mutating route is authorized; \
              (5) no glaring ANTI-PATTERN (N+1 query, unbounded fetch, business logic in the \
              controller). Name the file/function. Only flag REAL defects; ignore style. \
+             For EACH must-fix defect, ALSO give ONE concrete one-line fix in \
+             \"remediation\" in the SAME order (what to change / add — a next step, not \
+             a restatement of the problem). \
              JSON shape: {\"accepts\": <true|false>, \"blocking\": [\"<must-fix defect>\", …], \
+             \"remediation\": [\"<1-line fix for the matching blocking item>\", …], \
              \"advisory\": [\"<harden later>\", …], \"evidence\": [\"<file/why>\", …]}";
         let floor = if artifacts.qa_floor.trim().is_empty() {
             "(deterministic contract / coverage floor: no gaps found)".to_string()
@@ -657,7 +717,11 @@ impl RoleCritic for DevOpsCritic {
              externalised — no hardcoded credential, token, or environment-specific endpoint \
              baked into source (config comes from the environment); (5) is it actually \
              release-ready. Name the file / step. Only flag REAL ship-blockers; ignore style. \
+             For EACH must-fix blocker, ALSO give ONE concrete one-line fix in \
+             \"remediation\" in the SAME order (what to change / add — a next step, not \
+             a restatement of the problem). \
              JSON shape: {\"accepts\": <true|false>, \"blocking\": [\"<must-fix blocker>\", …], \
+             \"remediation\": [\"<1-line fix for the matching blocking item>\", …], \
              \"advisory\": [\"<harden later>\", …], \"evidence\": [\"<file/step/why>\", …]}";
         let floor = if artifacts.qa_floor.trim().is_empty() {
             "(deterministic build / quality floor: no failures recorded)".to_string()
@@ -889,12 +953,52 @@ mod tests {
     }
 
     #[test]
+    fn role_verdict_remediation_pairs_with_blocking_and_is_fail_open() {
+        // The seat emits a per-blocker "how to fix" (`remediation`, index-aligned
+        // with `blocking`) so a blocked run can show a concrete next-step, not just
+        // the problem. The `fix` alias is accepted for a terser reply.
+        let json = r#"{"accepts": false,
+            "blocking": ["Authentication is bypassed", "Hardcoded session id"],
+            "remediation": ["add a signed session token + a real identity provider", "  "],
+            "evidence": ["server.mjs"]}"#;
+        let v: RoleVerdict = serde_json::from_str(json).unwrap();
+        let v = v.normalized("security-engineer");
+        // Blocker 0 → its concrete fix; blocker 1's blank suggestion → None (a
+        // blank slot is trimmed to None, never a fabricated fix — fail-open) while
+        // the SLOT is preserved so alignment is not shifted.
+        assert_eq!(
+            v.fix_for(0),
+            Some("add a signed session token + a real identity provider")
+        );
+        assert_eq!(v.fix_for(1), None, "a blank suggestion yields None");
+        assert_eq!(v.fix_for(9), None, "out-of-range index yields None");
+        // A blank MIDDLE slot must not shift later suggestions onto the wrong
+        // blocker — the slot is preserved, not dropped.
+        let mid = RoleVerdict {
+            blocking: vec!["a".into(), "b".into(), "c".into()],
+            remediation: vec!["fix-a".into(), "  ".into(), "fix-c".into()],
+            ..Default::default()
+        }
+        .normalized("qa-engineer");
+        assert_eq!(mid.fix_for(0), Some("fix-a"));
+        assert_eq!(mid.fix_for(1), None);
+        assert_eq!(mid.fix_for(2), Some("fix-c"), "alignment preserved");
+        // The `fix` alias also feeds `remediation`.
+        let aliased: RoleVerdict =
+            serde_json::from_str(r#"{"blocking":["x"],"fix":["do y"]}"#).unwrap();
+        assert_eq!(aliased.normalized("qa-engineer").fix_for(0), Some("do y"));
+        // The fail-open empty verdict carries no remediation.
+        assert!(RoleVerdict::empty("architect").fix_for(0).is_none());
+    }
+
+    #[test]
     fn append_team_ledger_writes_jsonl_and_is_fail_open() {
         let tmp = tempfile::TempDir::new().unwrap();
         let v = RoleVerdict {
             role: "product-manager".into(),
             accepts: false,
             blocking: vec!["a".into(), "b".into()],
+            remediation: vec![],
             advisory: vec!["c".into()],
             evidence: vec![],
         };
@@ -1026,6 +1130,12 @@ mod tests {
         assert!(
             system.to_lowercase().contains("qa engineer"),
             "the reviewer's own seat/focus is what frames the review"
+        );
+        // The seat is asked for a per-blocker FIX (the user-facing next-step), not
+        // just the problem — the `remediation` channel is wired into every prompt.
+        assert!(
+            system.contains("remediation"),
+            "the prompt asks the seat for a per-blocker remediation/next-step"
         );
         // No doer deliberation: a chain-of-thought trace was never an input to the
         // artifact view, so it cannot appear in what the reviewer sees.

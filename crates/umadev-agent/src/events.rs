@@ -214,6 +214,12 @@ pub enum EngineEvent {
         accepts: bool,
         /// Must-fix findings the seat raised (may be empty).
         blocking: Vec<String>,
+        /// A suggested one-line FIX per blocking finding — the seat's "how to fix",
+        /// index-aligned with `blocking`, so a blocked run surfaces a concrete
+        /// next-step to the USER (not just the problem). May be empty / shorter than
+        /// `blocking`: a blocker with no matching suggestion carries none (fail-open,
+        /// never a fabricated fix). Advisory only — never drives the loop.
+        remediation: Vec<String>,
         /// Nice-to-have notes (may be empty).
         advisory: Vec<String>,
     },
@@ -278,6 +284,7 @@ impl EngineEvent {
             seat: verdict.role.clone(),
             accepts: verdict.accepts,
             blocking: verdict.blocking.clone(),
+            remediation: verdict.remediation.clone(),
             advisory: verdict.advisory.clone(),
         }
     }
@@ -531,6 +538,7 @@ mod tests {
             role: "architect".to_string(),
             accepts: false,
             blocking: vec!["missing API table".to_string()],
+            remediation: vec!["add an API table: method / path / auth per endpoint".to_string()],
             advisory: vec!["consider rate limiting".to_string()],
             evidence: vec!["architecture.md".to_string()],
         };
@@ -539,6 +547,7 @@ mod tests {
             seat,
             accepts,
             blocking,
+            remediation,
             advisory,
         } = ev
         else {
@@ -547,6 +556,9 @@ mod tests {
         assert_eq!(seat, "architect");
         assert!(!accepts);
         assert_eq!(blocking, vec!["missing API table".to_string()]);
+        // The per-blocker fix rides the event so a UI can surface a next-step.
+        assert_eq!(remediation.len(), 1);
+        assert!(remediation[0].contains("API table"));
         assert_eq!(advisory.len(), 1);
     }
 }

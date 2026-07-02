@@ -574,8 +574,28 @@ pub struct CriticRow {
     pub accepts: bool,
     /// Must-fix findings (may be empty).
     pub blocking: Vec<String>,
+    /// Suggested one-line FIX per blocking finding — the seat's "how to fix",
+    /// index-aligned with `blocking`. Surfaced so a blocked run shows a concrete
+    /// next-step, not just the problem. May be empty / shorter than `blocking`
+    /// (a blocker with no suggestion carries none — fail-open).
+    pub remediation: Vec<String>,
     /// Nice-to-have notes (may be empty).
     pub advisory: Vec<String>,
+}
+
+impl CriticRow {
+    /// The suggested one-line fix for the blocking finding at `idx`, if the seat
+    /// emitted one (`remediation` is index-aligned with `blocking`). `None` when no
+    /// matching, non-blank suggestion exists — the caller then shows the blocker
+    /// alone, never a fabricated fix (fail-open).
+    #[must_use]
+    pub fn fix_for(&self, idx: usize) -> Option<&str> {
+        self.remediation
+            .get(idx)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// Live status of one convened teammate in the **team roster** (Wave C). Derived
@@ -5854,6 +5874,7 @@ impl App {
         seat: String,
         accepts: bool,
         blocking: Vec<String>,
+        remediation: Vec<String>,
         advisory: Vec<String>,
     ) {
         // A sealed round means this verdict opens a NEW review round — drop the
@@ -5865,11 +5886,12 @@ impl App {
         }
         // Mirror the full verdict into the transcript (the never-lost source of
         // truth) before the value is moved into the panel row.
-        self.push_critic_note(&seat, accepts, &blocking);
+        self.push_critic_note(&seat, accepts, &blocking, &remediation);
         let row = CriticRow {
             seat,
             accepts,
             blocking,
+            remediation,
             advisory,
         };
         if let Some(existing) = self.critic_verdicts.iter_mut().find(|c| c.seat == row.seat) {
@@ -5883,7 +5905,13 @@ impl App {
     /// the unbounded, scrollable record that guarantees a blocking critic's full
     /// findings are never hidden behind the panel's "… +N" clip. An accept is one
     /// line; a block lists every must-fix finding underneath. Localized.
-    fn push_critic_note(&mut self, seat: &str, accepts: bool, blocking: &[String]) {
+    fn push_critic_note(
+        &mut self,
+        seat: &str,
+        accepts: bool,
+        blocking: &[String],
+        remediation: &[String],
+    ) {
         let mut body = if accepts {
             umadev_i18n::tf(self.lang, "plan.review.note.accept", &[seat])
         } else {
@@ -5893,10 +5921,24 @@ impl App {
                 &[seat, &blocking.len().max(1).to_string()],
             )
         };
-        for b in blocking {
+        for (i, b) in blocking.iter().enumerate() {
             let item = b.trim();
-            if !item.is_empty() {
-                body.push_str(&format!("\n  - {item}"));
+            if item.is_empty() {
+                continue;
+            }
+            body.push_str(&format!("\n  - {item}"));
+            // The seat's per-blocker "how to fix" (index-aligned) rides directly
+            // under the problem so the transcript shows a concrete next-step, not
+            // just what is wrong. Fail-open: no matching suggestion → nothing extra.
+            if let Some(fix) = remediation
+                .get(i)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                body.push_str(&format!(
+                    "\n    {}",
+                    umadev_i18n::tf(self.lang, "plan.review.fix", &[fix])
+                ));
             }
         }
         self.push(ChatRole::System, body);
@@ -5989,8 +6031,9 @@ impl App {
                 seat,
                 accepts,
                 blocking,
+                remediation,
                 advisory,
-            } => self.apply_critic_verdict(seat, accepts, blocking, advisory),
+            } => self.apply_critic_verdict(seat, accepts, blocking, remediation, advisory),
             EngineEvent::PhaseStarted { phase } => {
                 self.set_phase(phase, PhaseStatus::Running);
                 self.phase_started_at = Some(std::time::Instant::now());
@@ -15502,12 +15545,14 @@ mod tests {
             seat: "architect".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         app.apply_engine(EngineEvent::CriticVerdict {
             seat: "qa".into(),
             accepts: false,
             blocking: vec!["missing tests".into()],
+            remediation: vec![],
             advisory: vec![],
         });
         let roster = app.convened_roster();
@@ -15532,6 +15577,52 @@ mod tests {
         let app = fresh_app(Some("offline"));
         assert!(app.convened_roster().is_empty());
         assert!(app.handoffs.is_empty());
+    }
+
+    #[test]
+    fn critic_transcript_note_carries_per_blocker_resolution() {
+        // The never-lost transcript note lists each must-fix problem AND, right
+        // under it, the seat's suggested fix (the per-blocker remediation) so the
+        // full resolution is always in the scrollable history.
+        let mut app = fresh_app(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        app.apply_engine(EngineEvent::CriticVerdict {
+            seat: "security-engineer".into(),
+            accepts: false,
+            blocking: vec![
+                "Authentication is effectively bypassed".into(),
+                "Hardcoded, guessable session identifiers".into(),
+            ],
+            remediation: vec![
+                "add a signed session token + a real identity provider".into(),
+                "generate a random per-session id server-side".into(),
+            ],
+            advisory: vec![],
+        });
+        let note = app
+            .history
+            .iter()
+            .find(|m| m.role == ChatRole::System && m.body().contains("must-fix"))
+            .expect("a blocking critic pushes a transcript note");
+        let body = note.body();
+        // Each problem is present…
+        assert!(
+            body.contains("Authentication is effectively bypassed"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Hardcoded, guessable session identifiers"),
+            "{body}"
+        );
+        // …with its concrete fix surfaced right under it.
+        assert!(
+            body.contains("signed session token"),
+            "fix 1 surfaced: {body}"
+        );
+        assert!(
+            body.contains("random per-session id"),
+            "fix 2 surfaced: {body}"
+        );
     }
 
     #[test]
@@ -15895,12 +15986,14 @@ mod tests {
             seat: "architect".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec!["consider a cache".into()],
         });
         app.apply_engine(EngineEvent::CriticVerdict {
             seat: "qa".into(),
             accepts: false,
             blocking: vec!["no tests".into(), "no error handling".into()],
+            remediation: vec![],
             advisory: vec![],
         });
         assert_eq!(app.critic_verdicts.len(), 2);
@@ -15909,6 +16002,7 @@ mod tests {
             seat: "qa".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         assert_eq!(app.critic_verdicts.len(), 2, "seat replaced, not stacked");
@@ -16006,6 +16100,7 @@ mod tests {
             seat: "qa".into(),
             accepts: false,
             blocking: vec!["x".into()],
+            remediation: vec![],
             advisory: vec![],
         });
         assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
@@ -16027,6 +16122,7 @@ mod tests {
                 "API contract drift: /login missing".into(),
                 "no error states on the form".into(),
             ],
+            remediation: vec![],
             advisory: vec![],
         });
         let joined: String = app.history.iter().map(|m| m.body().clone()).collect();
@@ -16052,6 +16148,7 @@ mod tests {
                 seat: seat.into(),
                 accepts: false,
                 blocking: vec!["fix it".into()],
+                remediation: vec![],
                 advisory: vec![],
             });
         }
@@ -16067,6 +16164,7 @@ mod tests {
             seat: "qa".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         assert_eq!(
@@ -16087,12 +16185,14 @@ mod tests {
             seat: "architect".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         app.apply_engine(EngineEvent::CriticVerdict {
             seat: "qa".into(),
             accepts: false,
             blocking: vec!["no tests".into()],
+            remediation: vec![],
             advisory: vec![],
         });
         assert_eq!(app.critic_verdicts.len(), 2, "one round keeps both seats");
@@ -16114,6 +16214,7 @@ mod tests {
             seat: "qa".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
@@ -16153,6 +16254,7 @@ mod tests {
             seat: "qa".into(),
             accepts: false,
             blocking: vec!["broken".into()],
+            remediation: vec![],
             advisory: vec![],
         });
         assert!(!app.plan_steps.is_empty() && !app.critic_verdicts.is_empty());
@@ -19314,12 +19416,14 @@ mod tests {
             seat: "architect".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec!["consider a cache".into()],
         });
         a.apply_engine(EngineEvent::CriticVerdict {
             seat: "qa".into(),
             accepts: false,
             blocking: vec!["no tests for login".into(), "no error handling".into()],
+            remediation: vec![],
             advisory: vec![],
         });
         assert_eq!(a.critic_verdicts.len(), 2);
@@ -19402,12 +19506,14 @@ mod tests {
             seat: "architect".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         a.apply_engine(EngineEvent::CriticVerdict {
             seat: "qa".into(),
             accepts: false,
             blocking: vec!["no tests for login".into()],
+            remediation: vec![],
             advisory: vec![],
         });
         let before = a.history.len();
@@ -19446,6 +19552,7 @@ mod tests {
             seat: "pm".into(),
             accepts: true,
             blocking: vec![],
+            remediation: vec![],
             advisory: vec![],
         });
         let before = a.history.len();

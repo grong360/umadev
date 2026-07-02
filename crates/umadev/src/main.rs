@@ -2291,6 +2291,7 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
             seat,
             accepts,
             blocking,
+            remediation,
             ..
         } => {
             if *accepts {
@@ -2298,6 +2299,15 @@ fn print_engine_event(event: &umadev_agent::EngineEvent) {
             } else {
                 let first = blocking.first().map_or("", String::as_str);
                 eprintln!("  [{seat}] ✗ {} must-fix: {first}", blocking.len());
+                // Surface the seat's suggested fix for the first blocker so the
+                // headless path shows a next-step too. Fail-open: none → skip.
+                if let Some(fix) = remediation
+                    .first()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    eprintln!("        fix: {fix}");
+                }
             }
         }
         _ => {}
