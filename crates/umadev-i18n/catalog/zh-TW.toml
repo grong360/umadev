@@ -560,12 +560,12 @@
 "route.failed" = "[warn] 路由失敗(底座 `{}`): {}\n  你可以重試,或用 /run <需求> 顯式啟動流水線。"
 
 # 底座失敗分類器 —— 可操作診斷(classify → actionable_message)
-"base.fail.auth.claude" = "底座未登入 — 執行 `claude /login`(或檢查你接入的第三方 API key),然後用 /continue 接續"
-"base.fail.auth.codex" = "codex 未登入或鑑權失敗 — 檢查 codex 登入或 API key,然後用 /continue 接續"
-"base.fail.auth.opencode" = "opencode 未登入或鑑權失敗 — 檢查 opencode 登入或 API key,然後用 /continue 接續"
-"base.fail.auth.generic" = "底座未登入或鑑權失敗 — 檢查底座的登入或 API key,然後用 /continue 接續"
-"base.fail.ratelimit" = "底座觸發限流 — 稍後重試,或換個底座(模型由底座管理,在底座裡配置)"
-"base.fail.overloaded" = "底座過載(忙)— 稍後重試,或換個底座"
+"base.fail.auth.claude" = "底座未登入 — 執行 `claude auth login`,或為無頭呼叫設定 CLAUDE_CODE_OAUTH_TOKEN(來自 `claude setup-token`),然後用 /continue 接續"
+"base.fail.auth.codex" = "codex 未登入或鑑權失敗 — 執行 `codex login`(或檢查 API key),然後用 /continue 接續"
+"base.fail.auth.opencode" = "opencode 未登入或鑑權失敗 — 執行 `opencode auth login`(或檢查 API key),然後用 /continue 接續"
+"base.fail.auth.generic" = "底座未登入或鑑權失敗 — 執行底座的登入命令(或檢查 API key),然後用 /continue 接續"
+"base.fail.ratelimit" = "底座觸發限流 — 等待其重置(見下方底座的原始訊息),或用 /model 切換模型,或換個底座"
+"base.fail.overloaded" = "底座過載(忙)— 稍後重試,或用 /model 切到更輕量的模型,或換個底座"
 "base.fail.network" = "連不上底座的模型端點 — 檢查網路或代理設定"
 "base.fail.network.ssl" = "SSL / 憑證校驗失敗 — 檢查代理或企業憑證(NODE_EXTRA_CA_CERTS)"
 "base.fail.context" = "上下文超出底座上限 — 用 /compact 壓縮,或換更大上下文的模型"

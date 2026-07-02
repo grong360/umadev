@@ -562,12 +562,12 @@
 "route.failed" = "[warn] Routing failed (base `{}`): {}\n  You can retry, or use /run <requirement> to start the pipeline explicitly."
 
 # Base-failure classifier — actionable diagnosis (classify -> actionable_message)
-"base.fail.auth.claude" = "Base not logged in — run `claude /login` (or check your third-party API key), then /continue"
-"base.fail.auth.codex" = "codex not logged in / auth failed — check codex login or API key, then /continue"
-"base.fail.auth.opencode" = "opencode not logged in / auth failed — check opencode login or API key, then /continue"
-"base.fail.auth.generic" = "Base not logged in / auth failed — check the base login or API key, then /continue"
-"base.fail.ratelimit" = "Base hit a rate limit — retry shortly, or switch base (the model is the base's own — set it in the base)"
-"base.fail.overloaded" = "Base is overloaded (busy) — retry shortly, or switch base"
+"base.fail.auth.claude" = "Base not logged in — run `claude auth login`, or set CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`) for headless use, then /continue"
+"base.fail.auth.codex" = "codex not logged in / auth failed — run `codex login` (or check your API key), then /continue"
+"base.fail.auth.opencode" = "opencode not logged in / auth failed — run `opencode auth login` (or check your API key), then /continue"
+"base.fail.auth.generic" = "Base not logged in / auth failed — run the base's login command (or check your API key), then /continue"
+"base.fail.ratelimit" = "Base hit a rate limit — wait for it to reset (see the base's message below), or /model to switch model, or switch base"
+"base.fail.overloaded" = "Base is overloaded (busy) — retry shortly, or /model to a lighter model, or switch base"
 "base.fail.network" = "Cannot reach the base model endpoint — check your network or proxy settings"
 "base.fail.network.ssl" = "SSL / certificate verification failed — check your proxy or corporate cert (NODE_EXTRA_CA_CERTS)"
 "base.fail.context" = "Context exceeded the base limit — /compact to shrink, or switch to a larger-context model"

@@ -132,10 +132,13 @@ pub fn is_transient(f: &BaseFailure) -> bool {
 
 /// The per-base, actionable, localized diagnosis for a [`BaseFailure`].
 ///
-/// Returns a short imperative line that names the fix for THIS base (so a `claude`
-/// auth failure says "run `claude /login`" while `codex` says "check codex
-/// login"). [`BaseFailure::Unknown`] returns an empty string — the caller then
-/// falls back to today's generic reason (no actionable line prepended).
+/// Returns a short imperative line that names the CONCRETE next command for THIS
+/// base — tied to the picker's own `login_hint` per backend (so a `claude` auth
+/// failure says "run `claude auth login` / set `CLAUDE_CODE_OAUTH_TOKEN`", `codex`
+/// says "run `codex login`", `opencode` says "run `opencode auth login`"), and a
+/// rate-limit / overloaded points at `/model`, a context overflow at `/compact`.
+/// [`BaseFailure::Unknown`] returns an empty string — the caller then falls back
+/// to today's generic reason (no actionable line prepended).
 #[must_use]
 pub fn actionable_message(f: &BaseFailure, backend: &str) -> String {
     match f {
@@ -686,6 +689,41 @@ mod tests {
         assert!(m.contains("137"), "exit message names the code: {m}");
         // Unknown is empty → the mint point keeps today's generic reason.
         assert_eq!(actionable_message(&BaseFailure::Unknown, "codex"), "");
+    }
+
+    #[test]
+    fn remediation_names_the_concrete_next_command() {
+        // The remediation isn't just "what failed" — it carries the CONCRETE next
+        // command, per base, tied to the picker's own login commands. These are
+        // Latin literals identical across all three catalogs, so the assertion holds
+        // regardless of the active UI language.
+        //
+        // AUTH → the base's own login command (+ the headless token for claude).
+        let claude = actionable_message(&BaseFailure::Auth, "claude-code");
+        assert!(claude.contains("claude auth login"), "{claude}");
+        assert!(claude.contains("CLAUDE_CODE_OAUTH_TOKEN"), "{claude}");
+        assert!(
+            actionable_message(&BaseFailure::Auth, "codex").contains("codex login"),
+            "codex auth names `codex login`"
+        );
+        assert!(
+            actionable_message(&BaseFailure::Auth, "opencode").contains("opencode auth login"),
+            "opencode auth names `opencode auth login`"
+        );
+        // RATE LIMIT / OVERLOADED → the /model lever (switch model without leaving UmaDev).
+        assert!(
+            actionable_message(&BaseFailure::RateLimit, "codex").contains("/model"),
+            "rate-limit remediation offers /model"
+        );
+        assert!(
+            actionable_message(&BaseFailure::Overloaded, "codex").contains("/model"),
+            "overloaded remediation offers /model"
+        );
+        // CONTEXT → the /compact lever.
+        assert!(
+            actionable_message(&BaseFailure::Context, "codex").contains("/compact"),
+            "context remediation offers /compact"
+        );
     }
 
     #[test]

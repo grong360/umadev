@@ -488,7 +488,7 @@ pub(crate) fn idle_reason(idle: Duration) -> String {
 /// Fail-open + bounded, mirroring the chat path: it first [`classify`]es the
 /// base's own captured evidence (exit + stderr tail) and
 /// PREPENDS the per-base [`actionable_message`] (D1: turn "base session idle" into
-/// "底座未登录 — 运行 claude /login …"); then a non-success exit appends
+/// "底座未登录 — 运行 claude auth login …"); then a non-success exit appends
 /// `(base 进程已退出: <status>)` and a present stderr tail appends
 /// ` — base stderr: …` using its last 3 non-empty lines, ≤280 chars, so power
 /// users still see the verbatim base error as the technical detail. A failure
@@ -4463,7 +4463,7 @@ mod tests {
         // D1: a known stderr (here an auth error) now classifies and PREPENDS the
         // per-base actionable diagnosis, while still appending the raw stderr tail
         // as the technical detail — so a hung claude with a bad key reads e.g.
-        // "底座未登录 — 运行 claude /login … — base stderr: error: invalid x-api-key"
+        // "底座未登录 — 运行 claude auth login … — base stderr: error: invalid x-api-key"
         // instead of a blind "base session idle".
         let enriched = enrich_idle_reason(
             "base session idle",

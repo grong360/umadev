@@ -319,6 +319,23 @@ mod tests {
             "pipeline.generic_error",
             "pipeline.error_note",
             "base.init_failed",
+            // Base-failure remediation catalog (base_error::actionable_message): when the
+            // BORROWED base CLI fails, UmaDev classifies the raw stderr/turn error and
+            // PREPENDS a per-base "here's the next step" line (concrete command), keeping
+            // the raw base error as the detail. These back the run-path (enrich_idle_reason)
+            // and chat-path (enrich_base_failure / enrich_base_turn_failure) surfaces, so a
+            // dev hard-coding one in English again would ship a wrong-language remediation.
+            "base.fail.auth.claude",
+            "base.fail.auth.codex",
+            "base.fail.auth.opencode",
+            "base.fail.auth.generic",
+            "base.fail.ratelimit",
+            "base.fail.overloaded",
+            "base.fail.network",
+            "base.fail.network.ssl",
+            "base.fail.context",
+            "base.fail.exited",
+            "base.fail.turn_failed",
             // Idle-watchdog diagnosis (run + chat paths): the base went silent with no
             // tool running (looks hung) OR the run budget was reached — while a tool
             // runs UmaDev keeps waiting as long as the base is alive (liveness-based, no
