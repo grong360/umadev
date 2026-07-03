@@ -48,9 +48,18 @@ const SKIP_DIRS: &[&str] = &[
     "output",
 ];
 
-/// Recursively collect source files (bounded: depth 8, 600 files).
+/// Maximum directory depth for the source walk. Enterprise Vue/Java admin
+/// projects commonly nest real code below `src/views/.../components/...`, so an
+/// 8-level cap misses legitimate source and feeds empty/partial evidence to QA.
+/// File count + skip dirs remain the real monorepo guard.
+const MAX_SOURCE_DEPTH: usize = 16;
+
+/// Maximum number of source files scanned (guards a pathological monorepo).
+const MAX_SOURCE_FILES: usize = 600;
+
+/// Recursively collect source files (bounded by depth + file count).
 fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 8 || out.len() > 600 {
+    if depth > MAX_SOURCE_DEPTH || out.len() > MAX_SOURCE_FILES {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -576,6 +585,30 @@ mod tests {
         let gaps = task_acceptance_gaps(tmp.path(), "demo");
         assert_eq!(gaps.len(), 1);
         assert!(gaps[0].contains("/api/users"));
+    }
+
+    #[test]
+    fn source_files_include_deep_enterprise_view_paths() {
+        // Repro shape from enterprise Vue/admin projects:
+        // src/views/biz/app/page/component/widgets/customer/detail/...
+        // This used to exceed the depth-8 walk cap, making real delivered code
+        // invisible to the source-present gate and QA/code-review digest.
+        let tmp = TempDir::new().unwrap();
+        let deep = tmp
+            .path()
+            .join("src/views/biz/app/page/component/widgets/customer/detail/panels");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(
+            deep.join("ProfilePanel.vue"),
+            "<script setup>const loaded = true</script>\n<template><main /></template>",
+        )
+        .unwrap();
+
+        let found = source_files(tmp.path());
+        assert!(
+            found.iter().any(|p| p.ends_with("ProfilePanel.vue")),
+            "deep real source must be visible to QA/source-present scans: {found:?}"
+        );
     }
 
     #[test]

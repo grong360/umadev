@@ -2793,8 +2793,16 @@ pub async fn run_post_build_qc(
 fn post_build_rework_context(options: &RunOptions) -> String {
     let mut out = String::new();
     // Knowledge digest — small budget (3 chunks), matching the agentic light-turn size.
-    let digest =
-        crate::phases::agentic_knowledge_digest(&options.project_root, &options.requirement, 3);
+    // `record_feedback = true`: this prefix front-loads a chat-BUILD's post-QC fix
+    // directives (only reached once a turn is a real build), and that fix loop runs
+    // the same `self_evolve` reward/penalise seam as `/run` — so the surfaced chunks
+    // are snapshotted here for that outcome to attribute.
+    let digest = crate::phases::agentic_knowledge_digest(
+        &options.project_root,
+        &options.requirement,
+        3,
+        true,
+    );
     if !digest.trim().is_empty() {
         out.push_str(digest.trim());
     }

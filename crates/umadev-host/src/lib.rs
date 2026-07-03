@@ -396,7 +396,14 @@ fn spawn_stderr_capture(
             while buf.len() < STDERR_CAPTURE_CAP {
                 match se.read(&mut chunk).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        let remaining = STDERR_CAPTURE_CAP - buf.len();
+                        let take = n.min(remaining);
+                        buf.extend_from_slice(&chunk[..take]);
+                        if take < n {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1348,12 +1355,18 @@ pub(crate) fn clean_output(raw: &str) -> String {
 /// consistent (previously `codex.rs` mapped *all* errors, including
 /// timeouts, to `HostProcess`, which broke caller-side timeout detection).
 pub(crate) fn map_subprocess_error(err: String) -> umadev_runtime::RuntimeError {
-    if err.contains("timed out") {
+    if err.contains("timed out") || err.contains("idle timeout") {
         let secs = err
             .split("after ")
             .nth(1)
             .and_then(|s| s.split('s').next())
             .and_then(|n| n.parse::<u64>().ok())
+            .or_else(|| {
+                err.split("for ")
+                    .nth(1)
+                    .and_then(|s| s.split('s').next())
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
             .unwrap_or(300);
         umadev_runtime::RuntimeError::Timeout(secs, err)
     } else {
@@ -1956,6 +1969,46 @@ mod tests {
         assert!(merged.contains("User: 你好"));
         assert!(merged.contains("Assistant: 你好,我是底座"));
         assert!(merged.ends_with("User: 我刚才说了什么?"));
+    }
+
+    #[test]
+    fn map_subprocess_error_classifies_streaming_idle_timeout() {
+        let err = "`claude` idle timeout: no stdout for 7s (stream-json hang? lines so far: 1). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.".to_string();
+        match map_subprocess_error(err) {
+            umadev_runtime::RuntimeError::Timeout(secs, msg) => {
+                assert_eq!(secs, 7);
+                assert!(msg.contains("idle timeout"));
+            }
+            other => panic!("idle timeout must map to RuntimeError::Timeout, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_capture_cap_is_a_hard_limit() {
+        // The contract says 256 KiB; the old implementation appended whole
+        // chunks and could exceed the cap by up to 8191 bytes.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(
+                "i=0; while [ $i -lt 4000 ]; do \
+                 printf '0123456789%.0s' 1 2 3 4 5 6 7 8 9 10 1>&2; \
+                 i=$((i+1)); \
+                 done",
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let task = spawn_stderr_capture(child.stderr.take());
+        let _ = child.wait().await.unwrap();
+        let buf = reap_bounded(task).await.unwrap();
+        assert_eq!(
+            buf.len(),
+            STDERR_CAPTURE_CAP,
+            "stderr capture must not grow past the advertised hard cap"
+        );
     }
 
     #[test]

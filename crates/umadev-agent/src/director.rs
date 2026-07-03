@@ -317,8 +317,16 @@ fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> Stri
     // the query and filters the corpus to its discipline's subdirs, so a frontend
     // step draws frontend/design knowledge and a security step draws security KB.
     // Fail-open empty (or the plain instruction-keyed digest for an unknown seat).
-    let knowledge =
-        crate::phases::seat_scoped_knowledge_digest(&options.project_root, role, instruction, 4);
+    // `record_feedback = true`: this seat step's directive precedes a real doer
+    // whose PASS/FAIL is consumed by `self_evolve::{reward_on_pass,penalise_on_fail}`
+    // — so the surfaced chunks are snapshotted here for that outcome to attribute.
+    let knowledge = crate::phases::seat_scoped_knowledge_digest(
+        &options.project_root,
+        role,
+        instruction,
+        4,
+        true,
+    );
     let mut directive = String::new();
     directive.push_str(crate::experts::agentic_engineering_rules());
     directive.push_str("\n\n");

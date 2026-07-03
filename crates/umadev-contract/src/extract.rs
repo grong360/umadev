@@ -449,20 +449,17 @@ fn extract_from_file(file: &str, content: &str) -> Vec<FrontendCall> {
     calls
 }
 
-/// Maximum directory depth for the frontend-source walk. Guards against a
-/// pathological nesting (rare, but a symlink-resolved tree could be deep).
-const MAX_FRONTEND_DEPTH: usize = 8;
+/// Maximum directory depth for the frontend-source walk. Enterprise admin
+/// frontends commonly place real views under deep trees such as
+/// `src/views/biz/app/page/component/widgets/...`; keep this high enough to scan
+/// those while file count + skip dirs still bound pathological trees.
+const MAX_FRONTEND_DEPTH: usize = 16;
 
 fn collect_frontend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if depth > MAX_FRONTEND_DEPTH {
-        // Warn once at the boundary so a project with genuinely-deep source
-        // trees knows coverage is partial (previously this was silent).
-        if depth == MAX_FRONTEND_DEPTH + 1 {
-            eprintln!(
-                "warn: frontend source walk hit the depth-{MAX_FRONTEND_DEPTH} cap at {};                  files deeper than this are NOT scanned for API calls.                  If your source lives deeper, consider flattening or raise                  the cap.",
-                dir.display()
-            );
-        }
+        // Library code must never write directly to stdout/stderr: the TUI owns
+        // the terminal. A deep tree is bounded silently here and higher-level
+        // verification remains fail-open.
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -628,6 +625,29 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(calls.iter().any(|c| c.path == "/api/users"));
         assert!(calls.iter().any(|c| c.path == "/api/auth/login"));
+    }
+
+    #[test]
+    fn extracts_from_deep_enterprise_frontend_layout() {
+        // Enterprise admin projects often nest components deeper than 8 levels
+        // under src/views/...; those API calls still belong to the real frontend
+        // contract surface and must not be silently skipped.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp
+            .path()
+            .join("src/views/biz/app/page/component/widgets/customer/detail/panels");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ProfilePanel.vue"),
+            "<script setup>fetch('/api/customer/profile')</script>",
+        )
+        .unwrap();
+
+        let calls = extract_frontend_calls(tmp.path());
+        assert!(
+            calls.iter().any(|c| c.path == "/api/customer/profile"),
+            "deep frontend calls must be scanned: {calls:?}"
+        );
     }
 
     #[test]

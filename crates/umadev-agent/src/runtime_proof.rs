@@ -238,7 +238,7 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
     // 4. Spawn the dev server, capturing its output so we can read readiness and
     //    port-conflict signals (the old code discarded output, which is why a port
     //    fallback went unnoticed and the boot hung).
-    let (program, args) = split_command(dev.command);
+    let (program, args) = split_command(&dev.command);
     let (vprog, vlead) = spawn_parts(&program);
     let spawn = Command::new(vprog)
         .args(&vlead)
@@ -254,7 +254,7 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
         Err(e) => {
             let mut proof = RuntimeProof::not_verified(format!("failed to start dev server: {e}"));
             proof.dev_server = Some(dev.label.to_string());
-            proof.command = Some(dev.command.to_string());
+            proof.command = Some(dev.command.clone());
             proof.base_url = Some(base_url);
             return proof;
         }
@@ -297,7 +297,7 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
         BootOutcome::Timeout => {
             let mut proof = RuntimeProof::not_verified(boot_timeout_reason(READY_TIMEOUT_SECS));
             proof.dev_server = Some(dev.label.to_string());
-            proof.command = Some(dev.command.to_string());
+            proof.command = Some(dev.command.clone());
             proof.base_url = Some(base_url);
             proof
         }
@@ -352,7 +352,7 @@ async fn finish_proof(
         timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         status: RuntimeStatus::Verified,
         dev_server: Some(dev.label.to_string()),
-        command: Some(dev.command.to_string()),
+        command: Some(dev.command.clone()),
         base_url: Some(base_url.clone()),
         ready_ms,
         routes: Vec::new(),

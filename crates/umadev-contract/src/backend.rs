@@ -105,8 +105,10 @@ const SKIP_DIRS: &[&str] = &[
     ".cache",
 ];
 
-/// Maximum directory depth for the backend-source walk.
-const MAX_DEPTH: usize = 8;
+/// Maximum directory depth for the backend-source walk. Real Spring/Nest/Go
+/// monorepos can nest routes/controllers deeper than 8 levels under modules;
+/// file count + skip dirs are the primary guard against pathological trees.
+const MAX_DEPTH: usize = 16;
 /// Maximum number of source files scanned (guards a pathological monorepo).
 const MAX_FILES: usize = 800;
 /// Skip files larger than this (a bundled / generated file, not hand-written
@@ -1222,6 +1224,36 @@ mod tests {
         let routes = extract_backend_routes(tmp.path());
         assert!(routes.iter().any(|r| r.path == "/api/real"));
         assert!(!routes.iter().any(|r| r.path == "/api/evil"));
+    }
+
+    #[test]
+    fn extracts_routes_from_deep_backend_module_layout() {
+        // Real Java/Spring and generated admin modules can nest controllers well
+        // past 8 directories under a workspace. The route scanner must still see
+        // them so backend presence and API coverage are judged from reality.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp
+            .path()
+            .join("services/medical/modules/mes/src/main/java/com/acme/mes/app/api/controller");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("PatientController.java"),
+            r#"
+                @RestController
+                @RequestMapping("/api/patients")
+                class PatientController {
+                    @GetMapping("/{id}")
+                    String get() { return "ok"; }
+                }
+            "#,
+        )
+        .unwrap();
+
+        let routes = extract_backend_routes(tmp.path());
+        assert!(
+            routes.iter().any(|r| r.path == "/api/patients/{id}"),
+            "deep backend route must be scanned: {routes:?}"
+        );
     }
 
     #[test]

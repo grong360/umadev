@@ -227,8 +227,9 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
 pub struct DevServer {
     /// Human label, e.g. "Vite dev server".
     pub label: &'static str,
-    /// Exact command to spawn, e.g. "npm run dev".
-    pub command: &'static str,
+    /// Exact command to spawn, e.g. "npm run dev" or
+    /// "cd jeecgboot-vue3 && pnpm dev".
+    pub command: String,
     /// Default URL the dev server prints (for the "no URL recorded" hint).
     pub default_url: &'static str,
 }
@@ -238,6 +239,25 @@ pub struct DevServer {
 /// static-serve for plain HTML, then returns None.
 #[must_use]
 pub fn detect_dev_server(workspace: &Path) -> Option<DevServer> {
+    if let Some(root) = detect_dev_server_in_dir(workspace) {
+        if !looks_like_root_acceptance_harness(workspace) {
+            return Some(root);
+        }
+    }
+
+    for subdir in preferred_frontend_dirs(workspace) {
+        if let Some(mut ds) = detect_dev_server_in_dir(&subdir) {
+            let rel = subdir.strip_prefix(workspace).ok()?;
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            ds.command = format!("cd {rel} && {}", ds.command);
+            return Some(ds);
+        }
+    }
+
+    None
+}
+
+fn detect_dev_server_in_dir(workspace: &Path) -> Option<DevServer> {
     // 1. Node frameworks — ordered by specificity (most-distinctive first).
     if package_json_depends_on(workspace, "vite") {
         let pm = node_package_manager(workspace);
@@ -250,28 +270,28 @@ pub fn detect_dev_server(workspace: &Path) -> Option<DevServer> {
         };
         return Some(DevServer {
             label: "Vite dev server",
-            command: cmd,
+            command: cmd.to_string(),
             default_url: "http://localhost:5173",
         });
     }
     if package_json_depends_on(workspace, "next") {
         return Some(DevServer {
             label: "Next.js dev server",
-            command: "npm run dev",
+            command: "npm run dev".to_string(),
             default_url: "http://localhost:3000",
         });
     }
     if package_json_depends_on_prefix(workspace, "@astrojs") {
         return Some(DevServer {
             label: "Astro dev server",
-            command: "npm run dev",
+            command: "npm run dev".to_string(),
             default_url: "http://localhost:4321",
         });
     }
     if package_json_depends_on(workspace, "react-scripts") {
         return Some(DevServer {
             label: "Create React App dev server",
-            command: "npm start",
+            command: "npm start".to_string(),
             default_url: "http://localhost:3000",
         });
     }
@@ -280,7 +300,7 @@ pub fn detect_dev_server(workspace: &Path) -> Option<DevServer> {
     if has_node_script(workspace, "dev") {
         return Some(DevServer {
             label: "Node dev server",
-            command: "npm run dev",
+            command: "npm run dev".to_string(),
             default_url: "http://localhost:3000",
         });
     }
@@ -291,11 +311,53 @@ pub fn detect_dev_server(workspace: &Path) -> Option<DevServer> {
     if has_html {
         return Some(DevServer {
             label: "Static file server",
-            command: "python3 -m http.server 8000",
+            command: "python3 -m http.server 8000".to_string(),
             default_url: "http://localhost:8000",
         });
     }
     None
+}
+
+fn looks_like_root_acceptance_harness(workspace: &Path) -> bool {
+    let has_real_subproject = [
+        "jeecgboot-vue3",
+        "jeecg-boot",
+        "jeecguniapp",
+        "pigx-visual",
+        "pigx-ai-ui",
+        "frontend",
+        "web",
+        "ui",
+        "app",
+    ]
+    .iter()
+    .any(|d| workspace.join(d).is_dir());
+    if !has_real_subproject {
+        return false;
+    }
+
+    workspace.join("src/backend/server.mjs").is_file()
+        || workspace.join("src/frontend/index.html").is_file()
+        || workspace.join("src/frontend").is_dir()
+}
+
+fn preferred_frontend_dirs(workspace: &Path) -> Vec<std::path::PathBuf> {
+    const NAMES: &[&str] = &[
+        "jeecgboot-vue3",
+        "jeecg-boot/jeecgboot-vue3",
+        "jeecguniapp",
+        "pigx-ai-ui",
+        "pigx-visual/pigx-xxl-job-admin",
+        "frontend",
+        "web",
+        "ui",
+        "app",
+    ];
+    NAMES
+        .iter()
+        .map(|p| workspace.join(p))
+        .filter(|p| p.join("package.json").is_file())
+        .collect()
 }
 
 /// Resolve a bare program name to a spawnable path. Mirrors the host crate:
@@ -1451,6 +1513,31 @@ mod tests {
         .unwrap();
         let ds = detect_dev_server(tmp.path()).expect("generic dev project");
         assert_eq!(ds.label, "Node dev server");
+    }
+
+    #[test]
+    fn detect_prefers_real_frontend_subproject_over_root_harness() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/backend")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/frontend")).unwrap();
+        std::fs::write(tmp.path().join("src/backend/server.mjs"), "listen()").unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"local-acceptance-harness","scripts":{"dev":"node src/backend/server.mjs"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("jeecgboot-vue3")).unwrap();
+        std::fs::write(
+            tmp.path().join("jeecgboot-vue3/package.json"),
+            r#"{"name":"jeecgboot-vue3","scripts":{"dev":"vite"},"devDependencies":{"vite":"^5.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("jeecgboot-vue3/pnpm-lock.yaml"), "").unwrap();
+
+        let ds = detect_dev_server(tmp.path()).expect("real frontend subproject");
+        assert_eq!(ds.label, "Vite dev server");
+        assert_eq!(ds.command, "cd jeecgboot-vue3 && pnpm dev");
+        assert_eq!(ds.default_url, "http://localhost:5173");
     }
 
     #[test]

@@ -586,11 +586,9 @@ fn warn_md_cap_once(cap: usize) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "warn: knowledge index hit the {cap}-file cap (set \
-             UMADEV_KNOWLEDGE_MAX_FILES=0 to index everything, or a higher \
-             number). Files beyond the cap are NOT indexed — retrieval \
-             coverage is partial."
+        tracing::warn!(
+            cap,
+            "knowledge index hit the file cap; files beyond the cap are not indexed"
         );
     }
 }

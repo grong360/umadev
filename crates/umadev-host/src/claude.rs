@@ -329,16 +329,11 @@ impl Runtime for ClaudeCodeDriver {
         on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
     ) -> Result<CompletionResponse, RuntimeError> {
         let prompt = merge_prompt(&req);
-        // Streaming args: same base + stream-json + verbose instead of text.
-        let mut args = vec![
-            self.print_flag.clone(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-        ];
-        if std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() != Ok("1") {
-            args.push("--dangerously-skip-permissions".to_string());
-        }
+        // Streaming args: same session strategy as `complete()` (pinned
+        // `--session-id` on the first call, exact `--resume` later), but with the
+        // stream-json output format and `--verbose` for tool events.
+        let mut args = self.call_args_with_format("stream-json");
+        args.push("--verbose".to_string());
         // Honor the selected model (`/model` / RunOptions.model) — `claude
         // --model <alias|full-id>`. Without this the host silently runs its own
         // default and the user's model choice is ignored.
@@ -352,6 +347,10 @@ impl Runtime for ClaudeCodeDriver {
         // `govern_root_env`): the hook governs the run UmaDev drives, not the
         // user's own claude sessions.
         let govern_env = govern_root_env(&ws);
+        // From here on, a pinned auto-resume session is ESTABLISHED — later
+        // streaming/non-streaming calls resume it. Flip BEFORE the await so a
+        // concurrent next call resumes, matching `complete()`.
+        self.mark_session_started();
 
         // Accumulate the raw stream so a mid-stream failure can salvage whatever
         // the base already produced instead of cold-restarting a whole new run.
@@ -1426,6 +1425,90 @@ mod tests {
             .call_args_with_format("json")
             .windows(2)
             .any(|w| w == ["--resume", id.as_str()]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_complete_preserves_session_args_and_autoresume() {
+        // The streaming path must use the SAME session matrix as `complete()`:
+        // first call creates the pinned session, later calls resume it exactly.
+        // A hand-rolled stream-json arg vector used to drop these flags, making
+        // streaming turns cold-start and lose base context.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-claude-stream");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             {\n\
+             printf '%s\\n' '---CALL---'\n\
+             for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done\n\
+             } >> args.log\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let id = "11111111-2222-4333-8444-555555555555".to_string();
+        let mut d = ClaudeCodeDriver::with_program(script.to_str().unwrap())
+            .with_session_id(Some(id.clone()))
+            .with_continue_session(true)
+            .with_session_autoresume(true);
+        d.set_workspace(dir.path().to_path_buf());
+
+        let req = || CompletionRequest {
+            model: "claude-sonnet-4-6".into(),
+            system: None,
+            messages: vec![umadev_runtime::Message {
+                role: "user".into(),
+                content: "ping".into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+        };
+
+        let first = d.complete_streaming(req(), &|_| {}).await.unwrap();
+        let second = d.complete_streaming(req(), &|_| {}).await.unwrap();
+        assert_eq!(first.text, "ok");
+        assert_eq!(second.text, "ok");
+
+        let log = std::fs::read_to_string(dir.path().join("args.log")).unwrap();
+        let calls: Vec<&str> = log
+            .split("---CALL---\n")
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        assert_eq!(calls.len(), 2, "two streaming calls recorded: {log}");
+        for call in &calls {
+            assert!(
+                call.contains("--output-format\nstream-json"),
+                "streaming format flag must be present: {call}"
+            );
+            assert!(
+                call.contains("--verbose"),
+                "verbose stream-json tool events must stay enabled: {call}"
+            );
+        }
+        assert!(
+            calls[0].contains(&format!("--session-id\n{id}")),
+            "first streaming call must create the pinned session: {}",
+            calls[0]
+        );
+        assert!(
+            !calls[0].contains("--resume"),
+            "first streaming call must not resume before the pinned session exists: {}",
+            calls[0]
+        );
+        assert!(
+            calls[1].contains(&format!("--resume\n{id}")),
+            "second streaming call must resume the exact pinned session: {}",
+            calls[1]
+        );
+        assert!(
+            !calls[1].contains("--session-id"),
+            "second streaming call must not mint a fresh session: {}",
+            calls[1]
+        );
     }
 
     // The fake claude is a `#!/bin/sh` script, which Windows cannot exec; the

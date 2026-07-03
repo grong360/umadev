@@ -455,14 +455,22 @@ fn memory_layer(root: &Path, requirement: &str, seat: Option<&str>) -> String {
 /// [`JIT_KNOWLEDGE_CHUNKS`] short excerpts (identical budget). Fail-open: no
 /// `knowledge/` dir, a disabled KB, an unknown seat, or no match → empty string.
 fn knowledge_layer(root: &Path, requirement: &str, seat: Option<&str>) -> String {
+    // `record_feedback = false`: firmware composition runs on EVERY path (chat,
+    // quick-edit, explain, and the base build prompt). Retrieval-quality feedback
+    // is attributed at the BUILD-STEP directive sites (`director::summon_directive`
+    // / the post-build rework context), never here — so the light path drops no
+    // `.umadev/learned/_raw` snapshot into the user's working tree.
     match seat {
         Some(role) => crate::phases::seat_scoped_knowledge_digest(
             root,
             role,
             requirement,
             JIT_KNOWLEDGE_CHUNKS,
+            false,
         ),
-        None => crate::phases::agentic_knowledge_digest(root, requirement, JIT_KNOWLEDGE_CHUNKS),
+        None => {
+            crate::phases::agentic_knowledge_digest(root, requirement, JIT_KNOWLEDGE_CHUNKS, false)
+        }
     }
 }
 

@@ -233,14 +233,14 @@ pub fn read_workflow_state(project_root: &Path) -> Option<WorkflowState> {
         ReadState::Ok(s) => Some(s),
         ReadState::Missing => None,
         ReadState::Corrupt { path, error } => {
-            // Surface corruption in the log so a silent restart over a
-            // broken state isn't completely invisible. Best-effort: still
-            // returns None so fail-open callers behave as before.
-            eprintln!(
-                "warn: workflow-state.json at {} is corrupt ({error}); \
-                 treating as no run started. Run `umadev rollback latest` \
-                 or delete the file to recover.",
-                path.display()
+            // Surface corruption through tracing, not stderr: this can be read
+            // while the TUI owns the alternate screen, and direct stderr bytes
+            // corrupt the frame. Best-effort: still returns None so fail-open
+            // callers behave as before.
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "workflow-state.json is corrupt; treating as no run started"
             );
             None
         }

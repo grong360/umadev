@@ -542,14 +542,13 @@ fn filter_by_phase(
     // If phase-filtering wipes out everything, fall back to unfiltered top_k
     // so the prompt still gets context (better irrelevant than empty).
     if filtered.is_empty() && !raw.is_empty() {
-        // Surface that phase-filtering found nothing — previously this was
-        // completely silent, so a user whose `knowledge/` layout doesn't
-        // match the hardcoded phase_subdirs had no way to know filtering
-        // failed and they were getting unfiltered fallback results.
-        eprintln!(
-            "warn: knowledge phase-filter for `{phase:?}` matched 0 chunks (expected subdirs: {subdirs:?}); \
-             falling back to unfiltered top-{top_k}. If your knowledge/ layout uses different \
-             directory names, results may be less phase-relevant."
+        // Surface this through tracing, never stderr: retrieval can run while the
+        // TUI owns the alternate screen, and direct stderr bytes corrupt frames.
+        tracing::warn!(
+            ?phase,
+            ?subdirs,
+            top_k,
+            "knowledge phase-filter matched 0 chunks; falling back to unfiltered results"
         );
         raw.iter().take(top_k).copied().collect()
     } else {

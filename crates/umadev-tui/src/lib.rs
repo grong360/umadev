@@ -3520,12 +3520,30 @@ pub fn detect_base_model(backend_id: &str, project_root: &std::path::Path) -> Op
             })
         }
         // opencode: project/user opencode.json `model` (format provider/model).
-        "opencode" => json_top_string(&project_root.join("opencode.json"), "model").or_else(|| {
-            home.as_ref()
-                .and_then(|h| json_top_string(&h.join(".config/opencode/opencode.json"), "model"))
-        }),
+        "opencode" => opencode_config_paths(project_root, home.as_deref())
+            .into_iter()
+            .find_map(|p| json_value(&p).and_then(|v| opencode_model_from_config(&v))),
         _ => None,
     }
+}
+
+/// Read the active base's configured context window when the base config exposes
+/// an exact value. Today this is mainly OpenCode's provider model catalog
+/// (`provider.<id>.models.<model>.limit.context`). Fail-open: if the shape is
+/// absent or unfamiliar, callers fall back to the model-name estimate.
+#[must_use]
+pub fn detect_base_context_window(backend_id: &str, project_root: &std::path::Path) -> Option<u64> {
+    if backend_id != "opencode" {
+        return None;
+    }
+    let home = config::home_dir();
+    let paths = opencode_config_paths(project_root, home.as_deref());
+    let model = paths
+        .iter()
+        .find_map(|p| json_value(p).and_then(|v| opencode_model_from_config(&v)))?;
+    paths
+        .iter()
+        .find_map(|p| json_value(p).and_then(|v| opencode_context_for_model(&v, &model)))
 }
 
 /// Read the reasoning / thinking effort the BASE is configured with, so UmaDev
@@ -3562,9 +3580,206 @@ pub fn detect_base_reasoning(backend_id: &str, project_root: &std::path::Path) -
 
 /// Read a top-level string field from a JSON config file (fail-open `None`).
 fn json_top_string(path: &std::path::Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let v = json_value(path)?;
     v.get(key)?.as_str().map(str::to_string)
+}
+
+fn opencode_config_paths(
+    project_root: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![
+        project_root.join("opencode.json"),
+        project_root.join("opencode.jsonc"),
+        project_root.join(".opencode/opencode.json"),
+        project_root.join(".opencode/opencode.jsonc"),
+    ];
+    if let Some(home) = home {
+        paths.extend([
+            home.join(".config/opencode/opencode.json"),
+            home.join(".config/opencode/opencode.jsonc"),
+            home.join(".opencode/opencode.json"),
+            home.join(".opencode/opencode.jsonc"),
+        ]);
+    }
+    paths
+}
+
+fn json_value(path: &std::path::Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok().or_else(|| {
+        let stripped = strip_jsonc_comments(&text);
+        serde_json::from_str(&stripped)
+            .ok()
+            .or_else(|| serde_json::from_str(&remove_json_trailing_commas(&stripped)).ok())
+    })
+}
+
+fn opencode_model_from_config(v: &serde_json::Value) -> Option<String> {
+    if let Some(model) = v.get("model").and_then(serde_json::Value::as_str) {
+        let model = model.trim();
+        if !model.is_empty() {
+            return Some(model.to_string());
+        }
+    }
+    let model_id = v
+        .get("modelID")
+        .or_else(|| v.get("model_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let provider_id = v
+        .get("providerID")
+        .or_else(|| v.get("provider_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    Some(match provider_id {
+        Some(provider) => format!("{provider}/{model_id}"),
+        None => model_id.to_string(),
+    })
+}
+
+fn opencode_context_for_model(v: &serde_json::Value, model: &str) -> Option<u64> {
+    let (provider_id, model_id) = model
+        .split_once('/')
+        .map_or((None, model), |(provider, id)| (Some(provider), id));
+    let providers = v
+        .get("provider")
+        .or_else(|| v.get("providers"))?
+        .as_object()?;
+    if let Some(provider_id) = provider_id {
+        if let Some(limit) = providers
+            .get(provider_id)
+            .and_then(|provider| provider_model_context(provider, model_id))
+        {
+            return Some(limit);
+        }
+    }
+    providers
+        .values()
+        .find_map(|provider| provider_model_context(provider, model_id))
+}
+
+fn provider_model_context(provider: &serde_json::Value, model_id: &str) -> Option<u64> {
+    let models = provider.get("models")?.as_object()?;
+    models
+        .get(model_id)
+        .and_then(model_context_limit)
+        .or_else(|| {
+            models.iter().find_map(|(key, entry)| {
+                key.eq_ignore_ascii_case(model_id)
+                    .then(|| model_context_limit(entry))
+                    .flatten()
+            })
+        })
+}
+
+fn model_context_limit(entry: &serde_json::Value) -> Option<u64> {
+    entry
+        .pointer("/limit/context")
+        .and_then(json_u64)
+        .or_else(|| entry.pointer("/limits/context").and_then(json_u64))
+        .or_else(|| entry.get("context").and_then(json_u64))
+        .or_else(|| entry.get("context_window").and_then(json_u64))
+        .or_else(|| entry.get("contextWindow").and_then(json_u64))
+}
+
+fn json_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        v.as_str()
+            .map(|s| s.replace(['_', ','], ""))
+            .and_then(|s| s.parse::<u64>().ok())
+    })
+}
+
+fn strip_jsonc_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+        if c == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    let _ = chars.next();
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    let _ = chars.next();
+                    let mut prev = '\0';
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            out.push('\n');
+                        }
+                        if prev == '*' && next == '/' {
+                            break;
+                        }
+                        prev = next;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn remove_json_trailing_commas(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &c) in chars.iter().enumerate() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            out.push(c);
+            continue;
+        }
+        if c == ',' {
+            let next = chars[i + 1..].iter().find(|ch| !ch.is_whitespace());
+            if matches!(next, Some('}' | ']')) {
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Read a root string field from a TOML config file (fail-open `None`).
@@ -4357,6 +4572,15 @@ fn app_is_live(app: &App, continuous_active: bool) -> bool {
         || (app.run_started && !app.finished && !app.aborted)
 }
 
+/// Whether the 80ms animation tick should trigger an immediate draw. A tick is
+/// valuable while there is visible live work (spinner / elapsed counters /
+/// running task rows). In a settled chat, especially while the user is scrolled
+/// up through a large transcript, a tick-only redraw just repaints identical
+/// content and can look like flicker on terminals that require full-frame heals.
+fn tick_needs_draw(app: &App, continuous_active: bool) -> bool {
+    app_is_live(app, continuous_active) || app.has_active_run() || app.cancelling
+}
+
 /// Re-emit the terminal-mode setup escapes (idempotent) after a long input gap
 /// or a job-control resume (R5), healing a dead mouse / stale alt-screen after a
 /// laptop sleep, tmux re-attach, or ssh reconnect.
@@ -4769,6 +4993,119 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // Starts `false` (a cold launch is idle).
     let mut was_live = false;
 
+    // Apply one engine event plus the event-loop side effects that depend on the
+    // resulting app state. Kept as a local macro because it needs to await parked
+    // sessions and mutate several loop locals (`run_task`, `continuous_run_active`).
+    // Both the normal engine branch and the route-terminal pre-drain use this
+    // same path, so terminal route decisions cannot overtake already-emitted
+    // stream/plan events and leave stale output to appear under the next prompt.
+    macro_rules! apply_engine_event {
+        ($ev:expr) => {{
+            let was_finished = app.finished;
+            app.apply_engine($ev);
+            // Delivery build just completed (the banner with its preview URL
+            // line was pushed inside `apply_engine`): auto-start the dev
+            // server too so the user gets a live, clickable demo — not just a
+            // printed address. Mirrors the chat/Fast build's auto-preview,
+            // but does NOT re-push a card (the Delivery banner already
+            // covers the "✅ done + what changed" summary). Fail-open: a
+            // non-web project detects no dev server and starts nothing.
+            if !was_finished && app.finished {
+                if let Some((url, command)) = app.auto_preview_target() {
+                    start_preview_server(
+                        &app.preview_server,
+                        &sink,
+                        &url,
+                        &command,
+                        &app.project_root,
+                        false,
+                    );
+                }
+            }
+            // P1-F: a continuous run that has reached a TERMINAL state
+            // (delivery completed, or an honest abort / hard-stop carrying
+            // the `ABORT_SENTINEL`) must drop the `continuous_run_active`
+            // flag AND close + clear the parked director session — otherwise
+            // the next free-text `run` intent would reuse a dead/settled
+            // session holder and a stale "still continuous" flag (residual
+            // state). `apply_engine` already flipped `finished` / `aborted`;
+            // we react to that here, mirroring the cancel path's cleanup.
+            if continuous_run_active && (app.finished || app.aborted) {
+                if let Ok(mut g) = session_holder.try_lock() {
+                    if let Some(mut s) = g.take() {
+                        let _ = s.end().await;
+                    }
+                }
+                continuous_run_active = false;
+            }
+            // After processing the event, check if an auto-approve
+            // is pending (auto_approve_gates = true). If so, fire
+            // the Continue action immediately so the pipeline
+            // doesn't stall waiting for manual input.
+            if let Some(gate) = app.pending_auto_continue.take() {
+                app.active_gate = None;
+                let run_opts = current_run_options(app, &opts);
+                // A continuous run resumes the SAME parked session at the
+                // gate-anchored next phase; the single-shot path spawns a
+                // fresh `Block::Continue`.
+                run_task = Some(if continuous_run_active {
+                    let autonomous = continuous_autonomous(run_opts.mode);
+                    spawn_continuous_block(
+                        run_opts,
+                        sink.clone(),
+                        session_holder.clone(),
+                        continuous_resume_phase(gate),
+                        autonomous,
+                    )
+                } else {
+                    spawn_block(
+                        run_opts,
+                        app.brain_spec(),
+                        sink.clone(),
+                        Block::Continue(gate),
+                    )
+                });
+            }
+            // A message the user QUEUED mid-phase is ready to fire at
+            // this gap: re-run the producing block with it folded in as
+            // a revision (mirrors the Action::Revise path).
+            if let Some(text) = app.pending_steer.take() {
+                sink.emit(EngineEvent::Note(format!("queued steer: {text}")));
+                let gate = app.active_gate;
+                app.active_gate = None;
+                // P1-D: a continuous run must feed the steer back into the
+                // SAME held director session (re-driving the producing block
+                // on the continuous engine) — NOT spawn a single-shot block,
+                // which would orphan the held session (leaked, never
+                // `end()`-ed) and silently swap to the per-phase re-feed.
+                run_task = Some(if continuous_run_active {
+                    let mut run_opts = current_run_options(app, &opts);
+                    run_opts.requirement =
+                        format!("{}\n\n## Revision request\n{text}", app.requirement);
+                    let autonomous = continuous_autonomous(run_opts.mode);
+                    let start_after = continuous_revise_phase(gate.unwrap_or(Gate::DocsConfirm));
+                    spawn_continuous_block(
+                        run_opts,
+                        sink.clone(),
+                        session_holder.clone(),
+                        start_after,
+                        autonomous,
+                    )
+                } else {
+                    let mut run_opts = current_run_options(app, &opts);
+                    run_opts.requirement =
+                        format!("{}\n\n## Revision request\n{text}", app.requirement);
+                    let block = match gate {
+                        Some(Gate::PreviewConfirm) => Block::Continue(Gate::DocsConfirm),
+                        Some(Gate::ClarifyGate) => Block::Clarify,
+                        _ => Block::Initial,
+                    };
+                    spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
+                });
+            }
+        }};
+    }
+
     loop {
         // P2 — resolve the startup sync-output probe. The DECRPM verdict is
         // captured inside `input.next()` (the reply yields no input event, so
@@ -4912,6 +5249,18 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 // R3 — a turn-completion decision changes the transcript; mark it
                 // dirty (budget-gated — route decisions aren't bursty).
                 needs_redraw = true;
+                // Route terminal decisions and streamed/plan events are sent over
+                // separate channels. A terminal Done/Failed can therefore win this
+                // `select!` before the last already-emitted WorkerStream /
+                // PlanStepStatus events are applied. Drain those ready events first
+                // so a failed turn's tail cannot render under the next user prompt,
+                // and a completed build cannot show its done card before the live
+                // checklist reaches its settled status.
+                if maybe_route.is_some() {
+                    while let Ok(ev) = engine_rx.try_recv() {
+                        apply_engine_event!(ev);
+                    }
+                }
                 match maybe_route {
                     // The brain-driven turn finished cleanly: the body already
                     // streamed live, so we only record it as the assistant turn
@@ -4940,11 +5289,14 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         maybe_spawn_auto_compaction(app, &compaction_tx);
                     }
                     // The turn produced no usable reply (base init / stream error).
-                    // `record_route_failed` clears `thinking`; then fire the next
-                    // parked message so a failed turn doesn't strand the messages
-                    // typed behind it.
+                    // `record_route_failed` clears `thinking`; then drop exact
+                    // duplicate queued retries of the failed text before firing the
+                    // next distinct parked message. This keeps an accidental double
+                    // Enter from auto-replaying the same broken route while still
+                    // preserving real follow-up turns typed behind it.
                     Some(RouteDecision::Failed(note)) => {
                         app.record_route_failed(note);
+                        app.drop_failed_route_duplicate_queued_chat();
                         run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &sink, &route_tx);
                     }
                     None => {}
@@ -4976,109 +5328,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 // intervening redraws are coalesced.
                 let mut current = maybe_event;
                 while let Some(ev) = current.take() {
-                    let was_finished = app.finished;
-                    app.apply_engine(ev);
-                    // Delivery build just completed (the banner with its preview URL
-                    // line was pushed inside `apply_engine`): auto-start the dev
-                    // server too so the user gets a live, clickable demo — not just a
-                    // printed address. Mirrors the chat/Fast build's auto-preview,
-                    // but does NOT re-push a card (the Delivery banner already
-                    // covers the "✅ done + what changed" summary). Fail-open: a
-                    // non-web project detects no dev server and starts nothing.
-                    if !was_finished && app.finished {
-                        if let Some((url, command)) = app.auto_preview_target() {
-                            start_preview_server(
-                                &app.preview_server,
-                                &sink,
-                                &url,
-                                &command,
-                                &app.project_root,
-                                false,
-                            );
-                        }
-                    }
-                    // P1-F: a continuous run that has reached a TERMINAL state
-                    // (delivery completed, or an honest abort / hard-stop carrying
-                    // the `ABORT_SENTINEL`) must drop the `continuous_run_active`
-                    // flag AND close + clear the parked director session — otherwise
-                    // the next free-text `run` intent would reuse a dead/settled
-                    // session holder and a stale "still continuous" flag (residual
-                    // state). `apply_engine` already flipped `finished` / `aborted`;
-                    // we react to that here, mirroring the cancel path's cleanup.
-                    if continuous_run_active && (app.finished || app.aborted) {
-                        if let Ok(mut g) = session_holder.try_lock() {
-                            if let Some(mut s) = g.take() {
-                                let _ = s.end().await;
-                            }
-                        }
-                        continuous_run_active = false;
-                    }
-                    // After processing the event, check if an auto-approve
-                    // is pending (auto_approve_gates = true). If so, fire
-                    // the Continue action immediately so the pipeline
-                    // doesn't stall waiting for manual input.
-                    if let Some(gate) = app.pending_auto_continue.take() {
-                        app.active_gate = None;
-                        let run_opts = current_run_options(app, &opts);
-                        // A continuous run resumes the SAME parked session at the
-                        // gate-anchored next phase; the single-shot path spawns a
-                        // fresh `Block::Continue`.
-                        run_task = Some(if continuous_run_active {
-                            let autonomous = continuous_autonomous(run_opts.mode);
-                            spawn_continuous_block(
-                                run_opts,
-                                sink.clone(),
-                                session_holder.clone(),
-                                continuous_resume_phase(gate),
-                                autonomous,
-                            )
-                        } else {
-                            spawn_block(
-                                run_opts,
-                                app.brain_spec(),
-                                sink.clone(),
-                                Block::Continue(gate),
-                            )
-                        });
-                    }
-                    // A message the user QUEUED mid-phase is ready to fire at
-                    // this gap: re-run the producing block with it folded in as
-                    // a revision (mirrors the Action::Revise path).
-                    if let Some(text) = app.pending_steer.take() {
-                        sink.emit(EngineEvent::Note(format!("queued steer: {text}")));
-                        let gate = app.active_gate;
-                        app.active_gate = None;
-                        // P1-D: a continuous run must feed the steer back into the
-                        // SAME held director session (re-driving the producing block
-                        // on the continuous engine) — NOT spawn a single-shot block,
-                        // which would orphan the held session (leaked, never
-                        // `end()`-ed) and silently swap to the per-phase re-feed.
-                        run_task = Some(if continuous_run_active {
-                            let mut run_opts = current_run_options(app, &opts);
-                            run_opts.requirement =
-                                format!("{}\n\n## Revision request\n{text}", app.requirement);
-                            let autonomous = continuous_autonomous(run_opts.mode);
-                            let start_after =
-                                continuous_revise_phase(gate.unwrap_or(Gate::DocsConfirm));
-                            spawn_continuous_block(
-                                run_opts,
-                                sink.clone(),
-                                session_holder.clone(),
-                                start_after,
-                                autonomous,
-                            )
-                        } else {
-                            let mut run_opts = current_run_options(app, &opts);
-                            run_opts.requirement =
-                                format!("{}\n\n## Revision request\n{text}", app.requirement);
-                            let block = match gate {
-                                Some(Gate::PreviewConfirm) => Block::Continue(Gate::DocsConfirm),
-                                Some(Gate::ClarifyGate) => Block::Clarify,
-                                _ => Block::Initial,
-                            };
-                            spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
-                        });
-                    }
+                    apply_engine_event!(ev);
                     // R3 — pull the next already-queued engine event (if any) and
                     // apply it in this same pass; `None` ends the drain.
                     current = engine_rx.try_recv().ok();
@@ -5990,10 +6240,17 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 app.cancel_run();
             }
             _ = tick.tick() => {
-                // R3 — the 80ms animation tick advances the spinner / shimmer /
-                // elapsed clock, so draw this frame immediately (this also keeps
-                // the idle redraw cadence identical to before the budget gate).
-                draw_now = true;
+                // R3 — the 80ms animation tick advances spinners / elapsed clocks
+                // only while something visible is live. In a settled transcript,
+                // especially when the user has scrolled into a large scrollback,
+                // forcing a redraw every tick repaints identical content and can
+                // read as constant refresh/flicker on Windows Terminal. Keep the
+                // hot cadence for live work; stay quiet while idle.
+                let animate_live = tick_needs_draw(app, continuous_run_active);
+                if animate_live {
+                    draw_now = true;
+                    app.tick();
+                }
                 // Flush any leaked-mouse-seq candidate that never completed — a
                 // lone `Esc` (or a partial `Esc [`) the user pressed and then
                 // paused on. Applying it now means a real Esc still arms the
@@ -6033,7 +6290,6 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         }
                     }
                 }
-                app.tick();
             }
             // R5 — job-control resume (Unix SIGCONT: `Ctrl-Z` then `fg`, or
             // `kill -CONT`). The process was just continued after a suspend —
@@ -7056,6 +7312,57 @@ mod tests {
         }
         // Unknown / offline base pins nothing -> base default (None).
         assert_eq!(detect_base_model("offline", root), None);
+    }
+
+    #[test]
+    fn detect_opencode_context_window_reads_provider_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("opencode.jsonc"),
+            r#"
+            {
+              // OpenCode can carry the exact context window in provider metadata.
+              "model": "provider-auth-big/glm-5",
+              "provider": {
+                "provider-auth-big": {
+                  "models": {
+                    "glm-5": {
+                      "name": "GLM-5",
+                      "limit": {
+                        "context": 200000,
+                      },
+                    },
+                  },
+                },
+              },
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_base_model("opencode", root).as_deref(),
+            Some("provider-auth-big/glm-5")
+        );
+        assert_eq!(detect_base_context_window("opencode", root), Some(200_000));
+    }
+
+    #[test]
+    fn detect_opencode_model_reads_legacy_dot_opencode_project_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".opencode")).unwrap();
+        std::fs::write(
+            root.join(".opencode/opencode.json"),
+            r#"{"model":"my-provider/custom-model"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_base_model("opencode", root).as_deref(),
+            Some("my-provider/custom-model")
+        );
     }
 
     #[test]
@@ -10365,6 +10672,29 @@ mod tests {
         assert!(
             !app.take_terminal_contaminated(),
             "contamination drains once"
+        );
+    }
+
+    #[test]
+    fn idle_animation_tick_does_not_force_a_redraw() {
+        let (mut app, _tmp) = build_test_app();
+
+        assert!(
+            !tick_needs_draw(&app, false),
+            "a settled chat should not repaint every 80ms tick while the user reads scrollback"
+        );
+
+        app.thinking = true;
+        assert!(
+            tick_needs_draw(&app, false),
+            "a live thinking spinner still needs tick-driven redraws"
+        );
+        app.thinking = false;
+
+        app.register_run_task("long build");
+        assert!(
+            tick_needs_draw(&app, false),
+            "a running background task keeps elapsed/status animation fresh"
         );
     }
 

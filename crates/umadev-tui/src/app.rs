@@ -196,15 +196,9 @@ impl PickerStep {
 /// fails with a "prompt too long" (the reactive `BaseFailure::Context` remedy).
 pub(crate) const CONTEXT_NUDGE_PCT: u16 = 80;
 
-/// A **conservative** estimate of the active base/model's default context budget,
-/// used purely as the DENOMINATOR of the context-usage gauge — UmaDev owns no
-/// model, so this is never a hard limit it enforces (the base owns the real
-/// window). It reflects the base CLI's *practical default* budget, NOT a model's
-/// theoretical maximum: current Claude models can reach ~1M with the long-context
-/// beta, but `claude-code` defaults to ~200k (the point where `/compact` becomes
-/// due, and the size `base_error` classifies "prompt too long" against), so a
-/// conservative 200k errs toward nudging early — a safe direction, since running
-/// `/compact` is always fine, while under-estimating would let the base overflow.
+/// Estimate of the active base/model's context budget, used purely as the
+/// DENOMINATOR of the context-usage gauge — UmaDev owns no model, so this is
+/// never a hard limit it enforces (the base owns the real window).
 ///
 /// Matched by lowercased substring so a version suffix or a `provider/model`
 /// prefix (opencode's `anthropic/claude-opus-4-8`) still resolves. `None` when
@@ -215,10 +209,19 @@ pub(crate) fn context_window_estimate(backend_id: &str, model: &str) -> Option<u
     let m = model.to_ascii_lowercase();
     // Model-id substring match wins (most specific). Ordered so a `gpt-5` hit
     // beats the generic `gpt-4` bucket.
+    if m.contains("gemini-1.5") || m.contains("gemini-2") || m.contains("gemini-3") {
+        return Some(1_000_000);
+    }
+    if m.contains("glm-4.5") || m.contains("glm-5") {
+        return Some(128_000);
+    }
+    if m.contains("claude-sonnet-4.5") || m.contains("claude-opus-4.1") {
+        return Some(1_000_000);
+    }
     if m.contains("claude") {
         return Some(200_000);
     }
-    if m.contains("gpt-5") {
+    if m.contains("gpt-5.5") || m.contains("gpt-5.1") || m.contains("gpt-5") {
         return Some(400_000);
     }
     if m.contains("o4-mini") || m.contains("o3") || m.contains("gpt-4") {
@@ -2216,6 +2219,10 @@ pub struct App {
     pub backend: Option<String>,
     /// Display label for the worker — `claude-code` / `codex` / `offline`.
     pub backend_label: String,
+    /// The active base's configured model, read once from the base's own config.
+    pub(crate) base_model: Option<String>,
+    /// Exact context window read from the base config when available.
+    pub(crate) base_context_window: Option<u64>,
 
     /// Workspace slug (filled in by the caller).
     pub slug: String,
@@ -2654,6 +2661,12 @@ impl App {
             .collect();
         let backend = config.backend.clone().filter(|b| b != "offline");
         let backend_label = backend.clone().unwrap_or_else(|| "offline".to_string());
+        let base_model = backend
+            .as_deref()
+            .and_then(|b| crate::detect_base_model(b, &project_root));
+        let base_context_window = backend
+            .as_deref()
+            .and_then(|b| crate::detect_base_context_window(b, &project_root));
         let lang = config.resolved_lang();
         umadev_i18n::set_lang(lang);
         // Publish the saved process-log preference (`/logs`) into the base drivers'
@@ -2733,6 +2746,8 @@ impl App {
             director_run_in_flight: false,
             backend,
             backend_label,
+            base_model,
+            base_context_window,
             slug: slug.into(),
             requirement: String::new(),
             phases,
@@ -3801,14 +3816,12 @@ impl App {
     }
 
     /// Scroll the transcript UP by `rows` (toward older history). Any non-zero
-    /// scroll makes the renderer STOP auto-sticking to the bottom. A real offset
-    /// change requests a full repaint (see [`Self::scroll_jump_repaint`]).
+    /// scroll makes the renderer STOP auto-sticking to the bottom.
     pub fn transcript_scroll_up(&mut self, rows: usize) {
         let max = self.transcript_max_scroll.get();
         let before = self.transcript_scroll.get();
         self.transcript_scroll
             .set(before.saturating_add(rows).min(max));
-        self.scroll_jump_repaint(before);
     }
 
     /// Scroll the transcript DOWN by `rows` (toward the newest content). Hitting
@@ -3816,34 +3829,16 @@ impl App {
     pub fn transcript_scroll_down(&mut self, rows: usize) {
         let before = self.transcript_scroll.get();
         self.transcript_scroll.set(before.saturating_sub(rows));
-        self.scroll_jump_repaint(before);
     }
 
     /// Jump to the very top of the transcript (oldest content on screen).
     pub fn transcript_scroll_to_top(&mut self) {
-        let before = self.transcript_scroll.get();
         self.transcript_scroll.set(self.transcript_max_scroll.get());
-        self.scroll_jump_repaint(before);
     }
 
     /// Jump back to the bottom (newest content) and re-enable auto-stick.
     pub fn transcript_scroll_to_bottom(&mut self) {
-        let before = self.transcript_scroll.get();
         self.transcript_scroll.set(0);
-        self.scroll_jump_repaint(before);
-    }
-
-    /// Request a full clear + repaint when a scroll actually moved the viewport
-    /// (`before` differs from the new offset). A scroll jump replaces the whole
-    /// visible window at once; on a diff-only console the outgoing rows can survive
-    /// as stale overlap, so a clean repaint scrubs them. No-op on a boundary scroll
-    /// that changed nothing (already pinned / already at the top), and the loop
-    /// coalesces repeated requests into ONE clear per drawn frame, so a fast wheel
-    /// spin never repaints more than once per frame.
-    fn scroll_jump_repaint(&self, before: usize) {
-        if self.transcript_scroll.get() != before {
-            self.request_transcript_repaint();
-        }
     }
 
     /// Scroll the help overlay DOWN by `rows`, clamped to the renderer-published
@@ -7744,9 +7739,11 @@ impl App {
         // A brain-driven turn is still in flight (`thinking`). Firing a second one
         // now would drive the SAME base `session_id` in two subprocesses at once →
         // interleaved / out-of-order replies and a scrambled memory. Park this
-        // turn instead; the event loop fires it the moment the current turn lands
-        // (a clean / failed terminal outcome both drain the queue). (A gate is
-        // never open while `thinking`, so this check sits ahead of gate handling.)
+        // turn instead; the event loop fires it the moment the current turn lands.
+        // A failed terminal outcome first drops exact duplicate retries of the
+        // failed turn, so a double-Enter cannot auto-replay the same broken route.
+        // (A gate is never open while `thinking`, so this check sits ahead of gate
+        // handling.)
         if self.thinking {
             // Park it WITHOUT recording into conversation memory yet. Recording at
             // submit time left a dangling "user said X" with no assistant reply in
@@ -8119,6 +8116,42 @@ impl App {
         Some(text)
     }
 
+    /// After a route failure, drop leading queued chat turns that are exact
+    /// duplicates of the user turn that just failed. This catches a common TUI
+    /// race/user gesture: pressing Enter twice (or re-sending the same text while
+    /// the first turn is still "thinking") used to make the failed turn auto-fire
+    /// again as soon as the failure note landed, reading as "it skipped thinking
+    /// and dumped old output". Different queued turns still drain normally.
+    pub(crate) fn drop_failed_route_duplicate_queued_chat(&mut self) -> usize {
+        let Some(failed_turn) = self
+            .conversation
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            return 0;
+        };
+        let mut dropped = 0usize;
+        while self
+            .queued_chat
+            .front()
+            .is_some_and(|text| text.trim() == failed_turn)
+        {
+            self.queued_chat.pop_front();
+            dropped += 1;
+        }
+        if dropped > 0 {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.queued_duplicate_skipped").to_string(),
+            );
+            self.refresh_status();
+        }
+        dropped
+    }
+
     /// I6 — pull the MOST RECENT chat turn parked behind the in-flight one
     /// ([`queued_chat`]) back into the input box for editing, popping it from the
     /// queue. Lets the user fix (or drop) a queued message before it sends,
@@ -8219,10 +8252,17 @@ impl App {
     #[must_use]
     pub(crate) fn context_window_tokens(&self) -> Option<u64> {
         // UmaDev owns no model and never pins one — the base runs its own. So the
-        // gauge denominator is the active BASE's conservative default window
-        // (`context_window_estimate` resolves that from the backend id when the
-        // model is unknown, which it always is here). Pure read, no per-frame IO.
-        context_window_estimate(self.backend.as_deref().unwrap_or(""), "")
+        // gauge denominator uses the exact base-configured window when present,
+        // then the detected model-name estimate, then the active backend's
+        // conservative default when the base runs on its login default. Pure read,
+        // no per-frame IO.
+        if let Some(total) = self.base_context_window {
+            return Some(total);
+        }
+        context_window_estimate(
+            self.backend.as_deref().unwrap_or(""),
+            self.base_model.as_deref().unwrap_or(""),
+        )
     }
 
     /// Current context occupancy as a whole percent (`used / window`), or `None`
@@ -10433,19 +10473,27 @@ impl App {
         // Build the directive the director sees, and the user-facing confirmation.
         let (directive, confirm) = match sub {
             "skip" => (
-                format!("Plan steering: SKIP step `{target}` — do not perform it; proceed with the rest of the plan."),
+                format!(
+                    "Plan steering: SKIP step `{target}` — do not perform it; proceed with the rest of the plan."
+                ),
                 umadev_i18n::tf(self.lang, "plan.steer.skip", &[target]),
             ),
             "veto" => (
-                format!("Plan steering: VETO step `{target}` — remove it from the plan entirely and do not perform it."),
+                format!(
+                    "Plan steering: VETO step `{target}` — remove it from the plan entirely and do not perform it."
+                ),
                 umadev_i18n::tf(self.lang, "plan.steer.veto", &[target]),
             ),
             "up" => (
-                format!("Plan steering: REORDER step `{target}` EARLIER — do it before its current predecessors where dependencies allow."),
+                format!(
+                    "Plan steering: REORDER step `{target}` EARLIER — do it before its current predecessors where dependencies allow."
+                ),
                 umadev_i18n::tf(self.lang, "plan.steer.move", &[target, "↑"]),
             ),
             "down" => (
-                format!("Plan steering: REORDER step `{target}` LATER — defer it after its current successors where dependencies allow."),
+                format!(
+                    "Plan steering: REORDER step `{target}` LATER — defer it after its current successors where dependencies allow."
+                ),
                 umadev_i18n::tf(self.lang, "plan.steer.move", &[target, "↓"]),
             ),
             // `add`
@@ -11232,6 +11280,14 @@ impl App {
     fn commit_backend(&mut self, backend: Option<String>) {
         self.backend.clone_from(&backend);
         self.backend_label = backend.clone().unwrap_or_else(|| "offline".to_string());
+        self.base_model = backend
+            .as_deref()
+            .filter(|b| !b.is_empty() && *b != "offline")
+            .and_then(|b| crate::detect_base_model(b, &self.project_root));
+        self.base_context_window = backend
+            .as_deref()
+            .filter(|b| !b.is_empty() && *b != "offline")
+            .and_then(|b| crate::detect_base_context_window(b, &self.project_root));
         self.config.backend = Some(self.backend_label.clone());
         // A different base means a different session — don't resume the old
         // base's conversation into the new one.
@@ -11257,7 +11313,7 @@ impl App {
             .clone()
             .filter(|b| !b.is_empty() && b != "offline")
         {
-            match crate::detect_base_model(&b, &self.project_root) {
+            match self.base_model.clone() {
                 Some(m) => self.push(
                     ChatRole::System,
                     umadev_i18n::tf(self.lang, "model.synced", &[&m, &self.backend_label]),
@@ -11303,6 +11359,47 @@ impl App {
         parse_notes_section(&body, "Run command").map(str::to_string)
     }
 
+    fn notes_preview_is_acceptance_harness(&self) -> bool {
+        let Some(cmd) = self.run_command_from_notes() else {
+            return false;
+        };
+        let cmd = cmd.to_ascii_lowercase().replace('\\', "/");
+        let looks_like_harness =
+            cmd.contains("src/backend/server.mjs") || cmd.contains("src/frontend");
+        if !looks_like_harness {
+            return false;
+        }
+        [
+            "jeecgboot-vue3",
+            "jeecg-boot",
+            "jeecguniapp",
+            "pigx-ai-ui",
+            "pigx-visual",
+            "frontend",
+            "web",
+            "ui",
+            "app",
+        ]
+        .iter()
+        .any(|d| self.project_root.join(d).is_dir())
+    }
+
+    fn preview_url_from_notes_for_product(&self) -> Option<String> {
+        if self.notes_preview_is_acceptance_harness() {
+            None
+        } else {
+            self.preview_url_from_notes()
+        }
+    }
+
+    fn run_command_from_notes_for_product(&self) -> Option<String> {
+        if self.notes_preview_is_acceptance_harness() {
+            None
+        } else {
+            self.run_command_from_notes()
+        }
+    }
+
     /// `/preview` — read the Preview URL the worker recorded, start the dev
     /// server in the background, open the browser, and tell the user. Falls
     /// back to a clear hint when no notes / no URL yet.
@@ -11328,9 +11425,9 @@ impl App {
         // worker-recorded URL when no manifest-based detection matches.
         let detected = umadev_agent::verify::detect_dev_server(&self.project_root);
         let url = self.effective_preview_url();
-        let command = match (&detected, self.run_command_from_notes()) {
+        let command = match (&detected, self.run_command_from_notes_for_product()) {
             // Self-detection wins — we control the command + know the URL.
-            (Some(ds), _) => Some(ds.command.to_string()),
+            (Some(ds), _) => Some(ds.command.clone()),
             // Worker recorded a run command — use it.
             (None, Some(cmd)) => Some(cmd),
             (None, None) => None,
@@ -11384,7 +11481,7 @@ impl App {
     /// (it reflects the real port), fall back to the dev-server default
     /// (e.g. 5173 for Vite) when the worker did not record one.
     fn effective_preview_url(&self) -> Option<String> {
-        if let Some(u) = self.preview_url_from_notes() {
+        if let Some(u) = self.preview_url_from_notes_for_product() {
             return Some(u);
         }
         umadev_agent::verify::detect_dev_server(&self.project_root)
@@ -11473,9 +11570,8 @@ impl App {
         }
 
         // Run command — worker-recorded, else self-detected dev server.
-        let run_cmd = self.run_command_from_notes().or_else(|| {
-            umadev_agent::verify::detect_dev_server(&self.project_root)
-                .map(|ds| ds.command.to_string())
+        let run_cmd = self.run_command_from_notes_for_product().or_else(|| {
+            umadev_agent::verify::detect_dev_server(&self.project_root).map(|ds| ds.command.clone())
         });
         if let Some(cmd) = run_cmd {
             lines.push(umadev_i18n::tf(lang, "build.complete.run", &[&cmd]));
@@ -11497,9 +11593,9 @@ impl App {
     pub(crate) fn auto_preview_target(&self) -> Option<(String, String)> {
         let ds = umadev_agent::verify::detect_dev_server(&self.project_root)?;
         let url = self
-            .preview_url_from_notes()
+            .preview_url_from_notes_for_product()
             .unwrap_or_else(|| ds.default_url.to_string());
-        Some((url, ds.command.to_string()))
+        Some((url, ds.command.clone()))
     }
 
     /// Push the build-complete card into the transcript and return the
@@ -12234,7 +12330,7 @@ impl App {
     /// Called by `apply_engine` when the preview gate opens: surface the
     /// recorded URL so the user knows where to look.
     pub fn maybe_announce_preview(&mut self) {
-        if let Some(url) = self.preview_url_from_notes() {
+        if let Some(url) = self.effective_preview_url() {
             self.push(
                 ChatRole::UmaDev,
                 umadev_i18n::tf(self.lang, "preview.gate_announce", &[&url]),
@@ -13223,7 +13319,22 @@ fn new_chat_session_id() -> String {
     u[8] = (u[8] & 0x3F) | 0x80; // RFC-4122 variant
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]
+        u[0],
+        u[1],
+        u[2],
+        u[3],
+        u[4],
+        u[5],
+        u[6],
+        u[7],
+        u[8],
+        u[9],
+        u[10],
+        u[11],
+        u[12],
+        u[13],
+        u[14],
+        u[15]
     )
 }
 
@@ -13306,7 +13417,7 @@ fn run_bang_command(root: &std::path::Path, cmd: &str, lang: umadev_i18n::Lang) 
             return (
                 false,
                 umadev_i18n::tf(lang, "tui.bang.spawn_failed", &[&e.to_string()]),
-            )
+            );
         }
     };
 
@@ -14096,10 +14207,11 @@ mod tests {
 
     #[test]
     fn context_window_table_returns_sane_denominators() {
-        // Claude family (incl. opencode's `provider/model` form) → the 200k floor.
+        // Claude family (incl. opencode's `provider/model` form) follows the
+        // detected model window; older/unknown Claude variants keep the 200k floor.
         assert_eq!(
-            context_window_estimate("claude-code", "claude-opus-4-8"),
-            Some(200_000)
+            context_window_estimate("claude-code", "claude-sonnet-4.5"),
+            Some(1_000_000)
         );
         assert_eq!(
             context_window_estimate("opencode", "anthropic/claude-sonnet-4-6"),
@@ -14107,8 +14219,12 @@ mod tests {
         );
         // GPT-5 family → 400k; older o-series / gpt-4 → 128k.
         assert_eq!(
-            context_window_estimate("codex", "gpt-5.1-codex"),
+            context_window_estimate("codex", "gpt-5.5-codex"),
             Some(400_000)
+        );
+        assert_eq!(
+            context_window_estimate("opencode", "zhipuai/glm-5"),
+            Some(128_000)
         );
         assert_eq!(context_window_estimate("codex", "o4-mini"), Some(128_000));
         // Unset model → the per-backend default budget.
@@ -14141,6 +14257,63 @@ mod tests {
         assert_eq!(app.context_used_tokens(), Some(50_000));
         assert_eq!(app.context_window_tokens(), Some(200_000));
         assert_eq!(app.context_usage_pct(), Some(25));
+    }
+
+    #[test]
+    fn context_gauge_uses_detected_base_model_window() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/config.toml"),
+            "model = \"gpt-5.5\"\n",
+        )
+        .unwrap();
+        let mut app = App::new(
+            "demo".to_string(),
+            UserConfig {
+                backend: Some("codex".into()),
+                ..Default::default()
+            },
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        app.last_turn_input_tokens = 100_000;
+        assert_eq!(app.base_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(app.context_window_tokens(), Some(400_000));
+        assert_eq!(app.context_usage_pct(), Some(25));
+    }
+
+    #[test]
+    fn context_gauge_prefers_exact_opencode_provider_window() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("opencode.json"),
+            r#"{
+              "model": "provider-auth-big/glm-5",
+              "provider": {
+                "provider-auth-big": {
+                  "models": {
+                    "glm-5": { "limit": { "context": 200000 } }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let mut app = App::new(
+            "demo".to_string(),
+            UserConfig {
+                backend: Some("opencode".into()),
+                ..Default::default()
+            },
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        app.last_turn_input_tokens = 100_000;
+        assert_eq!(app.base_model.as_deref(), Some("provider-auth-big/glm-5"));
+        assert_eq!(app.base_context_window, Some(200_000));
+        assert_eq!(app.context_window_tokens(), Some(200_000));
+        assert_eq!(app.context_usage_pct(), Some(50));
     }
 
     #[test]
@@ -15890,6 +16063,47 @@ mod tests {
                 assert_eq!(command, "cd web && npm run dev");
             }
             other => panic!("expected StartPreview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_preview_ignores_harness_notes_when_real_frontend_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let slug = "demo";
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/backend")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/frontend")).unwrap();
+        std::fs::write(tmp.path().join("src/backend/server.mjs"), "listen()").unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("output")
+                .join(format!("{slug}-frontend-notes.md")),
+            "## Preview URL\n\nhttp://127.0.0.1:4173\n\n## Run command\n\nnode src/backend/server.mjs\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("jeecgboot-vue3")).unwrap();
+        std::fs::write(
+            tmp.path().join("jeecgboot-vue3/package.json"),
+            r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^5.0.0"}}"#,
+        )
+        .unwrap();
+
+        let mut app = App::new(
+            slug.to_string(),
+            UserConfig {
+                backend: Some("offline".into()),
+                ..Default::default()
+            },
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        let action = app.slash_preview();
+        match action {
+            Action::StartPreview { url, command } => {
+                assert_eq!(url, "http://localhost:5173");
+                assert_eq!(command, "cd jeecgboot-vue3 && npm run dev");
+            }
+            other => panic!("expected real frontend StartPreview, got {other:?}"),
         }
     }
 
@@ -17968,7 +18182,7 @@ mod tests {
     // leave stale/overlapping rows over a long streaming run. ----------------
 
     #[test]
-    fn scroll_jump_requests_a_transcript_repaint() {
+    fn scroll_jump_does_not_force_full_repaint() {
         let mut a = fresh_app(Some("offline"));
         // The renderer publishes the scroll bound; pin one so a scroll actually
         // moves the offset.
@@ -17977,24 +18191,22 @@ mod tests {
             !a.take_transcript_repaint(),
             "no transcript repaint pending before any scroll"
         );
-        // A real scroll UP (0 → 10) replaces the visible window → repaint.
+        // A real scroll UP (0 → 10) replaces the visible window, but it must not
+        // clear the whole terminal on every wheel/PageUp step; that visibly
+        // flickers on Windows. Structural reflow still repaints via the renderer.
         a.transcript_scroll_up(10);
         assert_eq!(a.transcript_scroll(), 10);
         assert!(
-            a.take_transcript_repaint(),
-            "a scroll jump that moved the viewport must force a full repaint"
-        );
-        // Drains in one shot.
-        assert!(
             !a.take_transcript_repaint(),
-            "the transcript repaint request drains once"
+            "scrolling history must not force a full clear/repaint"
         );
-        // Scrolling back to the bottom (10 → 0) also moves the window → repaint.
+        // Scrolling back to the bottom also moves the window, but stays
+        // incremental for the same reason.
         a.transcript_scroll_to_bottom();
         assert_eq!(a.transcript_scroll(), 0);
         assert!(
-            a.take_transcript_repaint(),
-            "jumping back to the bottom also forces a repaint"
+            !a.take_transcript_repaint(),
+            "jumping back to bottom must not force a full clear/repaint"
         );
     }
 
@@ -22853,6 +23065,47 @@ mod tests {
         assert_eq!(a.queued_chat.len(), 2);
         assert_eq!(a.take_next_queued_chat().as_deref(), Some("second message"));
         assert_eq!(a.take_next_queued_chat().as_deref(), Some("third message"));
+    }
+
+    #[test]
+    fn failed_route_skips_identical_queued_retry_but_keeps_distinct_followup() {
+        let mut a = fresh_app(Some("offline"));
+        // First turn routes and records the user turn in base-facing memory.
+        let first = a.submit_text("same question".to_string());
+        assert!(matches!(first, Action::Route(_)));
+        assert!(a.thinking);
+        // A duplicate Enter/re-send while thinking is parked, plus a real follow-up.
+        let _ = a.submit_text("same question".to_string());
+        let _ = a.submit_text("different follow-up".to_string());
+        assert_eq!(a.queued_chat.len(), 2);
+
+        a.record_route_failed("route failed".into());
+        let dropped = a.drop_failed_route_duplicate_queued_chat();
+
+        assert_eq!(dropped, 1, "only the exact duplicate retry is skipped");
+        assert_eq!(
+            a.queued_chat.front().map(String::as_str),
+            Some("different follow-up"),
+            "a distinct queued turn remains ready to drain"
+        );
+        assert!(
+            a.history
+                .iter()
+                .any(|m| m.body().contains("完全相同") || m.body().contains("identical")),
+            "the transcript explains why the duplicate was skipped"
+        );
+        assert_eq!(
+            a.conversation
+                .iter()
+                .filter(|m| m.role == "user" && m.content == "same question")
+                .count(),
+            1,
+            "the skipped duplicate was never recorded into base memory"
+        );
+        assert_eq!(
+            a.take_next_queued_chat().as_deref(),
+            Some("different follow-up")
+        );
     }
 
     // ---- I6: editable queued-input recall ------------------------------------

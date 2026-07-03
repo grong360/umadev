@@ -163,11 +163,20 @@ pub fn phase_knowledge_digest_with_retrieval(
 /// **Fail-open**: no `knowledge/` dir, retrieval disabled, an empty index, or no
 /// match all return an empty string — the caller then injects nothing and the
 /// turn proceeds exactly as before. Never errors.
+///
+/// `record_feedback` gates the retrieval-quality snapshot: it is written ONLY
+/// when this digest is composed for a BUILD STEP whose PASS/FAIL will later be
+/// consumed by [`crate::self_evolve`] (the seat-step / rework directives). The
+/// LIGHT path ([`crate::context::compose_firmware`]) passes `false`: a chat /
+/// quick-edit turn has no step outcome to attribute, so it must NOT drop a
+/// `.umadev/learned/_raw` artifact into the user's tree (which would also read
+/// as a spurious working-tree change on that turn).
 #[must_use]
 pub fn agentic_knowledge_digest(
     project_root: &Path,
     requirement: &str,
     max_chunks: usize,
+    record_feedback: bool,
 ) -> String {
     if requirement.trim().is_empty() || max_chunks == 0 {
         return String::new();
@@ -202,12 +211,16 @@ pub fn agentic_knowledge_digest(
     }
     // Retrieval-quality feedback: snapshot the chunks actually injected so the
     // step's later PASS/FAIL can tune their usefulness prior (fail-open, bounded).
-    let surfaced: Vec<(String, String)> = hits
-        .iter()
-        .take(max_chunks)
-        .map(|h| (h.chunk.meta.path.clone(), h.chunk.meta.section.clone()))
-        .collect();
-    crate::knowledge_feedback::record_surfaced_chunks(project_root, &surfaced);
+    // ONLY on the build-step path (`record_feedback`): the light/chat path has no
+    // step outcome to attribute and must leave no `.umadev` artifact behind.
+    if record_feedback {
+        let surfaced: Vec<(String, String)> = hits
+            .iter()
+            .take(max_chunks)
+            .map(|h| (h.chunk.meta.path.clone(), h.chunk.meta.section.clone()))
+            .collect();
+        crate::knowledge_feedback::record_surfaced_chunks(project_root, &surfaced);
+    }
     let mut out = String::from(
         "\n\nYOUR TEAM'S EXPERIENCE ON THIS (patterns and practices your team has \
          built up that match this request — draw on what's useful, your judgment \
@@ -250,12 +263,18 @@ pub fn agentic_knowledge_digest(
 /// `knowledge/` dir, a disabled KB, no match, or a filter that would empty the set
 /// each degrade to the plain [`agentic_knowledge_digest`] (or an empty string) —
 /// never a panic, and never WORSE than the seat-agnostic path.
+///
+/// `record_feedback` threads through exactly as in [`agentic_knowledge_digest`]
+/// (including into every fallback to it): the seat-step directive on the build
+/// path passes `true` so the surfaced chunks are attributed to that step's
+/// outcome; the light-path firmware passes `false` and writes no snapshot.
 #[must_use]
 pub fn seat_scoped_knowledge_digest(
     project_root: &Path,
     role: &str,
     instruction: &str,
     max_chunks: usize,
+    record_feedback: bool,
 ) -> String {
     if instruction.trim().is_empty() || max_chunks == 0 {
         return String::new();
@@ -263,7 +282,7 @@ pub fn seat_scoped_knowledge_digest(
     // Unknown seat → no domains → today's instruction-keyed digest (fail-open).
     let domains = crate::experts::seat_knowledge_domains(role);
     if domains.is_empty() {
-        return agentic_knowledge_digest(project_root, instruction, max_chunks);
+        return agentic_knowledge_digest(project_root, instruction, max_chunks, record_feedback);
     }
     let base = knowledge_root(project_root);
     if !base.is_dir() {
@@ -301,7 +320,7 @@ pub fn seat_scoped_knowledge_digest(
     if hits.is_empty() {
         // Nothing matched even unfiltered → fall back so a seat step is never
         // WORSE off than the plain path.
-        return agentic_knowledge_digest(project_root, instruction, max_chunks);
+        return agentic_knowledge_digest(project_root, instruction, max_chunks, record_feedback);
     }
     // Keep only chunks under the seat's domain subdirs (plus cross-cutting learned
     // lessons); a chunk path is a segment match so `design` matches `design/x` but
@@ -326,11 +345,14 @@ pub fn seat_scoped_knowledge_digest(
     // Retrieval-quality feedback: snapshot the chunks actually injected for THIS
     // seat step so its later PASS/FAIL can tune their usefulness prior. Fail-open,
     // bounded, overwrite-most-recent (mirrors the surfaced-lesson-identity snapshot).
-    let surfaced: Vec<(String, String)> = chosen
-        .iter()
-        .map(|h| (h.chunk.meta.path.clone(), h.chunk.meta.section.clone()))
-        .collect();
-    crate::knowledge_feedback::record_surfaced_chunks(project_root, &surfaced);
+    // Build-step path only (`record_feedback`): the light path leaves no artifact.
+    if record_feedback {
+        let surfaced: Vec<(String, String)> = chosen
+            .iter()
+            .map(|h| (h.chunk.meta.path.clone(), h.chunk.meta.section.clone()))
+            .collect();
+        crate::knowledge_feedback::record_surfaced_chunks(project_root, &surfaced);
+    }
     let mut out = format!(
         "\n\nYOUR TEAM'S EXPERIENCE ON THIS ({role} seat — patterns and practices \
          from your discipline that match this step; draw on what's useful, your \
@@ -3792,11 +3814,11 @@ mod tests {
         // unchanged when there's nothing to inject.)
         let _no_corpus = NoBundledCorpus::new();
         let tmp = TempDir::new().unwrap();
-        let d = agentic_knowledge_digest(tmp.path(), "build a login page", 4);
+        let d = agentic_knowledge_digest(tmp.path(), "build a login page", 4, false);
         assert!(d.is_empty(), "no knowledge dir -> empty digest");
         // Empty requirement / zero budget also short-circuit to empty.
-        assert!(agentic_knowledge_digest(tmp.path(), "   ", 4).is_empty());
-        assert!(agentic_knowledge_digest(tmp.path(), "build it", 0).is_empty());
+        assert!(agentic_knowledge_digest(tmp.path(), "   ", 4, false).is_empty());
+        assert!(agentic_knowledge_digest(tmp.path(), "build it", 0, false).is_empty());
     }
 
     #[test]
@@ -3821,7 +3843,7 @@ mod tests {
         );
 
         // And recall over it is non-empty for a matching requirement.
-        let d = agentic_knowledge_digest(project.path(), "service layering", 4);
+        let d = agentic_knowledge_digest(project.path(), "service layering", 4, false);
         assert!(
             !d.is_empty(),
             "staged corpus must produce a non-empty digest for a matching ask"
@@ -3863,7 +3885,7 @@ mod tests {
              business logic into a service layer; repositories own persistence.\n",
         )
         .unwrap();
-        let d = agentic_knowledge_digest(tmp.path(), "service layering controllers", 4);
+        let d = agentic_knowledge_digest(tmp.path(), "service layering controllers", 4, false);
         // Fail-open is fine if the index can't match (e.g. tokeniser edge), but when
         // it does match it must carry the real source path + the team-experience
         // framing.
@@ -3906,8 +3928,8 @@ mod tests {
         let instr = "implement the account settings page";
         // SAME step instruction, DIFFERENT seats → DIFFERENT knowledge: proving the
         // SEAT (not just the instruction text) drives retrieval.
-        let fe = seat_scoped_knowledge_digest(tmp.path(), "frontend-engineer", instr, 4);
-        let sec = seat_scoped_knowledge_digest(tmp.path(), "security-engineer", instr, 4);
+        let fe = seat_scoped_knowledge_digest(tmp.path(), "frontend-engineer", instr, 4, false);
+        let sec = seat_scoped_knowledge_digest(tmp.path(), "security-engineer", instr, 4, false);
         assert!(
             !fe.is_empty() && !sec.is_empty(),
             "both seats recall real knowledge"
@@ -3951,8 +3973,8 @@ mod tests {
         let instr = "implement the account settings page";
         // An unknown seat has no domains → byte-identical to the seat-agnostic digest
         // (fail-open: never worse, never a panic).
-        let unknown = seat_scoped_knowledge_digest(tmp.path(), "astrologer", instr, 4);
-        let plain = agentic_knowledge_digest(tmp.path(), instr, 4);
+        let unknown = seat_scoped_knowledge_digest(tmp.path(), "astrologer", instr, 4, false);
+        let plain = agentic_knowledge_digest(tmp.path(), instr, 4, false);
         assert_eq!(
             unknown, plain,
             "unknown seat == today's instruction-keyed digest"
@@ -3964,11 +3986,11 @@ mod tests {
         let _no_corpus = NoBundledCorpus::new();
         let tmp = two_domain_corpus();
         // Empty instruction / zero budget → empty (fail-open guards).
-        assert!(seat_scoped_knowledge_digest(tmp.path(), "frontend", "   ", 4).is_empty());
-        assert!(seat_scoped_knowledge_digest(tmp.path(), "frontend", "x", 0).is_empty());
+        assert!(seat_scoped_knowledge_digest(tmp.path(), "frontend", "   ", 4, false).is_empty());
+        assert!(seat_scoped_knowledge_digest(tmp.path(), "frontend", "x", 0, false).is_empty());
         // Bounded: even a generous max_chunks renders at most `max_chunks` short
         // excerpts, so the digest stays a small overlay (never a corpus dump).
-        let big = seat_scoped_knowledge_digest(tmp.path(), "frontend", "build the ui", 4);
+        let big = seat_scoped_knowledge_digest(tmp.path(), "frontend", "build the ui", 4, false);
         assert!(
             big.chars().count() < 3_000,
             "seat digest stays bounded: {}",
@@ -3977,7 +3999,78 @@ mod tests {
         // No knowledge dir → empty (fail-open), never a panic.
         let bare = TempDir::new().unwrap();
         assert!(
-            seat_scoped_knowledge_digest(bare.path(), "frontend", "build the ui", 4).is_empty()
+            seat_scoped_knowledge_digest(bare.path(), "frontend", "build the ui", 4, false)
+                .is_empty()
+        );
+    }
+
+    /// Regression guard (retrieval-feedback `record_feedback` gate): the LIGHT path
+    /// (`record_feedback = false`) composes a real knowledge digest but must drop NO
+    /// surfaced-chunks snapshot into the user's `.umadev` tree. A chat / quick-edit
+    /// turn has no step outcome to attribute, and the stray `.umadev/learned/_raw`
+    /// artifact read as a spurious working-tree change — which is what flipped a
+    /// non-host light turn into a phantom "build" (`non_host_build_does_not_lock_or_
+    /// isolate_on_the_light_path` in umadev-tui). The BUILD-step path
+    /// (`record_feedback = true`) writes the SAME digest AND the snapshot, so
+    /// `self_evolve` can still feed the usefulness prior.
+    #[test]
+    fn knowledge_digest_snapshots_chunks_only_on_the_build_path() {
+        let _no_corpus = NoBundledCorpus::new();
+        let tmp = two_domain_corpus();
+        let instr = "build the frontend ui with design tokens and components";
+
+        // (1) Light path: a real digest, but NO feedback snapshot and NO `.umadev`
+        // artifact anywhere under the user's project root.
+        let light = agentic_knowledge_digest(tmp.path(), instr, 4, false);
+        assert!(!light.is_empty(), "the corpus matches -> a real digest");
+        assert!(
+            crate::knowledge_feedback::read_surfaced_chunks(tmp.path()).is_empty(),
+            "light path records no retrieval-feedback snapshot"
+        );
+        assert!(
+            !tmp.path().join(".umadev").exists(),
+            "light path leaves NO `.umadev` artifact in the user's working tree"
+        );
+
+        // (2) Build-step path: byte-identical digest text, but the surfaced chunks
+        // ARE snapshotted so a later PASS/FAIL can tune their usefulness prior.
+        let build = agentic_knowledge_digest(tmp.path(), instr, 4, true);
+        assert_eq!(
+            build, light,
+            "only the side effect differs, not the digest text"
+        );
+        assert!(
+            !crate::knowledge_feedback::read_surfaced_chunks(tmp.path()).is_empty(),
+            "build path snapshots the surfaced chunks for feedback"
+        );
+    }
+
+    /// The seat-scoped digest honours the SAME `record_feedback` gate (it threads the
+    /// flag through, including into every fallback to the plain digest).
+    #[test]
+    fn seat_scoped_digest_snapshots_chunks_only_on_the_build_path() {
+        let _no_corpus = NoBundledCorpus::new();
+        let tmp = two_domain_corpus();
+        let instr = "implement the account settings page";
+
+        let light = seat_scoped_knowledge_digest(tmp.path(), "frontend-engineer", instr, 4, false);
+        assert!(
+            !light.is_empty(),
+            "the frontend seat matches -> a real digest"
+        );
+        assert!(
+            crate::knowledge_feedback::read_surfaced_chunks(tmp.path()).is_empty(),
+            "seat light path records no snapshot"
+        );
+        assert!(
+            !tmp.path().join(".umadev").exists(),
+            "seat light path leaves NO `.umadev` artifact"
+        );
+
+        let _build = seat_scoped_knowledge_digest(tmp.path(), "frontend-engineer", instr, 4, true);
+        assert!(
+            !crate::knowledge_feedback::read_surfaced_chunks(tmp.path()).is_empty(),
+            "seat build path snapshots the surfaced chunks for feedback"
         );
     }
 
