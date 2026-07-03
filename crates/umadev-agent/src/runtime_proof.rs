@@ -237,13 +237,25 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
 
     // 4. Spawn the dev server, capturing its output so we can read readiness and
     //    port-conflict signals (the old code discarded output, which is why a port
-    //    fallback went unnoticed and the boot hung).
-    let (program, args) = split_command(&dev.command);
-    let (vprog, vlead) = spawn_parts(&program);
-    let spawn = Command::new(vprog)
-        .args(&vlead)
-        .args(&args)
-        .current_dir(workspace)
+    //    fallback went unnoticed and the boot hung). The working directory is
+    //    RESOLVED + VERIFIED up front (`resolve_spawn_plan`): a `cd <subdir> &&`
+    //    prefix becomes an explicit `current_dir`, never a spawned `cd` program
+    //    (the recurring Windows "cannot find the path specified"), and a
+    //    nonexistent dir fails open here with a reason instead of a raw OS error.
+    let plan = match resolve_spawn_plan(&dev.command, workspace) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            let mut proof =
+                RuntimeProof::not_verified(format!("failed to start dev server: {reason}"));
+            proof.dev_server = Some(dev.label.to_string());
+            proof.command = Some(dev.command.clone());
+            proof.base_url = Some(base_url);
+            return proof;
+        }
+    };
+    let spawn = Command::new(&plan.program)
+        .args(&plan.args)
+        .current_dir(&plan.dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -410,6 +422,97 @@ fn split_command(cmd: &str) -> (String, Vec<String>) {
     let mut parts = cmd.split_whitespace().map(str::to_string);
     let program = parts.next().unwrap_or_default();
     (program, parts.collect())
+}
+
+/// A resolved, VERIFIED spawn plan for the detected dev-server command: the
+/// directory to run it in, the program to spawn, and its args. See
+/// [`resolve_spawn_plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnPlan {
+    /// Working directory for the child — canonicalized + proven to exist.
+    dir: PathBuf,
+    /// Program to spawn (a Windows `.cmd`/`.bat` shim already routed via `cmd /c`).
+    program: String,
+    /// Program arguments.
+    args: Vec<String>,
+}
+
+/// Turn a detected dev-server command into an explicit, verified
+/// `(working_dir, program, args)` spawn plan.
+///
+/// [`detect_dev_server`] prefixes a subproject command with `cd <rel> && ` when
+/// the frontend lives in a subdirectory (e.g. `cd web && pnpm dev`). Spawning
+/// that string as-is is the recurring **Windows** failure: a naive
+/// whitespace split makes the *program* the shell builtin `cd`, which
+/// `CreateProcess` cannot resolve → "The system cannot find the path
+/// specified". Instead we split the target directory OUT and set it as the
+/// child's `current_dir` explicitly, so the working dir is real by construction
+/// and no nested `cd … &&` (with its fragile quoting, or a scheduled-task /
+/// `powershell` detach that silently mis-resolves the path) is ever built. The
+/// bare program is routed through [`spawn_parts`] so a Windows npm/pnpm `.cmd`
+/// shim runs via `cmd /c`.
+///
+/// The working directory is `canonicalize`d up front, which both normalizes it
+/// and FAILS when it does not exist — turning a would-be raw OS path error at
+/// spawn time into an actionable, fail-open `Err(reason)` the caller records as
+/// `NotVerified`. Never spawns into an unresolved / nonexistent cwd.
+fn resolve_spawn_plan(command: &str, workspace: &Path) -> Result<SpawnPlan, String> {
+    let (raw_dir, bare) = split_cd_prefix(command, workspace);
+    let dir = std::fs::canonicalize(&raw_dir)
+        .map(undecorate)
+        .map_err(|e| {
+            format!(
+                "dev-server working directory `{}` is not accessible: {e}",
+                raw_dir.display()
+            )
+        })?;
+    let (program, args) = split_command(bare);
+    if program.is_empty() {
+        return Err("dev-server command is empty".to_string());
+    }
+    let (vprog, mut lead) = spawn_parts(&program);
+    lead.extend(args);
+    Ok(SpawnPlan {
+        dir,
+        program: vprog,
+        args: lead,
+    })
+}
+
+/// Split a leading `cd <dir> &&` off a run command, resolving `<dir>` against
+/// `workspace` (absolute paths kept as-is; quotes stripped). Returns
+/// `(working_dir, remaining_command)`. With no `cd` prefix the working dir is
+/// `workspace` and the whole (trimmed) command is returned unchanged. Mirrors
+/// the TUI's `parse_run_command` so `/preview` and the runtime proof detach the
+/// dev server identically.
+fn split_cd_prefix<'a>(command: &'a str, workspace: &Path) -> (PathBuf, &'a str) {
+    let trimmed = command.trim();
+    if let Some(after_cd) = trimmed.strip_prefix("cd ") {
+        if let Some((dir, rest)) = after_cd.split_once("&&") {
+            let dir = dir.trim().trim_matches(|c| c == '\'' || c == '"');
+            let resolved = if Path::new(dir).is_absolute() {
+                PathBuf::from(dir)
+            } else {
+                workspace.join(dir)
+            };
+            return (resolved, rest.trim());
+        }
+    }
+    (workspace.to_path_buf(), trimmed)
+}
+
+/// Strip the Windows verbatim prefix (`\\?\C:\x` → `C:\x`) that `canonicalize`
+/// adds. Pure string logic; every non-verbatim path (all unix paths) passes
+/// through unchanged. Mirrors the link opener's `undecorate` so a canonicalized
+/// `current_dir` stays a plain path.
+fn undecorate(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if !rest.starts_with("UNC") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
 
 /// Poll `base_url` until it STOPS answering (the port is free) or `budget_secs`
@@ -1154,6 +1257,117 @@ mod tests {
             )
         );
         assert_eq!(split_command(""), (String::new(), Vec::new()));
+    }
+
+    #[test]
+    fn split_cd_prefix_splits_dir_and_strips_operator() {
+        let root = Path::new("/workspace");
+
+        // Relative subdir → resolved against workspace; the `cd … &&` glue is gone.
+        let (dir, rest) = split_cd_prefix("cd web && pnpm dev", root);
+        assert_eq!(dir, root.join("web"));
+        assert_eq!(rest, "pnpm dev");
+        assert!(!rest.contains("cd") && !rest.contains("&&"));
+
+        // Quoted dir with a space survives, un-quoted.
+        let (dir, rest) = split_cd_prefix("cd 'my app' && npm run dev", root);
+        assert_eq!(dir, root.join("my app"));
+        assert_eq!(rest, "npm run dev");
+
+        // No `cd` prefix → workspace root, command returned unchanged (trimmed).
+        let (dir, rest) = split_cd_prefix("  npm run dev  ", root);
+        assert_eq!(dir, root.to_path_buf());
+        assert_eq!(rest, "npm run dev");
+
+        // Absolute target dir is kept as-is (unix-only: `/abs` is not absolute on
+        // Windows, which needs a drive letter).
+        #[cfg(unix)]
+        {
+            let (dir, rest) = split_cd_prefix("cd /abs/app && pnpm dev", root);
+            assert_eq!(dir, PathBuf::from("/abs/app"));
+            assert_eq!(rest, "pnpm dev");
+        }
+    }
+
+    #[test]
+    fn resolve_spawn_plan_cd_prefix_runs_in_subdir_never_spawns_cd() {
+        // The recurring Windows bug: `detect_dev_server` returns
+        // `cd <subdir> && <cmd>` for a subproject frontend. The old naive split
+        // spawned a program literally named `cd` (a shell builtin, not an exe) in
+        // the WRONG cwd → "The system cannot find the path specified". The plan
+        // must instead set the subdir as `current_dir` and spawn the real program.
+        let tmp = TempDir::new().unwrap();
+        let web = tmp.path().join("web");
+        fs::create_dir_all(&web).unwrap();
+
+        let plan =
+            resolve_spawn_plan("cd web && pnpm dev", tmp.path()).expect("subdir exists → resolves");
+
+        // cwd is the SUBDIR, resolved + set explicitly — not the workspace root.
+        assert_eq!(plan.dir, undecorate(web.canonicalize().unwrap()));
+
+        // The program is NEVER the shell builtin `cd`, and no fragile shell glue
+        // (a `&&`, a nested `cd`, a schtasks/powershell scheduled-task detach)
+        // leaks into the argv — the exact failure shapes we must not build.
+        assert_ne!(plan.program, "cd");
+        let argv: Vec<String> = std::iter::once(plan.program.clone())
+            .chain(plan.args.iter().cloned())
+            .collect();
+        assert!(!argv.iter().any(|t| t == "cd"), "no `cd` program: {argv:?}");
+        assert!(!argv.iter().any(|t| t == "&&"), "no shell op: {argv:?}");
+        assert!(
+            !argv.iter().any(|t| t.contains("schtasks")),
+            "no scheduled task: {argv:?}"
+        );
+        // The real run command survived intact (its last token is the run arg).
+        assert_eq!(plan.args.last().map(String::as_str), Some("dev"));
+    }
+
+    #[test]
+    fn resolve_spawn_plan_no_cd_runs_in_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let plan = resolve_spawn_plan("npm run dev", tmp.path()).expect("workspace exists");
+
+        assert_eq!(plan.dir, undecorate(tmp.path().canonicalize().unwrap()));
+        assert_ne!(plan.program, "cd");
+        // The run tokens are preserved in order after any (possibly empty)
+        // `spawn_parts` lead — off Windows / when no `.cmd` shim resolves the lead
+        // is empty and program is `npm`; on Windows with an `npm.cmd` shim the lead
+        // is `cmd /c <npm.cmd>` — either way `run`/`dev` are still there, in order.
+        assert!(plan.args.iter().any(|a| a == "run"), "{:?}", plan.args);
+        assert_eq!(plan.args.last().map(String::as_str), Some("dev"));
+    }
+
+    #[test]
+    fn resolve_spawn_plan_missing_dir_fails_open_with_reason() {
+        let tmp = TempDir::new().unwrap();
+        // `nope/` does not exist: resolve up front with an actionable reason rather
+        // than spawning into a bad cwd and surfacing a raw OS path error.
+        let err = resolve_spawn_plan("cd nope && npm run dev", tmp.path())
+            .expect_err("missing dir must fail open");
+        assert!(err.contains("nope"), "reason names the dir: {err}");
+        assert!(
+            err.to_lowercase().contains("not accessible"),
+            "actionable reason: {err}"
+        );
+    }
+
+    #[test]
+    fn undecorate_strips_windows_verbatim_prefix_only() {
+        // Non-verbatim paths (every unix path) pass through untouched.
+        assert_eq!(
+            undecorate(PathBuf::from("/plain/path")),
+            PathBuf::from("/plain/path")
+        );
+        // A `\\?\C:\x` verbatim prefix is stripped; a `\\?\UNC\...` share is kept.
+        assert_eq!(
+            undecorate(PathBuf::from(r"\\?\C:\proj\web")),
+            PathBuf::from(r"C:\proj\web")
+        );
+        assert_eq!(
+            undecorate(PathBuf::from(r"\\?\UNC\server\share")),
+            PathBuf::from(r"\\?\UNC\server\share")
+        );
     }
 
     #[test]
