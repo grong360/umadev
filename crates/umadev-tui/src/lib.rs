@@ -5309,6 +5309,35 @@ fn detach_session_close(mut session: Box<dyn umadev_runtime::BaseSession>) {
     });
 }
 
+/// P3 — whether quitting must run the SAME active-run teardown a `Cancel` does.
+/// Every `Action::Quit` path (`/quit`, Ctrl-D, the double-Esc confirm, the picker
+/// Esc) breaks the event loop DIRECTLY, bypassing the `Cancel` arm — so a
+/// task/run still in flight at quit would otherwise be left un-aborted, its
+/// guarded approval dangling, and its director session never drained (an
+/// orphan/wedged base subprocess). Cleanup is needed exactly when a task was
+/// running (`has_run_task`) or a continuous director session is parked
+/// (`continuous_run_active`). Pure so it is unit-tested directly; returns `false`
+/// for an idle quit, so `/quit` with nothing running stays as fast as before.
+fn quit_needs_active_cleanup(has_run_task: bool, continuous_run_active: bool) -> bool {
+    has_run_task || continuous_run_active
+}
+
+/// P3 — close a director-run base session at QUIT teardown, BOUNDED so a wedged
+/// base can't hang the exit. Same off-loop discipline as the resident-chat
+/// teardown close (spawn the `end()`, then WAIT at most one drain budget), for the
+/// `Box<dyn BaseSession>` parked in a [`SessionHolder`]. Unlike
+/// [`detach_session_close`] (fire-and-forget, used mid-session where the loop
+/// keeps running) this WAITS the bounded budget: at quit we want a healthy base's
+/// graceful `end()` to land, while the timeout guarantees a wedged base still
+/// can't stall the exit — the `Child` is `kill_on_drop`, so a dropped in-flight
+/// close still reaps it. Fail-open.
+async fn bounded_session_close(mut session: Box<dyn umadev_runtime::BaseSession>) {
+    let closer = tokio::spawn(async move {
+        let _ = session.end().await;
+    });
+    let _ = tokio::time::timeout(CANCEL_DRAIN_BUDGET, closer).await;
+}
+
 /// R3 — the per-loop draw decision (pure, so it is unit-tested directly). Draw
 /// when a self-heal repaint is forced (`force_full_repaint`), when a latency-
 /// sensitive source asked for an immediate frame (`draw_now` — input / the
@@ -7055,6 +7084,42 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // match the closed one. Best-effort + cheap (a chat with no recorded turns
     // is a no-op) — and NOT a hot-loop write: this runs exactly once per quit.
     app.persist_chat();
+    // P3 — quit-while-running teardown. Every `Action::Quit` path (`/quit`,
+    // Ctrl-D, the double-Esc confirm, the picker Esc) breaks the loop DIRECTLY
+    // without passing through the `Cancel` arm, so a task/run in flight at quit
+    // was left un-aborted, any guarded approval left dangling, and the director
+    // run session never drained — a potential orphan/wedged base subprocess. If
+    // (and ONLY if) something was live, run the SAME cleanup `Cancel` does before
+    // exiting: abandon the pending approval, abort the in-flight task, and
+    // bounded-close the continuous run session. Bounded + fail-open throughout so
+    // a wedged base can never hang the exit; an idle quit skips all of it and
+    // stays as fast as before.
+    if quit_needs_active_cleanup(run_task.is_some(), continuous_run_active) {
+        // Abandon any in-flight guarded approval pause — dropping its `reply_tx`
+        // fail-opens a blocked drain to DENY. Mirrors the `Cancel` arm.
+        clear_pending_approval(&approval_holder);
+        if let Some(h) = run_task.take() {
+            // `abort()` only SCHEDULES cancellation; the base subprocess keeps
+            // running until the task unwinds and drops its owned session. Bounded-
+            // wait for that wind-down (same absolute-deadline discipline as the
+            // `cancel_drain` branch) so the session-lock take below never races a
+            // still-held lock — a wedged task can't outlast the drain budget.
+            h.abort();
+            let deadline = tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET;
+            let _ = tokio::time::timeout_at(deadline, h).await;
+        }
+        // A continuous run held the director's persistent base session — close it
+        // bounded (off-loop spawn + wait ≤ budget) so its subprocess doesn't
+        // outlive the TUI, exactly as the resident-chat teardown below closes the
+        // chat session. `try_lock` fail-opens if the aborted task somehow still
+        // holds it (kill_on_drop still reaps the Child at runtime shutdown).
+        if continuous_run_active {
+            let run_session = session_holder.try_lock().ok().and_then(|mut g| g.take());
+            if let Some(s) = run_session {
+                bounded_session_close(s).await;
+            }
+        }
+    }
     // Quit / app teardown: close the resident chat session so its base subprocess
     // doesn't outlive the TUI. Best-effort; fail-open — never block the exit. The
     // close runs on a spawned task, bound-WAITED (not awaited inline): a wedged
@@ -7619,6 +7684,73 @@ mod tests {
     fn legacy_input_parks_immediately_on_eof() {
         let (_s, park) = legacy_input_park_decision(0, false, true, MAX_CONSECUTIVE_INPUT_ERRORS);
         assert!(park, "stdin EOF parks input immediately");
+    }
+
+    // --- P3: /quit during a running task runs the Cancel cleanup ------------
+
+    /// Quitting WHILE a task/run is live must trigger the same active-run
+    /// teardown a `Cancel` does — an in-flight task, a parked continuous run
+    /// session, or both, all demand the cleanup (abort + approval-clear + drain).
+    #[test]
+    fn quit_active_cleanup_runs_when_something_is_live() {
+        assert!(
+            quit_needs_active_cleanup(true, false),
+            "an in-flight task at quit must trigger the abort/drain cleanup"
+        );
+        assert!(
+            quit_needs_active_cleanup(false, true),
+            "a parked continuous run session at quit must be drained"
+        );
+        assert!(
+            quit_needs_active_cleanup(true, true),
+            "cleanup is needed when both a task and a run session are live"
+        );
+    }
+
+    /// An IDLE quit (nothing running, no parked run session) must SKIP the
+    /// active-run cleanup entirely — `/quit` with nothing in flight stays as fast
+    /// as before (no abort, no session drain), straight to the chat-session
+    /// teardown + exit.
+    #[test]
+    fn quit_active_cleanup_skipped_when_idle() {
+        assert!(
+            !quit_needs_active_cleanup(false, false),
+            "an idle quit must skip the active-run cleanup and stay fast"
+        );
+    }
+
+    /// The gated cleanup actually ABANDONS a dangling guarded approval when the
+    /// quit is active — and is SKIPPED (leaving the holder untouched) when idle.
+    /// This drives the exact seam the teardown uses: `if
+    /// quit_needs_active_cleanup(..) { clear_pending_approval(..) }`.
+    #[test]
+    fn quit_active_cleanup_clears_pending_approval_only_when_active() {
+        // Active quit: a guarded run left an approval pending → the gate fires →
+        // the approval is abandoned (its `reply_tx` dropped, so a blocked drain
+        // fail-opens to DENY), exactly as `Cancel` does.
+        let active: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        *active.lock().unwrap() = Some(PendingApproval { reply_tx: tx });
+        if quit_needs_active_cleanup(true, false) {
+            clear_pending_approval(&active);
+        }
+        assert!(
+            active.lock().unwrap().is_none(),
+            "quit-while-active must abandon the dangling approval"
+        );
+
+        // Idle quit (contrived parked approval): the gate is `false`, so the clear
+        // is NEVER invoked — proving idle quit does no active-run work.
+        let idle: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+        let (tx2, _rx2) = tokio::sync::oneshot::channel();
+        *idle.lock().unwrap() = Some(PendingApproval { reply_tx: tx2 });
+        if quit_needs_active_cleanup(false, false) {
+            clear_pending_approval(&idle);
+        }
+        assert!(
+            idle.lock().unwrap().is_some(),
+            "idle quit must SKIP the cleanup — no clear runs"
+        );
     }
 
     // --- R3 event coalescing + frame budget ---------------------------------
