@@ -80,9 +80,12 @@ impl ReviewReport {
     }
 }
 
-/// Workspace-relative path of the review report.
+/// Workspace-relative path of the review report. The slug is sanitized
+/// (see [`crate::runner::sanitize_slug`]) so a hostile/accidental slug
+/// (`../x`, `/tmp/x`) can't move the report outside `output/`.
 #[must_use]
 pub fn review_report_rel_path(slug: &str) -> String {
+    let slug = crate::runner::sanitize_slug(slug);
     format!("output/{slug}-review-report.md")
 }
 
@@ -91,6 +94,9 @@ pub fn review_report_rel_path(slug: &str) -> String {
 /// artifact yields an honest "not available" claim, never a panic.
 #[must_use]
 pub fn build_review_report(project_root: &Path, slug: &str) -> ReviewReport {
+    // Sanitize once at the boundary so every artifact path derived below
+    // (and the slug echoed into the report) stays inside `output/`.
+    let slug = &crate::runner::sanitize_slug(slug);
     let claims = vec![
         ci_integrity_claim(project_root),
         contract_claim(project_root, slug),
@@ -103,7 +109,7 @@ pub fn build_review_report(project_root: &Path, slug: &str) -> ReviewReport {
     ];
 
     ReviewReport {
-        slug: slug.to_string(),
+        slug: slug.clone(),
         claims,
     }
 }
@@ -583,6 +589,25 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn review_report_path_is_sanitized_against_traversal() {
+        // Normal slug lands where it always did.
+        assert_eq!(
+            review_report_rel_path("my-app"),
+            "output/my-app-review-report.md"
+        );
+        // Hostile slugs can't escape output/ or become absolute.
+        for hostile in ["../etc/passwd", "/tmp/x", "..\\..\\x"] {
+            let rel = review_report_rel_path(hostile);
+            assert!(rel.starts_with("output/"), "{hostile:?} -> {rel:?}");
+            assert!(!rel.contains(".."), "{hostile:?} -> {rel:?}");
+            assert!(
+                !std::path::Path::new(&rel).is_absolute(),
+                "{hostile:?} -> absolute {rel:?}"
+            );
+        }
+    }
 
     #[test]
     fn clean_diff_has_no_signals() {

@@ -598,19 +598,58 @@ pub fn setup_run_isolation(project_root: &Path, slug: &str) -> Option<(String, S
     announce
 }
 
+/// Reduce a run slug to a filename-safe path component so a hostile or
+/// accidental slug (`../x`, `/tmp/x`, `..\..\x`) can never escape the
+/// `output/` directory or resolve to an absolute path. Every downstream
+/// artifact path is built from the effective slug, so sanitizing here makes
+/// the whole run's output tree safe by construction.
+///
+/// Mirrors the governance sanitizer
+/// (`umadev_governance::compliance::sanitize_slug`, which is private to that
+/// crate): keep alphanumerics / `-` / `_` / `.`, map every other character
+/// (path separators included) to `_`, collapse any `..` traversal to `_`,
+/// and fall back to `"project"` for an empty or all-dot/underscore result.
+/// Deterministic and fail-open — never panics and always returns a
+/// non-empty, non-traversing component. A normal slug (`my-app`) passes
+/// through unchanged.
+#[must_use]
+pub(crate) fn sanitize_slug(slug: &str) -> String {
+    let cleaned: String = slug
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Collapse any `..` (even dot-underscore-separated) that could traverse.
+    let no_traversal = cleaned.replace("..", "_");
+    if no_traversal.is_empty() || no_traversal.chars().all(|c| c == '_' || c == '.') {
+        "project".to_string()
+    } else {
+        no_traversal
+    }
+}
+
 impl RunOptions {
     /// Resolve the effective slug — derives from workspace dir name
-    /// when empty.
+    /// when empty. The result is always filename-safe (see
+    /// [`sanitize_slug`]) so it can be interpolated into an artifact path
+    /// without escaping `output/` or resolving to an absolute path.
     #[must_use]
     pub fn effective_slug(&self) -> String {
-        if !self.slug.is_empty() {
-            return self.slug.clone();
-        }
-        self.project_root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("project")
-            .to_string()
+        let raw = if self.slug.is_empty() {
+            self.project_root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("project")
+                .to_string()
+        } else {
+            self.slug.clone()
+        };
+        sanitize_slug(&raw)
     }
 }
 
@@ -6644,6 +6683,60 @@ not json at all
             mode: crate::trust::TrustMode::Guarded,
             strict_coverage: false,
         }
+    }
+
+    #[test]
+    fn sanitize_slug_preserves_normal_slugs() {
+        // A legitimate slug is passed through byte-for-byte.
+        assert_eq!(sanitize_slug("demo"), "demo");
+        assert_eq!(sanitize_slug("my-app"), "my-app");
+        assert_eq!(sanitize_slug("my-app_2"), "my-app_2");
+        assert_eq!(sanitize_slug("v1.2"), "v1.2");
+    }
+
+    #[test]
+    fn sanitize_slug_neutralizes_path_traversal() {
+        for hostile in ["../etc/passwd", "/tmp/x", "..\\..\\x", "..", "a/b\\c"] {
+            let s = sanitize_slug(hostile);
+            assert!(!s.contains('/'), "{hostile:?} -> {s:?} still has '/'");
+            assert!(!s.contains('\\'), "{hostile:?} -> {s:?} still has '\\'");
+            assert!(!s.contains(".."), "{hostile:?} -> {s:?} still traverses");
+            assert!(!s.is_empty(), "{hostile:?} -> empty slug");
+            // The interpolated artifact path stays inside `output/`.
+            let rel = format!("output/{s}-research.md");
+            assert!(
+                !std::path::Path::new(&rel).is_absolute(),
+                "{hostile:?} -> absolute path {rel:?}"
+            );
+            assert!(
+                std::path::Path::new(&rel)
+                    .components()
+                    .all(|c| c != std::path::Component::ParentDir),
+                "{hostile:?} -> path {rel:?} escapes output/"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_slug_empty_and_degenerate_fall_back_to_project() {
+        assert_eq!(sanitize_slug(""), "project");
+        assert_eq!(sanitize_slug("   "), "project");
+        assert_eq!(sanitize_slug("...."), "project");
+        assert_eq!(sanitize_slug("//"), "project");
+    }
+
+    #[test]
+    fn effective_slug_sanitizes_hostile_cli_slug() {
+        let tmp = TempDir::new().unwrap();
+        // Normal slug unchanged.
+        let o = opts(tmp.path());
+        assert_eq!(o.effective_slug(), "demo");
+        // A hostile explicit slug is neutralized at the choke point, so every
+        // downstream artifact path is safe by construction.
+        let mut hostile = opts(tmp.path());
+        hostile.slug = "../../etc/passwd".into();
+        let s = hostile.effective_slug();
+        assert!(!s.contains('/') && !s.contains("..") && !s.is_empty());
     }
 
     /// A runtime that is NOT offline (so `use_runtime` is on) but always returns

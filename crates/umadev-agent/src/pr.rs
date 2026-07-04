@@ -269,6 +269,9 @@ pub fn manual_steps(readiness: &PrReadiness, slug: &str, body_path_rel: &str) ->
 /// `gh --body-file` path agree).
 #[must_use]
 pub fn pr_body_rel_path(slug: &str) -> String {
+    // Sanitize (see `crate::runner::sanitize_slug`) so a slug like `../x` or
+    // `/tmp/x` can't move the PR body outside `output/` or make it absolute.
+    let slug = crate::runner::sanitize_slug(slug);
     format!("output/{slug}-pr-body.md")
 }
 
@@ -279,6 +282,9 @@ pub fn pr_body_rel_path(slug: &str) -> String {
 /// renders a one-line note rather than an error.
 #[must_use]
 pub fn render_pr_body(project_root: &Path, slug: &str) -> String {
+    // Sanitize at the boundary so both the review report and the proof-pack
+    // summary below build only in-`output/` paths from the slug.
+    let slug = &crate::runner::sanitize_slug(slug);
     let report = build_review_report(project_root, slug);
     let review_md = render_review_md(&report);
 
@@ -671,6 +677,22 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn pr_body_path_is_sanitized_against_traversal() {
+        // Normal slug unchanged.
+        assert_eq!(pr_body_rel_path("app"), "output/app-pr-body.md");
+        // Hostile slugs stay inside output/ and never go absolute.
+        for hostile in ["../etc/passwd", "/tmp/x", "..\\..\\x"] {
+            let rel = pr_body_rel_path(hostile);
+            assert!(rel.starts_with("output/"), "{hostile:?} -> {rel:?}");
+            assert!(!rel.contains(".."), "{hostile:?} -> {rel:?}");
+            assert!(
+                !std::path::Path::new(&rel).is_absolute(),
+                "{hostile:?} -> absolute {rel:?}"
+            );
+        }
+    }
 
     fn readiness(default: &str, current: &str, all_ok: bool) -> PrReadiness {
         let mk = |id: &str| ReadinessCheck {
