@@ -120,9 +120,12 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     set_terminal_title(app.backend.as_deref().unwrap_or("offline"));
     let result = event_loop(&mut terminal, &mut app, opts).await;
     // Graceful cleanup: kill any preview dev server the user started via
-    // /preview, so quitting UmaDev never leaves an orphaned process.
+    // /preview, so quitting UmaDev never leaves an orphaned process. Kill the whole
+    // process GROUP — the dev server (npm/pnpm) forks the real node/vite server as a
+    // grandchild that a bare start_kill would leave holding the port.
     if let Ok(mut g) = app.preview_server.lock() {
         if let Some(mut child) = g.take() {
+            let _ = umadev_agent::kill_process_group(&child);
             let _ = child.start_kill();
         }
     }

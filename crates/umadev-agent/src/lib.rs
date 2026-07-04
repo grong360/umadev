@@ -206,7 +206,9 @@ pub use skills::{
     graduate_skill, graduate_validated_patterns, read_skills, retrieve_skills,
     skill_description_prompt, skills_for_prompt, skills_report, Skill,
 };
-pub use spawn_util::{detach_from_controlling_terminal, detach_kind, DetachKind};
+pub use spawn_util::{
+    detach_from_controlling_terminal, detach_kind, kill_process_group, DetachKind,
+};
 pub use state::{
     list_snapshots, read_workflow_state, read_workflow_state_diagnostic, restore_snapshot,
     unfinished_plan_summary, write_workflow_state, ReadState, WorkflowState,

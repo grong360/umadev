@@ -86,9 +86,54 @@ pub fn detach_from_controlling_terminal(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Kill a preview/dev-server child **and its whole descendant tree** — the node/
+/// vite grandchild an `npm run dev` / `pnpm dev` forks, not just the wrapper.
+///
+/// Because the child was spawned via [`detach_from_controlling_terminal`] it leads
+/// its own session/process-group (its `pgid == pid`), so a group kill reaches every
+/// descendant that stayed in the group. A plain `Child::start_kill` would SIGKILL
+/// only the direct wrapper, leaving the real server holding its port — the bug this
+/// fixes (`/stop-preview` reported "stopped" while the port stayed occupied).
+///
+/// Returns `true` when a kill was issued. **Fail-open**: an already-exited child
+/// (`id()` is `None`), a bad pid, or a `taskkill` failure returns `false` and never
+/// panics — the caller still drops the `Child` (`kill_on_drop`) as a backstop.
+#[must_use]
+#[allow(unsafe_code)] // the `killpg` seam; the rest of the crate stays unsafe-free
+pub fn kill_process_group(child: &tokio::process::Child) -> bool {
+    let Some(pid) = child.id() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        // SAFETY: `killpg` only posts a signal to the process group and is
+        // async-signal-safe; a nonexistent group returns `-1`/`ESRCH` which we
+        // treat as "nothing to kill" (fail-open). `pid` came from a live child.
+        let sent = unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        sent == 0
+    }
+    #[cfg(windows)]
+    {
+        // `taskkill /T` kills the whole tree rooted at `pid`; `/F` forces it.
+        std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{detach_from_controlling_terminal, detach_kind, DetachKind};
+    use super::{detach_from_controlling_terminal, detach_kind, kill_process_group, DetachKind};
 
     #[test]
     fn detach_kind_matches_the_platform() {
@@ -121,5 +166,42 @@ mod tests {
             .await
             .expect("detached `true` should exit");
         assert!(status.success(), "detached child ran in its own session");
+    }
+
+    // A detached child (its own group leader via `setsid`) is reaped by a group
+    // kill — the property `/stop-preview` relies on to take down npm/pnpm AND the
+    // node/vite grandchild. Unix only (`sleep` / signals).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_process_group_kills_a_detached_child() {
+        use std::process::Stdio;
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_from_controlling_terminal(&mut cmd);
+        let mut child = cmd.spawn().expect("`sleep` should spawn");
+        assert!(kill_process_group(&child), "a live child's group is killed");
+        let status = child.wait().await.expect("a killed child still exits");
+        assert!(!status.success(), "a SIGKILLed `sleep` does not exit 0");
+    }
+
+    // Fail-open: a child that already exited has no pid → no kill, no panic.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_process_group_fails_open_on_an_exited_child() {
+        use std::process::Stdio;
+        let mut child = tokio::process::Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("`true` should spawn");
+        child.wait().await.expect("`true` should exit");
+        assert!(
+            !kill_process_group(&child),
+            "an already-exited child fails open to false"
+        );
     }
 }

@@ -11981,10 +11981,18 @@ impl App {
 
     /// `/stop-preview` — kill the background dev server if one is running.
     fn slash_stop_preview(&mut self) -> Action {
-        let killed = self
-            .preview_server
-            .lock()
-            .is_ok_and(|mut g| g.take().is_some_and(|mut c| c.start_kill().is_ok()));
+        // Kill the whole process GROUP, not just the wrapper: `npm/pnpm run dev`
+        // forks the real node/vite server as a grandchild that a bare start_kill
+        // leaves holding the port (the "reported stopped but still running" bug).
+        // The preview child was spawned detached (its own session leader), so a
+        // group kill reaches the grandchild too.
+        let killed = self.preview_server.lock().is_ok_and(|mut g| {
+            g.take().is_some_and(|mut c| {
+                let _ = umadev_agent::kill_process_group(&c);
+                let _ = c.start_kill();
+                true
+            })
+        });
         if killed {
             self.push(
                 ChatRole::System,
