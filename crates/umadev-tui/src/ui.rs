@@ -7926,8 +7926,15 @@ mod tests {
         // terminal shows it; assert the leading glyph of the localized "ready" word
         // is on screen (wide CJK glyphs carry a skip-cell, so match the first one).
         let mut app = app_with(Some("offline"));
+        // Pin English so the "ready" marker is locale-independent: CI's detected
+        // locale differs from a dev machine's, which changes status.ready's glyphs
+        // (this test asserts the marker is on screen, so it must not depend on lang).
+        app.lang = umadev_i18n::Lang::En;
         app.insert_str_at_cursor("a\nb\nc\nd\ne\nf\ng\nh");
-        let out = render_chat_at(&app, 120, 12);
+        // Wide enough that the (long, English) meta row leaves room for the
+        // right-aligned live status — the point of the assertion below. Height stays
+        // short (12) so the prompt-height clamp is still exercised.
+        let out = render_chat_at(&app, 220, 12);
         let ready = umadev_i18n::t(app.lang, "status.ready").to_string();
         let marker = ready.chars().next().unwrap().to_string();
         assert!(
