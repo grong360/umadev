@@ -8837,7 +8837,7 @@ mod tests {
     fn floor_blocks_hardcoded_secret_in_any_file() {
         let d = pre_write_floor_decision(
             "src/cfg.ts",
-            "const k = \"aB3xK9pQ7mNr2WvT5sZ8dF1gH4jL6cE0\";",
+            "const apiSecret = \"aB3xK9pQ7mNr2WvT5sZ8dF1gH4jL6cE0\";",
         );
         assert!(d.block, "a leaked live secret must hit the floor");
         assert!(is_irreversible_write_floor(&d.clause));

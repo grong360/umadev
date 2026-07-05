@@ -901,7 +901,7 @@ mod tests {
                 "name": "govern_file",
                 "arguments": {
                     "file_path": "src/cfg.ts",
-                    "content": "const k = \"aB3xK9pQ7mNr2WvT5sZ8dF1gH4jL6cE0\";"
+                    "content": "const apiSecret = \"aB3xK9pQ7mNr2WvT5sZ8dF1gH4jL6cE0\";"
                 }
             }),
         };
