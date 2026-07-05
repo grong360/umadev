@@ -22792,7 +22792,10 @@ mod tests {
             .iter()
             .filter(|m| matches!(m.kind, MessageBody::Diff(_)))
             .count();
-        assert_eq!(two, 2, "a distinct follow-up edit still renders its own card");
+        assert_eq!(
+            two, 2,
+            "a distinct follow-up edit still renders its own card"
+        );
     }
 
     #[test]
