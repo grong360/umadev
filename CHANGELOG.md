@@ -2,6 +2,24 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.32] — 研究驱动的开发团队交互强化 · typed 交接契约全线打通 · 门禁显示一致性
+
+这一版落地一轮系统性的「开发 Agent 团队如何交互」研究成果:先深入互联网调研了 2024-2025 的多 Agent 工程实践(黑板架构 / 单写者串行 + 只读并行评审 / 确定性编排 / 不做有损散文接力),确认 UmaDev 现有设计正是这一轮的行业共识,再据此把「decision 用 typed 文档接力、context 用原始 forked 会话无损继承、绝不散文摘要轨迹」这条最佳实践在代码里全线打通。全部改动确定性、fail-open、有界、非破坏;确定性地板仍掌控循环控制,新增信号一律 advisory;umadev-agent 3700+ 测试全绿、clippy 净。研究综述见 docs/AGENT_TEAM_INTERACTION_DESIGN.md。
+
+### 新增 - 团队交互硬化(typed 交接契约)
+
+- 座位能力卡(Seat Card):每个座位(PM / 架构 / 设计 / 前端 / 后端 / QA / 安全 / DevOps)现在有一张 typed 自描述能力卡 -- 声明它 owns 什么、reads 哪些契约输入、produces 哪些产出(A2A 「Agent Card」的内部借用)。roster 自描述,每一次交接都成为显式可校验的契约。
+- 每跳交接校验(双向):座位运行前,系统即比对它声明的输入/产出与黑板现状 -- 缺声明输入(错位)或没产出其负责的 artifact(规格缺口,多 Agent 头号失败类)都在交接处就折进 verdict 暴露,而不是变成下游谜团。活在评审流里。
+- 两层 artifact 物化:把散文文档里的决策抽成 typed 契约 -- 数据模型(架构文档)、设计令牌(UIUX)、验收标准(PRD)-- emit 到 .umadev/contracts/derived-contracts.json,与 API 契约并列,接进文档阶段。
+- verdict 结构化溯源(provenance):评审结论现在可带结构化溯源(来源座位 + 关联 artifact + 诊断说明),由确定性标注器填充(绝不采信底座自述),让打回更可诊断、审计链可重建;serde 向后兼容,旧 verdict JSON 照样解析。
+- artifact 版本化 → DAG 陈旧失效:黑板文档带稳定内容版本(.umadev/artifact-versions.json);跨会话编辑了 PRD / 架构 / UIUX 后 resume,消费该文档的计划步骤及其下游会自动翻回待办、由总监对着变更后的上游重新推导,而不是信任一份已被「静默污染」的旧结果。
+- 黑板 public/private 私有区:两个座位化解一处冲突时可在 .umadev/scratch/ 私有区来回,不污染公共 output/ 黑板,run 结束回收。
+
+### 修复 - 门禁显示一致性
+
+- 守护模式门禁文案不再自相矛盾:预检卡此前底部显示「守护模式 · 逐门审核」,正文却写「两道 gate 默认自动通过」-- 现在门禁行随当前信任模式(auto / guarded / plan)动态生成,显示与实际审批行为一致。
+- 去掉重复的「完整构建」行:意图卡的标题与理由此前都以「这是一次完整构建」开头 -- 理由改为解释「为何」判为完整构建,不再复述标题。
+
 ## [1.0.31] — 闪屏根治 · 计数 / 滚动 / 去重修复 · 跨平台 CI 转绿
 
 紧接 1.0.30,这一版把用户实测后反馈的一批渲染 / 计数 / 跨平台问题一次修干净,并让此前已实现却未随发布上线的「鼠标选中 → 复制」正式生效。全部改动确定性、fail-open、有界、非破坏性;`umadev-tui` 保持 `#![forbid(unsafe_code)]`。
