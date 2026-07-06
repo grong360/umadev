@@ -428,6 +428,17 @@ fn is_network(hay: &str) -> Option<bool> {
         "socket hang up",
         "network error",
         "connection error",
+        // The literal claude prints — `(ConnectionRefused)` — has NO space, so the
+        // spaced "connection refused" above misses it; match the collapsed token too.
+        "connectionrefused",
+        // A base process that DIED (couldn't reach its endpoint, then exited)
+        // surfaces to the next write as a broken pipe / EPIPE. Classifying it here
+        // makes it TRANSIENT (is_network → is_transient), so the director restarts
+        // the session and recovers instead of hard-failing on an unclassifiable
+        // transport error (the enriched reason still carries the base's real cause).
+        "broken pipe",
+        "os error 32",
+        "epipe",
     ];
     if SSL_MARKERS.iter().any(|m| hay.contains(m)) {
         return Some(true);

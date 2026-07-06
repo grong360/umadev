@@ -198,7 +198,7 @@ where
 /// torn state escapes. Dependency-free — the agent crate avoids the `futures`
 /// crate's `catch_unwind` combinator on purpose (see the dependency-light
 /// contract), so this small adapter stands in for it.
-async fn catch_unwind_future<F, T>(fut: F, on_panic: impl Fn() -> T) -> T
+pub(crate) async fn catch_unwind_future<F, T>(fut: F, on_panic: impl Fn() -> T) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -3727,10 +3727,16 @@ impl<R: Runtime> AgentRunner<R> {
             )
             .unwrap_or_default()
         };
-        let (uiux, arch) = (read("uiux"), read("architecture"));
+        // Include the PRD: the preview team's seats (uiux-designer, frontend-engineer)
+        // declare `Prd` in their SeatCard.reads, so leaving it empty made the per-hop
+        // hand-off check emit a FALSE "missing Prd input" advisory + provenance on every
+        // preview review (and the uiux critic lost real PRD context). The docs bundle
+        // already includes it; the preview bundle simply forgot to.
+        let (uiux, arch, prd) = (read("uiux"), read("architecture"), read("prd"));
         let requirement = self.options.requirement.clone();
         let arts = crate::critics::CriticArtifacts {
             requirement: &requirement,
+            prd: &prd,
             uiux: &uiux,
             architecture: &arch,
             code: &code,

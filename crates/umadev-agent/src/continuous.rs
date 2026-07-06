@@ -1755,7 +1755,16 @@ async fn review_one(
     arts: CriticArtifacts<'_>,
 ) -> RoleVerdict {
     let consult = ForkConsult::new(fork);
-    let verdict = critic.review(&consult, arts).await;
+    // Panic isolation (parity with `runner::run_critics_concurrently`): a critic that
+    // PANICS (e.g. a slice/unwrap on a malformed brain reply) must collapse to its
+    // empty accepting verdict, NOT unwind through the shared `join_all_ordered` driver
+    // and abort the entire /run. The review is already fail-open for value errors; this
+    // extends that to a panic on the flagship director path too.
+    let role = critic.role().to_string();
+    let verdict = crate::runner::catch_unwind_future(critic.review(&consult, arts), || {
+        RoleVerdict::empty(&role)
+    })
+    .await;
     // Best-effort close the fork session (release the process / HTTP session).
     consult.end().await;
     verdict

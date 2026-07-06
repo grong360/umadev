@@ -172,6 +172,55 @@ fn route_wants_repo_map(route: &RoutePlan) -> bool {
     route.class != RouteClass::Chat
 }
 
+/// Byte budget for the ingested project agent-instruction files (see
+/// [`project_agent_instructions`]). Modest on purpose: these are hard constraints
+/// that lead the stable head, not a place to dump a whole doc tree.
+const AGENT_RULES_BUDGET: usize = 6000;
+
+/// Ingest the industry-standard agent-instruction files a repo may already carry from
+/// OTHER tools — `AGENTS.md` (the OpenAI/Codex open standard), `.cursorrules`,
+/// `.clinerules`, `.windsurfrules`, `.github/copilot-instructions.md` — into a single
+/// labeled firmware block so UmaDev honors the team's existing conventions instead of
+/// ignoring them. Files are concatenated in a FIXED order (KV-cache-stable), each under
+/// its own `### <path>` sub-heading, then the whole block is truncated to `budget` on a
+/// char boundary. Fully fail-open: a missing/unreadable/empty file is skipped; no files
+/// → an empty string (nothing injected, behaving exactly as before).
+fn project_agent_instructions(root: &Path, budget: usize) -> String {
+    const FILES: &[&str] = &[
+        "AGENTS.md",
+        ".cursorrules",
+        ".clinerules",
+        ".windsurfrules",
+        ".github/copilot-instructions.md",
+    ];
+    let mut out = String::new();
+    for rel in FILES {
+        let Ok(body) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str("## Project agent-instruction files (honor these existing conventions)\n");
+        }
+        out.push_str("\n### ");
+        out.push_str(rel);
+        out.push('\n');
+        out.push_str(body);
+        out.push('\n');
+    }
+    if out.len() > budget {
+        let mut end = budget;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+    }
+    out
+}
+
 /// Compose the firmware system prompt for ONE turn — the layered, budgeted,
 /// route-tiered overlay the host injects over the base's system-prompt face.
 ///
@@ -233,6 +282,20 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         let charter = crate::constitution::user_charter_firmware_block(root, CONSTITUTION_BUDGET);
         if !charter.trim().is_empty() {
             fw.push_block(&charter);
+        }
+
+        // ── Project AGENT-INSTRUCTION files (the industry standard) ──────────
+        // Honor the agent-instruction files a repo may already carry from OTHER
+        // tools — `AGENTS.md` (the OpenAI/Codex open standard), `.cursorrules`,
+        // `.clinerules`, `.windsurfrules`, `.github/copilot-instructions.md` — as
+        // HARD project context, so UmaDev respects the team's existing conventions
+        // (build/test quirks, coding standards, gotchas) instead of ignoring them.
+        // Part of the stable head like the charter (a user-authored constraint that
+        // changes rarely). Bounded + fully fail-open: no files → empty, nothing
+        // injected, behaving exactly as before.
+        let agent_rules = project_agent_instructions(root, AGENT_RULES_BUDGET);
+        if !agent_rules.trim().is_empty() {
+            fw.push_block(&agent_rules);
         }
 
         // ── OPEN-DECISIONS discipline — the parking-lot DIRECTIVE (static) ────
@@ -586,6 +649,31 @@ mod tests {
     use crate::critics::Seat;
     use crate::planner::TaskKind;
     use crate::router::{Budget, Depth};
+
+    #[test]
+    fn project_agent_instructions_ingests_standard_files_and_fails_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // No files → empty (fail-open: nothing injected, behaves exactly as before).
+        assert!(project_agent_instructions(root, AGENT_RULES_BUDGET).is_empty());
+        // AGENTS.md present → ingested under a labeled, source-attributed block.
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "Run `make test` before every commit.",
+        )
+        .unwrap();
+        let out = project_agent_instructions(root, AGENT_RULES_BUDGET);
+        assert!(out.contains("AGENTS.md"), "labels the source file");
+        assert!(out.contains("make test"), "carries the file body");
+        // A second standard file (.cursorrules) is appended too.
+        std::fs::write(root.join(".cursorrules"), "No any-typed exports.").unwrap();
+        let out2 = project_agent_instructions(root, AGENT_RULES_BUDGET);
+        assert!(out2.contains("make test") && out2.contains("No any-typed exports"));
+        // A giant file is truncated to budget on a char boundary without panicking.
+        std::fs::write(root.join(".clinerules"), "x".repeat(20_000)).unwrap();
+        let capped = project_agent_instructions(root, 500);
+        assert!(capped.len() <= 500);
+    }
 
     /// A minimal [`RoutePlan`] for a given class/depth/team, so the tests drive
     /// `compose_firmware` without a live router/session.

@@ -41,9 +41,16 @@ pub struct DerivedContracts {
 /// level. `None` when no matching section exists.
 fn section_body<'a>(md: &'a str, keys: &[&str]) -> Option<Vec<&'a str>> {
     let lines: Vec<&str> = md.lines().collect();
+    let line_starts_fence = |t: &str| t.starts_with("```") || t.starts_with("~~~");
+    let mut in_fence = false;
     for (i, raw) in lines.iter().enumerate() {
         let l = raw.trim_start();
-        if !l.starts_with('#') {
+        // A `#` INSIDE a fenced code block (a shell/python comment) is not a heading.
+        if line_starts_fence(l) {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || !l.starts_with('#') {
             continue;
         }
         let heading = l.trim_start_matches('#').trim().to_ascii_lowercase();
@@ -55,9 +62,15 @@ fn section_body<'a>(md: &'a str, keys: &[&str]) -> Option<Vec<&'a str>> {
         }
         let level = l.chars().take_while(|c| *c == '#').count();
         let mut body = Vec::new();
+        let mut body_fence = false;
         for lj in &lines[i + 1..] {
             let t = lj.trim_start();
-            if t.starts_with('#') {
+            if line_starts_fence(t) {
+                body_fence = !body_fence;
+                body.push(*lj);
+                continue;
+            }
+            if !body_fence && t.starts_with('#') {
                 let lvl = t.chars().take_while(|c| *c == '#').count();
                 if lvl <= level {
                     break;
@@ -68,6 +81,15 @@ fn section_body<'a>(md: &'a str, keys: &[&str]) -> Option<Vec<&'a str>> {
         return Some(body);
     }
     None
+}
+
+/// Split a `key: value` bullet on the first ASCII colon, the full-width CJK colon
+/// (Chinese data-model/token docs use it), or `=` when `allow_eq`. Char-boundary safe.
+fn split_kv(s: &str, allow_eq: bool) -> Option<(&str, &str)> {
+    let (i, ch) = s
+        .char_indices()
+        .find(|(_, c)| *c == ':' || *c == '：' || (allow_eq && *c == '='))?;
+    Some((&s[..i], &s[i + ch.len_utf8()..]))
 }
 
 /// A bullet line's payload (`- x` / `* x` / `1. x`), or `None` if not a bullet.
@@ -98,13 +120,7 @@ fn bullet_payload(line: &str) -> Option<String> {
 pub fn parse_data_model(architecture_md: &str) -> Vec<DataModelEntity> {
     let Some(body) = section_body(
         architecture_md,
-        &[
-            "data model",
-            "数据模型",
-            "数据模型设计",
-            "data schema",
-            "schema",
-        ],
+        &["data model", "数据模型", "数据模型设计", "data schema"],
     ) else {
         return Vec::new();
     };
@@ -113,7 +129,7 @@ pub fn parse_data_model(architecture_md: &str) -> Vec<DataModelEntity> {
         let Some(payload) = bullet_payload(line) else {
             continue;
         };
-        let Some((name, fields)) = payload.split_once(':') else {
+        let Some((name, fields)) = split_kv(&payload, false) else {
             continue;
         };
         let name = name.trim().to_string();
@@ -141,7 +157,6 @@ pub fn parse_design_tokens(uiux_md: &str) -> Vec<(String, String)> {
             "design-token",
             "设计令牌",
             "design system tokens",
-            "tokens",
         ],
     ) else {
         return Vec::new();
@@ -151,8 +166,7 @@ pub fn parse_design_tokens(uiux_md: &str) -> Vec<(String, String)> {
         let Some(payload) = bullet_payload(line) else {
             continue;
         };
-        let split = payload.split_once(':').or_else(|| payload.split_once('='));
-        if let Some((k, val)) = split {
+        if let Some((k, val)) = split_kv(&payload, true) {
             let k = k.trim().to_string();
             let val = val.trim().to_string();
             if !k.is_empty() && !val.is_empty() {

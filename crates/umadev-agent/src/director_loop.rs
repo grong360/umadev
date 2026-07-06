@@ -2402,11 +2402,24 @@ async fn verify_step_evidence(
     // empty tree is an honest reject regardless of the declared evidence. A positive
     // source pass becomes baseline positive evidence (so a Build step whose only
     // contract is an unrunnable route still counts the real source it wrote).
+    // A DOC-producing Build step (PM authoring the PRD, architect the architecture
+    // doc, designer the UIUX doc) delivers a DOCUMENT under `output/`, not source code
+    // — and `acceptance::source_files` deliberately excludes `output/`. Gating those
+    // steps on the source-present CODE floor falsely rejects them ("declared
+    // source-present but 0 source files") and collapses a greenfield build at its very
+    // first (docs) step. So apply the floor ONLY to code-writing seats; a doc step's
+    // own FileContains evidence (checked below) verifies its real deliverable.
+    let is_doc_seat = matches!(
+        step.seat,
+        crate::critics::Seat::ProductManager
+            | crate::critics::Seat::Architect
+            | crate::critics::Seat::UiuxDesigner
+    );
     let src = director::verify(options, events, VerifyKind::SourcePresent).await;
-    if is_build && src.available && !src.passed {
+    if is_build && !is_doc_seat && src.available && !src.passed {
         return acceptance_from_verify(src);
     }
-    let mut any_positive = is_build && src.available && src.passed;
+    let mut any_positive = is_build && !is_doc_seat && src.available && src.passed;
 
     // Precompute the SHARED, expensive producers at most once — only when a declared
     // contract actually needs them — so multiple contracts of the same kind don't

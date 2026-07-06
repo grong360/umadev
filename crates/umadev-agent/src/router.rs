@@ -668,6 +668,26 @@ fn path_hints_from_text(text: &str) -> Vec<String> {
 /// The brain's structured opinion of a request. Every field is optional / tolerant
 /// so a partial reply still parses (fail-open: a missing field falls back to the
 /// Tier-0 prior during reconciliation).
+/// Tolerant deserializer for the brain-triage array fields: accepts a JSON array of
+/// strings, a SINGLE string (LLMs routinely collapse a one-element array to a scalar),
+/// or anything else -> empty. Without this, one scalar-collapsed field makes
+/// serde_json::from_str::<BrainRoute> fail the WHOLE struct, silently degrading a real
+/// build to Chat on the primary chat surface (no plan/team/gates).
+fn de_string_or_vec<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(a) => a
+            .into_iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct BrainRoute {
     /// `chat | explain | quick_edit | debug | build` (free text; mapped tolerantly).
@@ -680,10 +700,10 @@ struct BrainRoute {
     #[serde(default)]
     complexity: String,
     /// What the request needs (roles / capabilities) — informs the team.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string_or_vec")]
     needs: Vec<String>,
     /// Likely-relevant files / dirs.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string_or_vec")]
     scope: Vec<String>,
     // NB: the prompt also invites a `risks` array; the router doesn't surface risks
     // (that's the plan's job — see `plan_state`), so it's intentionally not a field
@@ -692,7 +712,7 @@ struct BrainRoute {
     #[serde(default)]
     clarify_question: String,
     /// Discrete options for the clarifying question.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_string_or_vec")]
     clarify_options: Vec<String>,
     /// The brain's confidence `0.0..=1.0` (tolerant: out-of-range is clamped).
     #[serde(default)]

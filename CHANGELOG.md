@@ -2,6 +2,23 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.35] - 全架构深度审查(8 路并行)修复一批交互/逻辑 bug + 遵循行业标准 agent 指令文件
+
+对整个 Rust 工作区做了一次全覆盖的对抗式深度审查(8 个并行审查通道,逐块细读),挖出并修复了一批真 bug;同时借鉴顶尖 AI-coding 项目补上一处肉眼可见的加强。全部改动确定性、fail-open、非破坏。3740+ 测试绿,clippy + fmt 干净。
+
+### 修复(深度审查确认的真 bug)
+
+- **greenfield 构建不再在第一步就崩**:写文档的 Build 步骤(PM 写 PRD、架构师写架构文档、设计师写 UIUX)产出的是 output/*.md 文档而非源码,却被"源码存在性"诚实地板按代码步骤误判为"声称有源码却 0 个源文件" → 步骤 Blocked → 拖垮整条计划。现在源码 CODE 地板只对写代码的座位(前端/后端)生效,文档座位由它自己的 FileContains 证据验收,诚实地板本身不动(绝不放过真幻觉)。
+- **底座连接失败能被识别与恢复**:base_error 现在识别 `(ConnectionRefused)`(claude 打印的无空格写法)和 broken pipe / os error 32 / EPIPE —— 一个"连不上端点后退出"的底座会被归为可重启的瞬时故障,总监据此重启会话重试,而不是当成无法分类的硬失败直接失败整个运行。
+- **预览门不再每次误报"缺 Prd"**:前端预览评审的物料包漏塞了 PRD,而参与座位(uiux-designer / frontend-engineer)声明读取 Prd,导致每次 UI 构建都被逐跳交接检查误报"缺少声明输入 Prd" + 记进结构化溯源。补上后不再误报,uiux critic 也拿回真实 PRD 上下文。
+- **文档物化解析器三处修正**(数据模型/设计令牌 → 契约):代码围栏 ``` 内的 `#` 注释不再被当成章节标题(不再提前截断或选错段);中文全角冒号 `：` 现在能正确分割 `用户：id`(此前只认 ASCII 冒号 → 中文数据模型解析为空);去掉过宽的 "schema"/"tokens" 关键词(不再被 "JSON Schema" 等更早的段落劫持)。
+- **/run 主评审路径加 panic 隔离**:总监循环的角色评审此前没有 panic 隔离(只有旧版路径有),一个 critic 在畸形回复上 panic 会击穿并发驱动、中止整个运行。现在和 runner 路径一致地包了 catch_unwind,critic panic 收敛为其空的接受判决。
+- **路由容错解析,真构建不再被降级成聊天**:底座意图分诊 JSON 里的数组字段(needs/scope/clarify_options)若被模型塌缩成单个字符串(常见 LLM 怪癖),此前会让整个解析失败 → 一个真构建在默认聊天面被静默当成聊天(无计划/无团队/无门禁)。现在这些字段容错解析(数组、单字符串、或其它 → 空),一个字段畸形不再沉没整个判定。
+
+### 新增(借鉴顶尖 AI-coding 项目的可见加强)
+
+- **遵循行业标准 agent 指令文件**:UmaDev 现在会把仓库里已有的、来自其它工具的 agent 指令文件 —— `AGENTS.md`(OpenAI/Codex 开放标准)、`.cursorrules`、`.clinerules`、`.windsurfrules`、`.github/copilot-instructions.md` —— 作为硬约束注入 firmware,尊重团队既有的约定(构建/测试细节、编码规范、坑点),而不是无视它们。放在 KV-cache 稳定头(和用户宪章同级),有预算上限、按字符边界截断、完全 fail-open(没有这些文件 → 什么都不注入,行为和以前完全一致)。学自 Codex / Cursor / Cline / Continue 的通行做法。
+
 ## [1.0.34] - init 像 Claude Code /init 一样理解项目 - spec 阶段"写文档被当成写代码"误判修复
 
 两处体验修复。全部改动确定性、fail-open、非破坏。
