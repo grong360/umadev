@@ -3546,6 +3546,14 @@ async fn drive_one_turn_with_backoff(
     let mut est_tokens: u64 = approx_tokens(&directive);
     // Keep the directive OWNED (clone for the send) so a transient backoff-retry or a
     // silent-hang watchdog re-drive can re-send the SAME directive on this session.
+    //
+    // Base-call gate: hold ONE permit for this whole director turn (the send + the
+    // event drain + any transient re-send), so a build's doer turn is the only base
+    // connection in flight — a background pre-warm or a stray fork can't open a 2nd
+    // one that a low-concurrency gateway rejects with 529. Released when this fn
+    // returns, BEFORE the runner fans out the (separately-gated) critics, so it is
+    // never held while acquiring another permit and can never deadlock.
+    let _base_permit = crate::base_gate::base_permit().await;
     if let Err(e) = session.send_turn(directive.clone()).await {
         return Err(format!("session send: {e}"));
     }

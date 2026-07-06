@@ -3208,6 +3208,16 @@ fn spawn_chat_session_preload(
     };
     let backend = backend.to_string();
     tokio::spawn(async move {
+        // Base-call gate: pre-warming is a pure latency optimisation, so it must NEVER
+        // add a concurrent gateway connection. Only warm if a permit is free right now
+        // (no turn in flight); otherwise skip this round — the next real turn lazily
+        // opens its own session. Holding the permit across the open keeps the warm
+        // session's startup off the wire while a turn is talking, so a low-concurrency
+        // gateway never sees two connections at once.
+        let _permit = match umadev_agent::base_gate::try_base_permit() {
+            Some(p) => p,
+            None => return,
+        };
         // Open OUTSIDE the lock so the (slow) MCP/firmware load never holds the
         // mutex a live turn might need — then take the lock only to park it.
         // Fail-open: a failed open is dropped here (the `if let` skips it), leaving
@@ -3429,6 +3439,17 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         // the session is dead -- report an honest CHAT-turn failure (never a phantom
         // routing failure). The holder was already emptied above, so the next turn
         // lazily re-opens.
+        //
+        // Base-call gate: hold ONE permit from here through the whole response drain,
+        // so this turn's base connection is the ONLY one in flight (default budget
+        // 1 = a single direct session's footprint). It is scoped to this `'attempt`
+        // iteration, so it drops — releasing the permit — on EVERY exit: an early
+        // `return` on failure, or the `break 'attempt` on turn-done, BEFORE any
+        // post-turn base call (QC / fact-extract). That before-post-turn release is
+        // what keeps it deadlock-free (never held while acquiring another), and the
+        // hold is what stops a background pre-warm or a stray fork from opening a
+        // 2nd concurrent connection that a low-concurrency gateway rejects with 529.
+        let _base_permit = umadev_agent::base_gate::base_permit().await;
         if let Err(e) = session.send_turn(first_directive).await {
             let _ = session.end().await;
             let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(

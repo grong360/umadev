@@ -3804,6 +3804,14 @@ impl<R: Runtime> AgentRunner<R> {
             // through the shared concurrent driver and aborting the whole run.
             let role = critic.role().to_string();
             async move {
+                // Base-call gate: hold ONE permit for this critic's review so the
+                // team's forked sessions never exceed the base's concurrency budget
+                // (default 1 = a single direct session's footprint). Without this the
+                // fan-out opens N concurrent gateway connections at once, which a
+                // low-concurrency third-party endpoint rejects with 529. Released on
+                // drop (every path), and scoped to this one review so it can't
+                // deadlock against another permit.
+                let _permit = crate::base_gate::base_permit().await;
                 catch_unwind_future(critic.review(&consult, arts), || {
                     crate::critics::RoleVerdict::empty(&role)
                 })
