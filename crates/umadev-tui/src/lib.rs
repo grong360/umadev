@@ -888,6 +888,46 @@ type ApprovalHolder = Arc<std::sync::Mutex<Option<PendingApproval>>>;
 /// bounded so a walked-away user can never hold the resident session open forever.
 const APPROVAL_WAIT_BUDGET: Duration = Duration::from_secs(300);
 
+/// Process-global LIVE trust tier so a MID-TURN mode switch (shift+Tab / `/mode` /
+/// `/auto` / `/manual`) takes effect on the IN-FLIGHT chat turn — not just the snapshot
+/// captured when the turn was spawned. Reported bug: a user sent a command in Guarded,
+/// then switched to Auto to unblock a paused edit, but the running turn kept denying
+/// because it still ran under the spawn-time Guarded snapshot. The event loop republishes
+/// this on every mode change; the resident chat drain reads it at each approval decision.
+/// Encoded 0=Plan, 1=Guarded, 2=Auto. One TUI session per process, so a single global is
+/// the entire state.
+static LIVE_TRUST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Encode a [`TrustMode`] for [`LIVE_TRUST`].
+fn trust_to_u8(m: umadev_agent::TrustMode) -> u8 {
+    match m {
+        umadev_agent::TrustMode::Plan => 0,
+        umadev_agent::TrustMode::Guarded => 1,
+        umadev_agent::TrustMode::Auto => 2,
+    }
+}
+
+/// Decode a [`LIVE_TRUST`] byte back to a [`TrustMode`] (unknown → the safe Guarded).
+fn trust_from_u8(v: u8) -> umadev_agent::TrustMode {
+    match v {
+        0 => umadev_agent::TrustMode::Plan,
+        2 => umadev_agent::TrustMode::Auto,
+        _ => umadev_agent::TrustMode::Guarded,
+    }
+}
+
+/// Publish the current effective trust tier so the in-flight drain sees mode switches
+/// live. Called by the event loop whenever the mode could have changed.
+fn publish_live_trust(m: umadev_agent::TrustMode) {
+    LIVE_TRUST.store(trust_to_u8(m), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The LIVE trust tier — what the resident chat drain reads at each approval decision so
+/// a mid-turn switch applies to the turn already running.
+fn live_trust_tier() -> umadev_agent::TrustMode {
+    trust_from_u8(LIVE_TRUST.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Whether a live user is present at an interactive terminal — the `has_user` /
 /// `interactive` signal threaded into the pause decisions. The TUI event loop only
 /// runs under a real TTY (raw mode is on), so this is `true` in normal use and `false`
@@ -944,6 +984,20 @@ fn resolve_pending_approval(holder: &ApprovalHolder, code: KeyCode, mods: KeyMod
 fn clear_pending_approval(holder: &ApprovalHolder) {
     if let Ok(mut g) = holder.lock() {
         *g = None;
+    }
+}
+
+/// Resolve an in-flight guarded approval as ALLOW. Called when the user switches the
+/// trust tier to one that would NOT have paused this action (shift+Tab / `/mode` to
+/// Auto mid-turn): the currently-paused action then proceeds immediately instead of
+/// waiting out [`APPROVAL_WAIT_BUDGET`] and fail-open DENYing — which is exactly the
+/// reported "switched to Auto but the edit was still rejected". Fail-open: a poisoned
+/// lock / no pending approval is a no-op.
+fn allow_pending_approval(holder: &ApprovalHolder) {
+    if let Ok(mut g) = holder.lock() {
+        if let Some(p) = g.take() {
+            let _ = p.reply_tx.send(ApprovalReply::Allow);
+        }
     }
 }
 
@@ -2967,6 +3021,19 @@ async fn next_chat_event_idle(
     deadline: Option<std::time::Instant>,
 ) -> Result<Option<umadev_runtime::SessionEvent>, ()> {
     let window = budget.window(in_tool_call);
+    // Absolute ceiling on CONTINUOUS in-tool silence (zero events at all). A live base
+    // mid-tool normally streams SOMETHING (a ToolResult, text) — that returns above and
+    // resets this per call — so only a base that has produced NOTHING for this long is a
+    // genuine wedge, not a long build. This is the safety net for the interactive chat
+    // surface where `deadline` is `None`: without it a base parked forever on an
+    // unanswerable question / a never-returning tool while its resident server stays
+    // alive (opencode arms `in_tool_call` on the tool's `running` frame) hung the whole
+    // session with no bound — the reported "调用工具… 8684s". Generous + env-overridable
+    // (`UMADEV_CHAT_TOOL_MAX_SILENCE_SECS`, default 30 min) so a legitimately quiet-but-
+    // alive tool isn't killed; on exceed we settle (`Err`) and the caller interrupts +
+    // parks the session, so control ALWAYS returns to the user in bounded time.
+    let silence_ceiling = chat_tool_silence_ceiling();
+    let waited_since = std::time::Instant::now();
     loop {
         // A real event (or `Ok(None)` session-end) landed inside the window → return it.
         if let Ok(ev) = tokio::time::timeout(window, session.next_event()).await {
@@ -2986,11 +3053,31 @@ async fn next_chat_event_idle(
                     return Err(());
                 }
             }
+            // Universal wedge backstop (applies even when `deadline` is `None`): a base
+            // that has emitted nothing for the whole ceiling is stuck, not working.
+            if waited_since.elapsed() >= silence_ceiling {
+                return Err(());
+            }
             continue;
         }
         // NOT in a tool → genuinely hung: settle (the caller interrupts + ends).
         return Err(());
     }
+}
+
+/// Absolute ceiling on CONTINUOUS in-tool silence for one chat turn — the backstop that
+/// makes a wedged base recoverable on the interactive surface (where there is no
+/// run-budget `deadline`). Default 30 min; env `UMADEV_CHAT_TOOL_MAX_SILENCE_SECS` (a
+/// value of `0` is ignored). Generous on purpose: ANY base output resets it (a real long
+/// build streams progress), so only a truly silent wedge — a base parked awaiting a human
+/// answer, or a never-returning tool — ever trips it.
+fn chat_tool_silence_ceiling() -> std::time::Duration {
+    let secs = std::env::var("UMADEV_CHAT_TOOL_MAX_SILENCE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(1800);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Idle budget for one persistent-session chat turn — the SAME source the director
@@ -3673,6 +3760,10 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     // re-asked. HEADLESS / Auto / Plan / a read all fall through to the
                     // always-on floor auto-decide below (deny irreversible, allow the rest),
                     // so a userless guarded run is never wedged waiting on a human.
+                    // Read the LIVE trust tier, not the spawn-time snapshot: a mid-turn
+                    // switch (shift+Tab / `/mode`) must apply to the turn already running,
+                    // so switching to Auto stops pausing/denying subsequent tool calls.
+                    let mode = live_trust_tier();
                     let cap = umadev_agent::capability_class(&action, &target);
                     let ledger = umadev_agent::TrustLedger::load(&project_root);
                     let already = ledger.remembers_rooted(&action, &target, &project_root);
@@ -5823,6 +5914,9 @@ async fn event_loop(
     // between the spawned chat-turn drain (which registers a pause + blocks on it) and
     // this event loop (which routes the user's y/n/Esc into it). `None` = no pause.
     let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    // Seed the LIVE trust tier from the startup mode so the first turn's approval
+    // decisions read the right tier before any mid-turn switch republishes it.
+    publish_live_trust(app.effective_trust_mode());
     // Pre-load the resident chat session NOW if we launched straight into chat with a
     // host CLI already configured (a returning user — first launch lands on the
     // picker, which fires the pre-load on `Action::BackendChanged` once a base is
@@ -6663,6 +6757,18 @@ async fn event_loop(
                             let edit_probe = (!sync_output).then(|| app.input.clone());
                             let action =
                                 app.apply_key_with_mods(replay_key.code, replay_key.modifiers);
+                            // Republish the LIVE trust tier so a mid-turn mode switch
+                            // (shift+Tab cycles it here) applies to the turn already
+                            // running. Switching to Auto also RESOLVES any in-flight
+                            // guarded pause as Allow, so the paused action proceeds instead
+                            // of waiting out the budget and denying (the reported bug).
+                            {
+                                let m = app.effective_trust_mode();
+                                publish_live_trust(m);
+                                if matches!(m, umadev_agent::TrustMode::Auto) {
+                                    allow_pending_approval(&approval_holder);
+                                }
+                            }
                             // P4b — a key that CHANGED the input buffer is a same-line
                             // edit; record the time so the non-sync repaint heartbeat
                             // heals conhost incremental-diff drift within one cadence.
@@ -7545,6 +7651,43 @@ fn current_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_trust_round_trips_and_publishes() {
+        use umadev_agent::TrustMode;
+        // Encode/decode is a stable round-trip for every tier.
+        for m in [TrustMode::Plan, TrustMode::Guarded, TrustMode::Auto] {
+            assert_eq!(trust_from_u8(trust_to_u8(m)), m);
+        }
+        // An unknown byte decodes to the SAFE tier (Guarded), never Auto.
+        assert_eq!(trust_from_u8(200), TrustMode::Guarded);
+        // publish → the live reader sees exactly what was published (mid-turn switch).
+        publish_live_trust(TrustMode::Auto);
+        assert_eq!(live_trust_tier(), TrustMode::Auto);
+        publish_live_trust(TrustMode::Guarded);
+        assert_eq!(live_trust_tier(), TrustMode::Guarded);
+    }
+
+    #[test]
+    fn allow_pending_approval_resolves_the_waiter_as_allow() {
+        // Switching to Auto mid-pause must RESOLVE an in-flight guarded approval as
+        // Allow (not leave it to time out and deny) — the reported "switched to Auto
+        // but the edit was still rejected".
+        let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *holder.lock().unwrap() = Some(PendingApproval { reply_tx: tx });
+        allow_pending_approval(&holder);
+        assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
+        // The holder is cleared, so a second call is a harmless no-op.
+        assert!(holder.lock().unwrap().is_none());
+        allow_pending_approval(&holder);
+    }
+
+    #[test]
+    fn chat_tool_silence_ceiling_defaults_generously() {
+        // A wedge backstop, generous by default so a legit quiet build isn't killed.
+        assert!(chat_tool_silence_ceiling() >= std::time::Duration::from_secs(600));
+    }
 
     // --- Windows-console teardown: every exit path must FULLY restore the
     // terminal, symmetric with setup and in reverse order, or conhost leaves
