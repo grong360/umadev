@@ -127,11 +127,13 @@ const MAX_QC_ROUNDS: usize = 3;
 /// tool-aware LIVENESS POLL ([`tool_idle_timeout`] re-checked while a tool is in
 /// flight — see [`IdleBudget`] / [`next_event_idle`]): a tool of ANY duration with a
 /// LIVE base keeps waiting. This base default is the backstop for a TRULY silent base
-/// (no tool running), bumped to 600s so an ordinary slow turn is never mis-killed.
+/// (no tool running), bumped to 1200s so an ordinary slow turn - or a base pointed at a
+/// rate-limited third-party model doing its OWN internal retry backoff - is never mis-killed
+/// before its retry can land (raise UMADEV_IDLE_TIMEOUT_SECS for even more patience).
 /// Note this continuous-session watchdog has NO per-event hard ceiling (only the
 /// run budget), unlike the single-shot host path whose idle watchdog keeps its own
 /// 300s default below its 600s hard `timeout` ceiling.
-const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1200;
 
 /// Default LIVENESS-POLL interval, in seconds, used while the base is plausibly
 /// executing a tool (see [`IdleBudget`] / [`tool_phase_transition`] / [`next_event_idle`]).
@@ -5381,11 +5383,12 @@ mod tests {
 
     #[test]
     fn idle_defaults_dont_kill_ordinary_builds() {
-        // The base default is 600s so an ordinary slow non-tool turn is not mis-killed.
-        // The tool default is now a 300s LIVENESS-POLL interval (a re-check cadence, NOT
-        // a grace cap), so a tool of any duration with a live base is never killed on
-        // silence — only the run budget bounds it.
-        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 600);
+        // The base default is 1200s so an ordinary slow non-tool turn - or a base pointed at
+        // a rate-limited third-party model doing its OWN internal retry backoff - is not
+        // mis-killed before its retry can land. The tool default is a 300s LIVENESS-POLL
+        // interval (a re-check cadence, NOT a grace cap), so a tool of any duration with a
+        // live base is never killed on silence — only the run budget bounds it.
+        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 1200);
         assert_eq!(DEFAULT_TOOL_IDLE_TIMEOUT_SECS, 300);
         // Compile-time invariant: the poll interval is a positive, finite cadence (a
         // poll of 0 would busy-spin). A `const` block keeps the check at build time (and

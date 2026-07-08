@@ -439,6 +439,13 @@ fn is_network(hay: &str) -> Option<bool> {
         "broken pipe",
         "os error 32",
         "epipe",
+        // WINDOWS broken pipe is `os error 232` (NOT a superstring of "os error 32") and its
+        // localized text differs per locale ("The pipe is being closed." / zh 管道正在被关闭),
+        // so match all three forms - else a Windows session death classifies as Unknown and
+        // hard-fails instead of taking the transient session-restart path.
+        "os error 232",
+        "pipe is being closed",
+        "管道",
     ];
     if SSL_MARKERS.iter().any(|m| hay.contains(m)) {
         return Some(true);

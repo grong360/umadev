@@ -117,7 +117,13 @@ impl ClaudeSession {
         autonomous: bool,
         max_turns: Option<u32>,
     ) -> Result<Self, SessionError> {
-        let program = std::env::var("UMADEV_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        // Resolve the SAME way the single-shot driver does: honor UMADEV_CLAUDE_BIN, else on
+        // Windows prefer the REAL `@anthropic-ai/claude-code/bin/claude.exe` over the bare
+        // `claude` PATH entry (a `.cmd`/`.ps1` shim). Spawning the shim wraps it as
+        // `cmd /c claude.cmd`, which (a) surfaces as os error 193/232 (broken pipe) and (b)
+        // makes kill/exit-status target cmd.exe while the real node `claude` orphans. Using
+        // the real binary directly fixes both on the continuous (default) path.
+        let program = crate::claude::resolve_claude_program();
         Self::start_with_program(
             &program,
             workspace,
@@ -170,7 +176,13 @@ impl ClaudeSession {
         autonomous: bool,
         max_turns: Option<u32>,
     ) -> Result<Self, SessionError> {
-        let program = std::env::var("UMADEV_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        // Resolve the SAME way the single-shot driver does: honor UMADEV_CLAUDE_BIN, else on
+        // Windows prefer the REAL `@anthropic-ai/claude-code/bin/claude.exe` over the bare
+        // `claude` PATH entry (a `.cmd`/`.ps1` shim). Spawning the shim wraps it as
+        // `cmd /c claude.cmd`, which (a) surfaces as os error 193/232 (broken pipe) and (b)
+        // makes kill/exit-status target cmd.exe while the real node `claude` orphans. Using
+        // the real binary directly fixes both on the continuous (default) path.
+        let program = crate::claude::resolve_claude_program();
         Self::spawn_with_args(
             &program,
             workspace,
@@ -263,6 +275,17 @@ impl ClaudeSession {
 
     /// Write one NDJSON line + flush to the live session's stdin.
     async fn write_line(&mut self, line: &str) -> Result<(), SessionError> {
+        // Pre-send liveness: if the child already EXITED (a GLM/third-party API error killed
+        // `claude --print` between turns), the writes below would fail with a raw broken pipe
+        // (os error 232 on Windows / 32 on Unix). Detect the dead child FIRST and return a
+        // typed "base session ended" reason so the caller recognizes session loss and reopens
+        // a fresh session (+ transcript replay) instead of surfacing the confusing pipe error
+        // and re-resuming a corpse every subsequent turn.
+        if let Some(status) = self.try_exit_status() {
+            return Err(SessionError::Send(format!(
+                "base session ended before send (base exited: {status})"
+            )));
+        }
         self.stdin
             .write_all(line.as_bytes())
             .await

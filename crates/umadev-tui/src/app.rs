@@ -8429,6 +8429,29 @@ impl App {
     /// route that already failed. The human-readable reason is surfaced as a
     /// System note. Also clears `agentic_in_flight`: a failed agentic execution
     /// call flows through here, so this is its terminal cleanup too.
+    /// Whether a failed-turn note carries evidence the BASE SESSION itself is dead / gone -
+    /// a broken pipe on send (`os error 232` on Windows, `os error 32` on Unix), the base
+    /// process having exited, or a `--resume` that hit "No conversation found" - as opposed to
+    /// a content/tool error on a still-LIVE session. On session-death the stored base session
+    /// id is a CORPSE: re-`--resume`-ing it every subsequent turn reproduces the failure
+    /// forever (the reported "only the first turn works, then every turn fails"), so it must be
+    /// invalidated to force a FRESH session (+ UmaDev own transcript replay) next turn.
+    fn note_indicates_session_lost(note: &str) -> bool {
+        const MARKERS: &[&str] = &[
+            "no conversation found",
+            "session ended",
+            "session send",
+            "broken pipe",
+            "os error 232",
+            "os error 32",
+            "pipe is being closed",
+            "管道",
+            "epipe",
+        ];
+        let hay = note.to_lowercase();
+        MARKERS.iter().any(|m| hay.contains(m))
+    }
+
     pub(crate) fn record_route_failed(&mut self, note: String) {
         // Feature A — a turn that ran a while then errored out is still a terminal
         // outcome worth a beep (gated on elapsed, so a fast base-init failure is
@@ -8451,6 +8474,15 @@ impl App {
         // Arm the one-shot dedup guard with the just-failed turn's text so an immediate
         // reflexive re-send of the SAME message is swallowed once (see `submit_text`).
         self.suppress_route_dup = self.last_dispatched_chat.clone();
+        // If the failure is the BASE SESSION dying (broken pipe / process exit / a `--resume`
+        // that found no conversation), the stored session id is a corpse - re-resuming it on
+        // every subsequent turn reproduces the failure forever. Invalidate it so the NEXT turn
+        // opens a FRESH base session and UmaDev replays its own bounded transcript for context
+        // (the fresh-open path already exists; it was just never reached because the id
+        // survived the failure).
+        if Self::note_indicates_session_lost(&note) {
+            self.chat_session_id = None;
+        }
         self.refresh_status();
         self.push(ChatRole::System, note);
     }
@@ -14694,6 +14726,36 @@ mod tests {
     use super::*;
     use crate::config::UserConfig;
     use umadev_agent::config::CodexSandbox;
+
+    #[test]
+    fn session_lost_note_detected_across_locales_and_forms() {
+        // The Windows broken pipe (os error 232, either locale), a `--resume` that found no
+        // conversation, and a base-exited note are all SESSION LOST: the stored session id is a
+        // corpse, so record_route_failed invalidates it (next turn opens fresh + replays the
+        // transcript) instead of re-resuming the corpse forever.
+        for note in [
+            "session send: 管道正在被关闭 (os error 232)",
+            "session send: The pipe is being closed. (os error 232)",
+            "base session ended mid-turn - base stderr: No conversation found with session ID x",
+            "base session ended before send (base exited: exit status: 1)",
+            "session send: Broken pipe (os error 32)",
+        ] {
+            assert!(
+                App::note_indicates_session_lost(note),
+                "should be session-lost: {note}"
+            );
+        }
+        // A content/tool failure on a still-LIVE session must NOT drop the session.
+        for note in [
+            "本轮底座执行出错:模型返回了空回复",
+            "the build step failed: cargo test exited non-zero",
+        ] {
+            assert!(
+                !App::note_indicates_session_lost(note),
+                "should NOT be session-lost: {note}"
+            );
+        }
+    }
 
     #[test]
     fn codex_sandbox_warning_only_for_danger_full_access_on_codex() {

@@ -5745,6 +5745,14 @@ const FRAME_MIN: Duration = Duration::from_millis(16);
 /// [`periodic_repaint_due`].
 const REPAINT_HEARTBEAT: Duration = Duration::from_secs(1);
 
+/// P4c - how long AFTER the app goes idle the non-sync repaint heartbeat keeps firing. Drift
+/// often appears just after a run settles, or while the window is unfocused (alt-tab away, the
+/// Windows console redraws its own buffer, come back to a garbled screen) - cases the
+/// live-only heartbeat misses. Healing for a bounded window past the idle transition wipes
+/// that drift within ~1 tick of return, while a LONG-settled screen stops clearing so there is
+/// no perpetual idle flicker. Only on the non-sync Windows path.
+const IDLE_HEAL_WINDOW: Duration = Duration::from_secs(12);
+
 /// P4b — how long after the last input-buffer edit the non-sync repaint
 /// heartbeat treats the prompt as "editing recently" and keeps healing. On
 /// classic conhost a same-line edit on an idle prompt drifts under ratatui's
@@ -6132,6 +6140,8 @@ async fn event_loop(
     // the final settled frame gets one clean full repaint (see the loop top).
     // Starts `false` (a cold launch is idle).
     let mut was_live = false;
+    // P4c - set on the live->idle edge, cleared when live; feeds the bounded post-idle heal.
+    let mut idle_since: Option<Instant> = None;
 
     // Apply one engine event plus the event-loop side effects that depend on the
     // resulting app state. Kept as a local macro because it needs to await parked
@@ -6277,6 +6287,14 @@ async fn event_loop(
         let now_live = app_is_live(app, continuous_run_active);
         if was_live && !now_live {
             app.contaminate_terminal();
+            // Enter the bounded post-idle heal window (P4c): drift that appears just after a
+            // run settles, or while unfocused (alt-tab away -> terminal redraws -> come back
+            // to a garbled screen), still self-heals for a few ticks even though the app is
+            // no longer "live". Cleared once genuinely live again.
+            idle_since = Some(Instant::now());
+        }
+        if now_live {
+            idle_since = None;
         }
         was_live = now_live;
 
@@ -6328,10 +6346,13 @@ async fn event_loop(
         // streaming run (reported on macOS Terminal.app). Unix terminals never drift
         // this way, and their event-driven heals (resize/paste contamination,
         // input-height change, /clear) still fire — so nothing is left un-healed.
+        // P4c - also heal for a bounded window right after going idle (drift on settle /
+        // unfocused-redraw), not only while live/editing.
+        let recently_idle = idle_since.is_some_and(|t| t.elapsed() < IDLE_HEAL_WINDOW);
         if cfg!(windows)
             && periodic_repaint_due(
                 sync_output,
-                now_live,
+                now_live || recently_idle,
                 editing_recently,
                 last_full_repaint.elapsed(),
                 REPAINT_HEARTBEAT,
