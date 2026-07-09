@@ -253,7 +253,12 @@ export const i18n = {
         { name: "Jacky", role: "特别贡献者", avatarKey: "jacky" },
         { name: "R·K", role: "特别贡献者", avatarKey: "rk" },
         { name: "林", role: "特别贡献者", avatarKey: "lin" },
-        { name: "秦艽", role: "特别贡献者", avatarKey: "qinjiao" }
+        { name: "秦艽", role: "特别贡献者", avatarKey: "qinjiao" },
+        { name: "C", role: "特别贡献者", avatarKey: "c" },
+        { name: "Spring", role: "特别贡献者", avatarKey: "spring" },
+        { name: "ryne", role: "特别贡献者", avatarKey: "ryne" },
+        { name: "你微笑时很美", role: "特别贡献者", avatarKey: "niweixiaoshihenmei" },
+        { name: "愛慕關中娃", role: "特别贡献者", avatarKey: "aimuguanzhongwa" }
       ]
     },
     contributorsPage: {
@@ -505,7 +510,12 @@ export const i18n = {
         { name: "Jacky", role: "Special Contributor", avatarKey: "jacky" },
         { name: "R·K", role: "Special Contributor", avatarKey: "rk" },
         { name: "Lin", role: "Special Contributor", avatarKey: "lin" },
-        { name: "Qinjiao", role: "Special Contributor", avatarKey: "qinjiao" }
+        { name: "Qinjiao", role: "Special Contributor", avatarKey: "qinjiao" },
+        { name: "C", role: "Special Contributor", avatarKey: "c" },
+        { name: "Spring", role: "Special Contributor", avatarKey: "spring" },
+        { name: "ryne", role: "Special Contributor", avatarKey: "ryne" },
+        { name: "NiWeiXiaoShiHenMei", role: "Special Contributor", avatarKey: "niweixiaoshihenmei" },
+        { name: "AiMuGuanZhongWa", role: "Special Contributor", avatarKey: "aimuguanzhongwa" }
       ]
     },
     contributorsPage: {

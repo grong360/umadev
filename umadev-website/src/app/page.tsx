@@ -1324,7 +1324,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   {member.isVip && <div className={styles.matrixVipBadge}>{member.vipText}</div>}
                   <div className={styles.matrixAvatarWrapper}>
                     <Image
-                      src={asset(`/assets/contributors/${member.avatarKey}.png`)}
+                      src={asset(`/assets/contributors/${member.avatarKey}.png?v=2`)}
                       alt={member.name}
                       width={88}
                       height={88}
