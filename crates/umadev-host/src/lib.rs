@@ -1141,7 +1141,7 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{}` not found on PATH", call.program)
         } else {
@@ -1289,7 +1289,7 @@ pub(crate) async fn run_auth_status(
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().ok()?;
+    let mut child = spawn_retrying_etxtbsy(&mut cmd).ok()?;
     // Close stdin immediately (EOF) so a status command that peeks stdin in a
     // non-interactive context returns instead of blocking to the timeout.
     drop(child.stdin.take());
@@ -1363,7 +1363,7 @@ pub(crate) async fn run_subprocess_streaming(
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{}` not found on PATH", call.program)
         } else {

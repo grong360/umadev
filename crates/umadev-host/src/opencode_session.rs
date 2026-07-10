@@ -2471,7 +2471,7 @@ mod tests {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::null());
         cmd.kill_on_drop(true);
-        let mut child = cmd.spawn().unwrap();
+        let mut child = crate::spawn_retrying_etxtbsy(&mut cmd).unwrap();
         let stdout = child.stdout.take().unwrap();
 
         // Generous scrape budget: a `/bin/sh` fake's spawn + first echo can be
