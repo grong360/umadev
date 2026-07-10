@@ -228,8 +228,7 @@ impl OpenCodeSession {
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
+        let mut child = crate::spawn_retrying_etxtbsy(&mut cmd)
             .map_err(|e| SessionError::Start(spawn_err(program, &e)))?;
 
         let stdout = child

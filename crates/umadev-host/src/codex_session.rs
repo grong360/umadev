@@ -916,7 +916,7 @@ fn spawn_app_server(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
-    cmd.spawn().map_err(|e| spawn_error(program, &e))
+    crate::spawn_retrying_etxtbsy(&mut cmd).map_err(|e| spawn_error(program, &e))
 }
 
 /// Render a spawn failure into a `Start` error (NotFound vs other).

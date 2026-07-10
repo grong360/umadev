@@ -807,6 +807,47 @@ pub(crate) fn any_env_set(keys: &[&str]) -> bool {
         .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
 }
 
+/// Whether a spawn error is `ETXTBSY` ("text file busy", os error 26).
+#[cfg(unix)]
+fn is_text_file_busy(e: &std::io::Error) -> bool {
+    // ETXTBSY == 26 on Linux/macOS (also `io::ErrorKind::ExecutableFileBusy`, but the
+    // raw code is portable across the toolchains CI may pin).
+    e.raw_os_error() == Some(26)
+}
+/// Non-unix has no `ETXTBSY`, so nothing to retry.
+#[cfg(not(unix))]
+fn is_text_file_busy(_e: &std::io::Error) -> bool {
+    false
+}
+
+/// Spawn `cmd`, retrying briefly on `ETXTBSY` ("text file busy").
+///
+/// Under `cargo test` parallelism one test writes a fake base executable and immediately
+/// execs it, while ANOTHER test's `Command::spawn` is mid `fork`→`execve` and has
+/// transiently inherited a write handle to that freshly-written file — Linux then refuses
+/// the exec with `ETXTBSY` until that other child execs (dropping its `CLOEXEC` copy). It
+/// is a transient, self-clearing race, so a bounded retry recovers it (the flaky
+/// `test (ubuntu-latest)` `end_reaps` / `session_relays` spawn failures). In production the
+/// base binary is pre-existing and never write-open, so this path is effectively test-only;
+/// a genuine spawn error (missing binary / `EACCES`) returns at once. `tokio`'s
+/// `Command::spawn` is itself synchronous, so a bounded `std` sleep here matches the call it
+/// wraps.
+pub(crate) fn spawn_retrying_etxtbsy(
+    cmd: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    // ~600ms ceiling (30 × 20ms); the race window is sub-millisecond in practice, so this
+    // usually returns on the first or second attempt.
+    for _ in 0..30 {
+        match cmd.spawn() {
+            Err(e) if is_text_file_busy(&e) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+    cmd.spawn() // final attempt surfaces the real error if still busy
+}
+
 /// The user's home directory, derived without pulling in the `dirs` crate:
 /// `$HOME` on Unix, `%USERPROFILE%` (then `%HOMEDRIVE%%HOMEPATH%`) on Windows.
 pub(crate) fn home_dir() -> Option<PathBuf> {
