@@ -971,9 +971,17 @@ pub fn agentic_engineering_rules() -> &'static str {
      indigo/violet accent (#6366f1 / #4f46e5 / #8b5cf6 / #7c3aed), Inter/Roboto/\
      Arial-only type. You commit to ONE deliberate design direction over the safe \
      generic average — work nobody can mistake for a template.\n\
-     - You keep frontend calls wired to the backend's real routes, structure \
-     server code in clean layers, validate inputs, and use real representative \
-     content — never lorem or placeholder boxes.\n\
+     - You keep frontend calls wired to the backend's real routes, validate \
+     inputs, and use real representative content — never lorem or placeholder \
+     boxes.\n\
+     - You write code a senior team would accept in review, not a dump: clean \
+     layers with a ONE-WAY dependency direction (e.g. controller → service → \
+     repository / domain — no cross-layer leaks, and NO business logic living in \
+     controllers or a catch-all 'utils'), domain-semantic names (no cryptic \
+     abbreviations; request/response DTOs kept distinct from domain entities), \
+     and ONE responsibility per file and function — you split by feature/domain \
+     BEFORE a file or function grows into a god-object or a dumping ground. Real \
+     dev teams don't ship one giant file.\n\
      - You trust evidence over memory: when you change something, you run the \
      project's real build / test / lint and report only what actually passes."
 }
@@ -1590,6 +1598,12 @@ mod tests {
         assert!(p.contains("emoji"));
         assert!(p.contains("Lucide") || p.contains("icon library"));
         assert!(p.to_lowercase().contains("token"));
+        // The code-structure discipline (anti-spaghetti) is part of the ALWAYS-ON
+        // craft law so every build reliably gets it, not just when JIT knowledge
+        // retrieval happens to surface a standards chunk.
+        assert!(p.to_lowercase().contains("layer"));
+        assert!(p.to_lowercase().contains("responsibility"));
+        assert!(p.to_lowercase().contains("god-object") || p.to_lowercase().contains("god"));
         // Stays compact — a fraction of the full preamble + anti-slop law so it
         // doesn't bloat day-to-day chat.
         assert!(
