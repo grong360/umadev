@@ -1068,6 +1068,10 @@ async fn drive_director_loop_with_idle(
 
     let mut next_directive = first_directive;
     let mut last_reply = String::new();
+    // Change 2 (single-turn twin): did this build go through blocking-item rework? A round
+    // past 0 is a fix turn, so the build was reworked → the ONE integrated final report
+    // supersedes report A at the settle. A clean round-0 build keeps its reply untouched.
+    let mut reworked = false;
 
     for round in 0..MAX_QC_ROUNDS {
         // Wall-clock ceiling (graceful): a fix round past the budget is abandoned —
@@ -1088,26 +1092,32 @@ async fn drive_director_loop_with_idle(
         // no plan → nothing emitted, current behaviour.
         if round == 0 {
             mark_ready_steps(&mut plan, events, StepStatus::Active);
+        } else {
+            // Change 2: a round past 0 is a FIX turn — the build went through rework.
+            reworked = true;
         }
 
         // 1. Drive ONE end-to-end base turn (build, or fix-the-QC-findings). The
         //    base runs its own agentic tool loop (PM→…→QA internally) and writes
         //    real files under the run-lock the caller holds (single-writer).
-        let turn =
-            match drive_one_turn(session, options, events, next_directive, idle, deadline).await {
-                Ok(t) => t,
-                // A base-reported turn failure (an API error like a 429 rate limit)
-                // carries the base's OWN error text. Run it through the actionable
-                // classifier so the run's terminal failure NAMES the fix while keeping
-                // the raw error — never an anonymous stop. Fail-open: an
-                // unclassifiable reason surfaces verbatim (never swallowed).
-                Err(reason) => {
-                    return DirectorLoopOutcome::Failed(crate::base_error::diagnose_turn_failure(
-                        &reason,
-                        &options.backend,
-                    ))
-                }
-            };
+        // Change 1: defer the base's premature project-level wrap-up on this mid-run turn
+        // (round-0 build or a fix round) — narration stays, only the "## Next steps"
+        // conclusion is held back; the integrated final report comes at convergence.
+        let directive = format!("{next_directive}{}", wrapup_suppression_note());
+        let turn = match drive_one_turn(session, options, events, directive, idle, deadline).await {
+            Ok(t) => t,
+            // A base-reported turn failure (an API error like a 429 rate limit)
+            // carries the base's OWN error text. Run it through the actionable
+            // classifier so the run's terminal failure NAMES the fix while keeping
+            // the raw error — never an anonymous stop. Fail-open: an
+            // unclassifiable reason surfaces verbatim (never swallowed).
+            Err(reason) => {
+                return DirectorLoopOutcome::Failed(crate::base_error::diagnose_turn_failure(
+                    &reason,
+                    &options.backend,
+                ))
+            }
+        };
         last_reply = turn.text.clone();
 
         // 2. On the FIRST turn only: if the base didn't claim it built/changed code
@@ -1183,7 +1193,15 @@ async fn drive_director_loop_with_idle(
                 events,
             )
             .await;
-            return DirectorLoopOutcome::Done { reply: last_reply };
+            // Change 2: on a REWORKED build, supersede the (now-stale) report A with ONE
+            // integrated final report; a clean round-0 build keeps its reply (fail-open).
+            return DirectorLoopOutcome::Done {
+                reply: if reworked {
+                    integrated_final_report(session, options, events, last_reply, deadline).await
+                } else {
+                    last_reply
+                },
+            };
         }
 
         // 5. QC found blocking problems. Out of fix budget → settle (the caller's
@@ -1204,7 +1222,15 @@ async fn drive_director_loop_with_idle(
             // SIZING calibration: the cheap path burned its whole QC fix budget without
             // clearing → the work was HEAVIER than the single-turn sizing assumed.
             record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Heavy);
-            return DirectorLoopOutcome::Done { reply: last_reply };
+            // Change 2: this settle is always a reworked path (a fix round ran) — produce
+            // the ONE integrated final report; fail-open to the existing reply.
+            return DirectorLoopOutcome::Done {
+                reply: if reworked {
+                    integrated_final_report(session, options, events, last_reply, deadline).await
+                } else {
+                    last_reply
+                },
+            };
         }
 
         // 6. Fold the QC findings into ONE fix directive and feed it back over the
@@ -1220,7 +1246,15 @@ async fn drive_director_loop_with_idle(
     // SIZING calibration: exhausting the bounded rounds means the work outran the
     // single-turn sizing → HEAVY actual outcome. Advisory, fail-open.
     record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Heavy);
-    DirectorLoopOutcome::Done { reply: last_reply }
+    // Change 2: the loop only reaches here after fix rounds ran → produce the ONE
+    // integrated final report (fail-open to the existing reply).
+    DirectorLoopOutcome::Done {
+        reply: if reworked {
+            integrated_final_report(session, options, events, last_reply, deadline).await
+        } else {
+            last_reply
+        },
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1294,6 +1328,11 @@ async fn drive_plan_steps(
     )));
 
     let mut last_reply = String::new();
+    // Change 2: did the build actually go through blocking-item rework? Set true when a
+    // review step fired a fix turn OR the final gate ran a fix turn. Only then is the ONE
+    // integrated final report produced at convergence — a clean build (no blockers) keeps
+    // the last build step's reply as its correct final result (no extra turn).
+    let mut reworked = false;
     let mut transitions = 0usize;
     // The running count of completed BUILD steps — the "work turn" tally that the
     // active fact-extraction backstop throttles on (see `crate::fact_extract`).
@@ -1398,10 +1437,14 @@ async fn drive_plan_steps(
             drove,
             made_progress,
             gap_evidence,
+            reworked: step_reworked,
         } = outcome;
         if !reply.is_empty() {
             last_reply = reply;
         }
+        // Change 2: a review step that fired blocking-item rework marks the whole build
+        // as reworked, so the integrated final report supersedes the (now-stale) report A.
+        reworked |= step_reworked;
 
         // MEDIUM #2 (first-step bail) — FIX: reset the just-marked Active step BEFORE
         // bailing. If the FIRST step is a Build that could not drive a single turn (a
@@ -1577,6 +1620,23 @@ async fn drive_plan_steps(
     .await;
     if !final_gate.reply.is_empty() {
         last_reply = final_gate.reply;
+        // Change 2: the final gate ran a fix turn → the build went through rework, so the
+        // last build step's report A is stale (it predates this fix).
+        reworked = true;
+    }
+
+    // Change 2: the build has CONVERGED. If it actually went through blocking-item rework
+    // (a review-step fix turn OR the final gate's fix turn), the base's earlier streamed
+    // "here's what I did — ## Next steps" (report A) is stale — it can't reflect the
+    // blocking-item fixes or the plan/dependency changes they caused. Drive ONE governed
+    // turn on the MAIN continuous session (which holds the full build + rework history) to
+    // produce the holistic final report, and record THAT as the reply the user sees. A
+    // clean build (no rework) skips this entirely and keeps the last build step's reply.
+    // FAIL-OPEN: a dead/empty turn degrades to the existing `last_reply` (never lost). This
+    // runs AFTER `run_final_gate` and BEFORE the structured completion artifacts below,
+    // which stay untouched (they were already emitted post-convergence).
+    if reworked {
+        last_reply = integrated_final_report(session, options, events, last_reply, deadline).await;
     }
 
     // Persist the plan's terminal state for resume.
@@ -1667,6 +1727,10 @@ fn run_actual_size_from_plan(plan: &Plan) -> crate::sizing_calibration::SizeRank
 /// "accepted" step that did NO real verifiable work (a dead Build turn that only
 /// cleared a neutral skip, or an empty-team ReviewClean) is accepted-but-not-progress,
 /// so the scheduler marks it Blocked rather than falsely ticking it Done.
+// The four flags are INDEPENDENT honest observations of one step's outcome (accepted /
+// drove-a-turn / made-real-progress / fired-rework), not a state machine — collapsing
+// them into an enum would lose the orthogonal signals the scheduler reads separately.
+#[allow(clippy::struct_excessive_bools)]
 struct StepOutcome {
     /// Whether the step's acceptance is satisfied (passed or fail-open neutral skip).
     accepted: bool,
@@ -1686,6 +1750,13 @@ struct StepOutcome {
     /// blocked, not just that it did. Empty on an accepted step or a neutral skip that
     /// produced no verifiable failure.
     gap_evidence: Vec<String>,
+    /// Whether this step actually FIRED blocking-item rework — a review step that found
+    /// MUST-FIX findings and drove a fix turn on the main session (Change 2). It is the
+    /// signal the scheduler folds into the run-level `reworked` flag so the ONE integrated
+    /// final report is produced only when the build truly went through rework (a clean
+    /// build keeps the last build step's reply as its final word). A Build step never sets
+    /// this: its own fix rounds are already reflected in its final reply.
+    reworked: bool,
 }
 
 /// The overall-goal preamble prepended to every plan-step directive — the directive
@@ -1708,6 +1779,84 @@ fn step_goal_frame(options: &RunOptions) -> String {
          You are continuing the delivery plan for that goal; complete the current \
          step below in service of it.\n\n## Current step\n"
     )
+}
+
+/// A TARGETED directive addendum (Change 1) that DEFERS the base's premature final
+/// wrap-up while a step is still running. The base streams its own "here's what I did
+/// — ## Next steps …" conclusion the instant a doer step finishes — BEFORE the team
+/// review + blocking-item rework runs — so when there ARE blockers that conclusion is
+/// stale (it can't reflect fixes or the plan/dependency changes they caused). This
+/// note tells the base to keep NARRATING its concrete working actions (unchanged) but
+/// to hold back only the project-level DONE / next-steps CONCLUSION this turn; the
+/// single integrated final report is written once the whole build converges (after
+/// review + any rework — see [`integrated_final_report_directive`]). Appended to the
+/// mid-run doer / review-fix / single-turn directives, NEVER to the integrated-summary
+/// directive (that one WANTS the conclusion).
+pub(crate) fn wrapup_suppression_note() -> &'static str {
+    "\n\n## Stay mid-run — do NOT write the final wrap-up yet\n\
+     This is one step of a build that is still being reviewed and hardened, not the \
+     end. Keep narrating the concrete actions you take as you work, but do NOT close \
+     this turn with a project-level conclusion — no final \"summary\", \"## Next \
+     steps\", \"## 下一步\", or \"完成汇报\" block. The single, integrated final report is \
+     written only after the whole build converges (after team review and any \
+     blocking-item rework)."
+}
+
+/// The directive (Change 2) that drives the ONE integrated final report at convergence,
+/// AFTER the review → rework loop has settled. Because the base session is CONTINUOUS
+/// (it accumulated the full build + every rework across steps), the base can produce a
+/// holistic report from its OWN context — UmaDev keeps no critic verdicts agent-side.
+/// This is the wrap-up deferred by [`wrapup_suppression_note`], so it explicitly WANTS
+/// the conclusion (no suppression appended). Emitted only when the build actually went
+/// through blocking-item rework; a clean build keeps the last build step's reply as-is.
+fn integrated_final_report_directive(options: &RunOptions) -> String {
+    let req = options.requirement.trim();
+    let goal = if req.is_empty() {
+        String::new()
+    } else {
+        format!("## The product being delivered\n{req}\n\n")
+    };
+    format!(
+        "{goal}The build has now converged: the team reviewed the work and every \
+         blocking item raised in review has been worked through. Write the SINGLE, \
+         integrated final report for this build now — this is the wrap-up you deferred \
+         while the steps were still running. Ground it entirely in what actually \
+         happened in this session (you hold the full history). Do NOT open new work or \
+         edit files — just report, concisely:\n\
+         - What was ultimately delivered, and its real, current state.\n\
+         - Which blocking / must-fix items the review surfaced, and HOW each was resolved.\n\
+         - Any changes to the plan or task dependencies those fixes caused.\n\
+         - Anything the user should know or do next.\n\
+         Write the report in the same language you have been working in this session."
+    )
+}
+
+/// Drive the ONE integrated final report ([`integrated_final_report_directive`]) on the
+/// MAIN continuous session and return it as the reply the user sees as the build's final
+/// word. FAIL-OPEN by contract: a turn that errors (dead/hung session) or comes back
+/// empty degrades to `current` (the existing `last_reply`), so the reply is never lost —
+/// the extra turn can only IMPROVE the reported result, never crash or blank it. Bounded
+/// by the same `deadline` as every other governed turn.
+async fn integrated_final_report(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    current: String,
+    deadline: std::time::Instant,
+) -> String {
+    match drive_one_turn(
+        session,
+        options,
+        events,
+        integrated_final_report_directive(options),
+        IdleBudget::from_env(),
+        deadline,
+    )
+    .await
+    {
+        Ok(t) if !t.text.trim().is_empty() => t.text,
+        _ => current,
+    }
 }
 
 /// A COMPACT plan-progress recitation appended to each step directive — the
@@ -1958,6 +2107,9 @@ async fn drive_build_step(
                 // has_positive_evidence) condition that let it accept here.
                 made_progress: true,
                 gap_evidence: Vec::new(), // accepted → no gap to re-plan around
+                // A Build step's own fix rounds are already reflected in its final reply;
+                // only review/final-gate rework triggers the integrated final report.
+                reworked: false,
             };
         }
         // SELF-EVOLUTION (a SIDE EFFECT of this FAILING verdict — never a driver of
@@ -2027,6 +2179,7 @@ async fn drive_build_step(
         // The last failing round's typed evidence — WHY this step could not pass its
         // acceptance — so a bounded re-plan can route around the diagnosed blocker.
         gap_evidence: prior_fail_errors,
+        reworked: false, // a Build step never fires the run-level integrated-report rework
     }
 }
 
@@ -2120,6 +2273,7 @@ async fn drive_review_step(
             drove: reviewed,
             made_progress: reviewed,
             gap_evidence: Vec::new(), // review accepted → no gap
+            reworked: false,          // no blocking finding → no fix turn fired
         };
     }
     // Wall-clock ceiling: the team found blocking issues, but the budget is already
@@ -2139,6 +2293,7 @@ async fn drive_review_step(
             drove: false,
             made_progress: true,
             gap_evidence: Vec::new(), // advisory review deferred to the final gate
+            reworked: false,          // budget spent before any fix turn ran
         };
     }
     // The team found blocking issues — fold them into ONE bounded fix turn on the
@@ -2199,6 +2354,10 @@ async fn drive_review_step(
                 // The corroborating floor lines — WHY this review step is not clean — so
                 // a bounded re-plan (only if it strands dependents) can route around it.
                 gap_evidence: corroboration,
+                // A blocking-item fix turn DID run on the main session (repair above), so
+                // the build went through rework → the integrated final report supersedes
+                // the (now-stale) report A.
+                reworked: true,
             };
         }
         // NOT corroborated — a bare critic opinion only. Invariant 2 holds: advisory,
@@ -2219,6 +2378,9 @@ async fn drive_review_step(
         drove,
         made_progress: true,
         gap_evidence: Vec::new(), // review accepted (advisory) → no gap to re-plan
+        // A blocking-item fix turn ran on the main session (the repair above), so the
+        // build went through rework → trigger the integrated final report at convergence.
+        reworked: true,
     }
 }
 
@@ -5234,12 +5396,14 @@ mod tests {
 
         let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
         assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // Exactly MAX_QC_ROUNDS base build turns were driven, then the loop settled
-        // gracefully — the fix loop is BOUNDED, never an open-ended grind.
+        // Exactly MAX_QC_ROUNDS base build/fix turns were driven — the fix loop is
+        // BOUNDED, never an open-ended grind — PLUS the ONE integrated final-report turn
+        // (Change 2) at convergence, because this settle went through rework (fix rounds
+        // ran). The +1 is a single, bounded convergence turn, not another fix round.
         assert_eq!(
             sent.lock().unwrap().len(),
-            MAX_QC_ROUNDS,
-            "the fix loop is bounded by MAX_QC_ROUNDS"
+            MAX_QC_ROUNDS + 1,
+            "the fix loop is bounded by MAX_QC_ROUNDS, then one integrated final report closes it"
         );
     }
 
@@ -7144,6 +7308,14 @@ mod tests {
             sent.iter().any(|d| d.contains("Build the UI")),
             "the ui step got its own focused directive: {sent:?}"
         );
+        // Change 2: a CLEAN build (no blocking-item rework) must NOT drive the extra
+        // integrated final-report turn — the last build step's reply is the final word.
+        assert!(
+            !sent
+                .iter()
+                .any(|d| d.contains("integrated final report for this build")),
+            "a clean build drives no integrated final-report turn: {sent:?}"
+        );
         // FIX #6: each per-step directive HARD-scopes the base to ONE step (the root
         // fix for "the base builds the whole project in step 1's turn"). The focused
         // directive must carry the single-step constraint phrasing.
@@ -7692,6 +7864,92 @@ mod tests {
             !order.contains(&"api".to_string()) && !order.contains(&"ui".to_string()),
             "stranded dependents were never driven (rework obviated): {order:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn reworked_step_build_drives_one_integrated_final_report() {
+        // Change 2 (step path): when the build actually goes through blocking-item
+        // rework — a review step finds MUST-FIX findings and drives a fix turn — the
+        // base's premature "## Next steps" report A is stale, so at convergence the
+        // scheduler drives ONE integrated final-report turn on the MAIN session and
+        // records THAT as the reply. Proven by the integrated-report DIRECTIVE being
+        // sent (only this change emits it); the clean counterpart above asserts the
+        // negative (no such directive on a clean build).
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // the build step's source-present acceptance passes
+        let (events, _rec) = sink();
+        // can_fork=true + a blocking verdict → the review team raises a MUST-FIX finding,
+        // which folds into a fix turn on the main session (the rework this test needs).
+        let turns: Vec<Vec<SessionEvent>> = std::iter::once(text_turn(
+            "Built the feature end to end. ## Next steps: ship it.",
+        ))
+        .chain((0..8).map(|_| text_turn("Reworked and re-verified.")))
+        .collect();
+        let mut sess = FakeSession::new(
+            turns,
+            true,
+            r#"{"accepts": false, "blocking": ["登录失败路径缺测试"]}"#,
+        );
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的登录产品".to_string();
+        let route = build_route(); // team = [FrontendEngineer] → a seat actually reviews
+        let mut plan = Plan {
+            steps: vec![
+                PlanStep {
+                    id: "impl".into(),
+                    title: "Implement the login".into(),
+                    seat: crate::critics::Seat::FrontendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: vec![],
+                    acceptance: AcceptanceSpec::SourcePresent,
+                    evidence: Vec::new(),
+                    status: StepStatus::Pending,
+                },
+                PlanStep {
+                    id: "review".into(),
+                    title: "Cross-review".into(),
+                    seat: crate::critics::Seat::QaEngineer,
+                    kind: StepKind::Review,
+                    depends_on: vec!["impl".into()],
+                    acceptance: AcceptanceSpec::ReviewClean,
+                    evidence: Vec::new(),
+                    status: StepStatus::Pending,
+                },
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+
+        let sent = sent.lock().unwrap();
+        // The ONE integrated final-report turn fired at convergence (its distinctive
+        // directive was sent) — this only happens on the reworked path.
+        assert!(
+            sent.iter()
+                .any(|d| d.contains("integrated final report for this build")),
+            "a reworked build drives the integrated final-report turn: {sent:?}"
+        );
+        // And the final reply is NOT the premature report A (it was superseded).
+        match outcome {
+            Some(DirectorLoopOutcome::Done { reply }) => assert!(
+                !reply.contains("## Next steps"),
+                "report A was superseded by the integrated final report: {reply:?}"
+            ),
+            other => panic!("expected Done, got {other:?}"),
+        }
     }
 
     // ── First-pass acceptance signal: the measured engineering-doctrine telemetry

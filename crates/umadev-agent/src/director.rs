@@ -364,6 +364,11 @@ fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> Stri
         directive.push_str(kd);
         directive.push('\n');
     }
+    // Change 1: this is a MID-RUN doer turn — defer the premature project-level wrap-up
+    // (the base's "## Next steps" conclusion that streams the instant a step finishes,
+    // before review + rework). The base still narrates its actions; the integrated final
+    // report comes only after the whole build converges. See `wrapup_suppression_note`.
+    directive.push_str(crate::director_loop::wrapup_suppression_note());
     directive
 }
 
