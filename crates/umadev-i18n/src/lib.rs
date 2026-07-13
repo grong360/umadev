@@ -387,7 +387,18 @@ mod tests {
             "tui.hint.typed",
             "tui.hint.finished",
             "tui.hint.running",
-            "tui.hint.idle",
+            // The rotating idle-empty input placeholders (the `Enter 提交` /
+            // `/help 查看全部命令` chips moved off the meta row into this pool).
+            "input.idle",
+            "input.ph.dashboard",
+            "input.ph.help",
+            "input.ph.todo",
+            "input.ph.plan",
+            "input.ph.landing",
+            "input.ph.design",
+            "input.ph.fix",
+            "input.ph.keys",
+            "input.ph.blog",
             // Phase-2-C-P1: the persistent token/cost gauge in the meta row, and
             // the idle double-Esc rewind hint.
             "tui.gauge.tokens",
@@ -490,6 +501,11 @@ mod tests {
             "chat.turn_failed",
             "chat.turn_failed_retrying",
             "chat.director_build_with_history",
+            // Outstanding background sub-agents (the premature-final-report
+            // guard): the bounded "wait for your agents" re-drive announcement
+            // and the honest settled-with-outstanding-work note.
+            "bg.redrive",
+            "bg.outstanding_note",
             "gate.clarify_write_failed",
             // P2-D: gate-card artifact health labels (were hard-coded English).
             "gate.detail.missing",

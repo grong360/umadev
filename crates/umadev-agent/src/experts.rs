@@ -983,7 +983,10 @@ pub fn agentic_engineering_rules() -> &'static str {
      BEFORE a file or function grows into a god-object or a dumping ground. Real \
      dev teams don't ship one giant file.\n\
      - You trust evidence over memory: when you change something, you run the \
-     project's real build / test / lint and report only what actually passes."
+     project's real build / test / lint and report only what actually passes.\n\
+     - You never conclude or report completion while your own background agents \
+     or tasks are still running — you wait for them, collect every result, and \
+     only then write the final report."
 }
 
 /// The director's build-turn preamble — the USB / smart-hardware model of
@@ -1604,6 +1607,10 @@ mod tests {
         assert!(p.to_lowercase().contains("layer"));
         assert!(p.to_lowercase().contains("responsibility"));
         assert!(p.to_lowercase().contains("god-object") || p.to_lowercase().contains("god"));
+        // The background-agent discipline: never conclude while your own
+        // background agents are outstanding (the premature-final-report guard's
+        // prompt-side belt).
+        assert!(p.contains("background agents"));
         // Stays compact — a fraction of the full preamble + anti-slop law so it
         // doesn't bloat day-to-day chat.
         assert!(

@@ -603,6 +603,11 @@ async fn drive_phase(
                     return PhaseResult::Failed(format!("respond: {e}"));
                 }
             }
+            SessionEvent::BackgroundTask(_) => {
+                // Background-agent lifecycle frames drive the outstanding-agents
+                // settle guard on the modern pumps (director step pump / chat
+                // drain); the legacy env-gated phase walk ignores them (fail-open).
+            }
             SessionEvent::TurnDone { status, .. } => {
                 return finish_turn(options, events, phase, status)
             }
@@ -1927,6 +1932,14 @@ async fn drive_rework_turn_with_idle(
     // base re-runs its build/test to fix the cause), which go silent for minutes, so
     // an in-flight tool gets the extended window before the watchdog calls it a hang.
     let mut in_tool_call = false;
+    // Outstanding-background-agents guard (the premature-final-report fix): this
+    // pump drives the director loop's DOER steps (`director::summon`), where the
+    // base may dispatch its own background sub-agents and then end the turn while
+    // they still run. A `Completed` settle with agents outstanding becomes a
+    // bounded "wait for your agents, collect their results, THEN report" re-drive
+    // (at most `bg_agents::MAX_BG_REDRIVES` per turn, never past the deadline).
+    // Fail-open: no background signal → zero count → today's behavior.
+    let mut bg = crate::bg_agents::BgAgentTracker::new();
     // Idle watchdog (P1-11): this rework pump (reused by `governance_catchup` /
     // `review_and_rework` / the director's `summon`) was a naked
     // `next_event().await` — a base that hangs mid-rework would freeze every
@@ -2013,6 +2026,8 @@ async fn drive_rework_turn_with_idle(
         if let Some(t) = crate::director_loop::tool_phase_transition(&ev) {
             in_tool_call = t;
         }
+        // Feed the outstanding-background-agents guard (cheap, fail-open).
+        bg.observe(&ev);
         match ev {
             SessionEvent::TextDelta(delta) => {
                 est_tokens = est_tokens.saturating_add(crate::director_loop::approx_tokens(&delta));
@@ -2072,7 +2087,46 @@ async fn drive_rework_turn_with_idle(
                     };
                 }
             }
+            SessionEvent::BackgroundTask(_) => {
+                // Already folded into the tracker above; carries no render row.
+            }
             SessionEvent::TurnDone { status, usage } => {
+                // Outstanding-background-agents guard: a CLEAN finish while the
+                // doer's own background sub-agents still run is a premature settle
+                // (the step would be verified against work that hasn't landed, and
+                // a later teardown would kill the agents mid-write). Convert it
+                // into a bounded "wait for your agents, collect, THEN report"
+                // re-drive — at most `bg_agents::MAX_BG_REDRIVES` per turn, never
+                // past the deadline. Truncated is NOT re-driven (a cap was hit).
+                if matches!(status, TurnStatus::Completed)
+                    && std::time::Instant::now() < deadline
+                    && bg.begin_redrive()
+                {
+                    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "bg.redrive",
+                        &[
+                            &bg.outstanding().to_string(),
+                            &bg.redrives().to_string(),
+                            &crate::bg_agents::MAX_BG_REDRIVES.to_string(),
+                        ],
+                    )));
+                    let wait = bg.wait_directive();
+                    est_tokens =
+                        est_tokens.saturating_add(crate::director_loop::approx_tokens(&wait));
+                    if session.send_turn(wait).await.is_ok() {
+                        in_tool_call = false;
+                        continue;
+                    }
+                    // Send failed → the session is going away; settle honestly.
+                }
+                if matches!(status, TurnStatus::Completed | TurnStatus::Truncated)
+                    && bg.outstanding() > 0
+                {
+                    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "bg.outstanding_note",
+                        &[&bg.outstanding().to_string()],
+                    )));
+                }
                 // Record this turn's usage on the DEFAULT loop (fail-open). F3:
                 // prefer the base's REAL reported usage (claude/codex), falling
                 // back to the chars/4 estimate (opencode, or any base that didn't
@@ -5024,6 +5078,63 @@ mod tests {
             *interrupts.lock().unwrap(),
             1,
             "the watchdog issued its best-effort interrupt before settling"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_rework_turn_redrives_on_outstanding_bg_agents_then_settles_bounded() {
+        // Report-1 fix on the DOER pump (`director::summon` flows through here): a
+        // step turn that completes while the base's own background sub-agents still
+        // run is re-driven with a "wait for your agents" directive; agents that never
+        // resolve exhaust MAX_BG_REDRIVES and the turn settles (terminating) as done.
+        use umadev_runtime::BackgroundTaskSignal;
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, rec) = sink();
+        let stuck_turn = || {
+            vec![
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
+                    id: "agent-1".to_string(),
+                }),
+                SessionEvent::TextDelta("premature report".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ]
+        };
+        let mut session = FakeBaseSession::new(vec![stuck_turn(), stuck_turn(), stuck_turn()]);
+        let sent = session.sent_handle();
+
+        let turn = drive_rework_turn_with_idle(
+            &mut session,
+            &options,
+            &events,
+            "do the step".to_string(),
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await;
+
+        assert!(turn.done, "the bounded settle still completes the turn");
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1 + usize::from(crate::bg_agents::MAX_BG_REDRIVES),
+            "one step directive + exactly MAX_BG_REDRIVES bg re-drives: {sent:?}"
+        );
+        assert!(
+            sent[1].contains("background"),
+            "the re-drive is the wait-for-your-agents corrective: {}",
+            sent[1]
+        );
+        // The settle is honest about the still-outstanding agent.
+        assert!(
+            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("git status"))) >= 1,
+            "settling with outstanding agents must say so"
         );
     }
 

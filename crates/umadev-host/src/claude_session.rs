@@ -46,7 +46,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use umadev_runtime::{
-    ApprovalDecision, BaseSession, SessionError, SessionEvent, TurnStatus, Usage,
+    ApprovalDecision, BackgroundTaskSignal, BaseSession, SessionError, SessionEvent, TurnStatus,
+    Usage,
 };
 
 use crate::spawn_parts;
@@ -230,6 +231,20 @@ impl ClaudeSession {
         // untouched. Set on every spawned `claude` (main + read-only fork) so the
         // governance scope is consistent across the session's process tree.
         cmd.env(crate::GOVERN_ROOT_ENV, workspace);
+        // Belt for the base's OWN background sub-agents: in `--print` mode claude
+        // waits at wind-down (stdin closed, main thread done) for outstanding
+        // background tasks only up to a ceiling (default 600000 ms = 10 min), then
+        // sweeps them — killing a still-running background agent mid-write. Raise
+        // the ceiling so headless waits longer before sweeping. The user's own
+        // value always wins (only set when absent); the PRIMARY guard against a
+        // premature final report is the observable outstanding-agents counter +
+        // bounded re-drive in the orchestrator, which works on every base.
+        if std::env::var_os(crate::claude::PRINT_BG_WAIT_CEILING_ENV).is_none() {
+            cmd.env(
+                crate::claude::PRINT_BG_WAIT_CEILING_ENV,
+                crate::claude::PRINT_BG_WAIT_CEILING_DEFAULT_MS,
+            );
+        }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -562,13 +577,19 @@ fn maybe_divert_firmware(
 /// PreToolUse hook + the per-tool floor still gate its mutations). Every tool here is
 /// read-only / side-effect-free, so pre-approving them bypasses NO write governance.
 /// Honors the "inject NOTHING — the base's native capabilities run" contract.
-const GUARDED_ALLOWED_TOOLS: &str = "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,Agent,Task";
+/// `TaskOutput` / `BashOutput` / `AgentOutput` (current + legacy names) READ a
+/// background task's status/output — pre-approved so the base can collect its own
+/// background sub-agents' results (the outstanding-agents settle guard re-drives it
+/// to do exactly that) without eating an approval pause; `KillShell` mutates (stops
+/// a task) and stays gated.
+const GUARDED_ALLOWED_TOOLS: &str =
+    "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,Agent,Task,TaskOutput,BashOutput,AgentOutput";
 
 /// AUTO additionally pre-approves the MUTATING working set (`Edit` / `Write` / `Bash`
 /// / `NotebookEdit`) so an unattended autonomous run is never interrupted by a
 /// per-tool prompt — the autonomy tier the user opted into.
-const AUTO_ALLOWED_TOOLS: &str =
-    "Read,Edit,Write,Bash,Grep,Glob,WebSearch,WebFetch,TodoWrite,NotebookEdit,Agent,Task";
+const AUTO_ALLOWED_TOOLS: &str = "Read,Edit,Write,Bash,Grep,Glob,WebSearch,WebFetch,TodoWrite,\
+     NotebookEdit,Agent,Task,TaskOutput,BashOutput,AgentOutput";
 
 /// The `--allowedTools` value for an autonomy tier: AUTO pre-approves the mutating set
 /// too; GUARDED / plan pre-approves only the read-only + research + sub-agent set so
@@ -653,6 +674,17 @@ fn push_max_turns(args: &mut Vec<String>, max_turns: Option<u32>) {
 /// `acceptEdits` (write unattended); otherwise `default` (claude asks before
 /// each tool → a `NeedApproval` the orchestrator answers, the guarded
 /// human-in-the-loop tier). `UMADEV_CLAUDE_PERMISSION_MODE` overrides both.
+///
+/// **Full-bypass passthrough (documented contract).** Because UmaDev always
+/// passes an EXPLICIT `--permission-mode`, a user who configured claude's own
+/// full bypass (`permissions.defaultMode: "bypassPermissions"` in their claude
+/// settings) is otherwise DOWNGRADED — the CLI flag beats their settings. The
+/// supported way to keep full bypass under UmaDev is
+/// `UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions` (or `dontAsk`): the
+/// override is passed through verbatim on BOTH tiers (locked by test below).
+/// UmaDev deliberately does not auto-read the user's claude settings to infer
+/// bypass — an explicit opt-in keeps the irreversible-action floor from being
+/// silently dropped.
 ///
 /// **Guarded-tier awareness guard (labeling fix, not a lifecycle change).**
 /// UmaDev's Guarded tier drives the base through per-tool `NeedApproval` prompts
@@ -907,6 +939,14 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
                     return vec![SessionEvent::SessionModel(model.to_string())];
                 }
             }
+            // Background sub-agent lifecycle frames (`task_started` /
+            // `task_notification` / `background_tasks_changed`) — surfaced so the
+            // orchestrator can refuse to settle a turn as "done" while the base's
+            // OWN background agents are still running (the premature-final-report
+            // fix). Fail-open: a non-task system frame yields no event, as before.
+            if let Some(ev) = background_task_event(&v) {
+                return vec![ev];
+            }
             vec![]
         }
         // keep_alive, status, tool_progress, … → not events.
@@ -1006,6 +1046,90 @@ fn describe_system_event(v: &Value) -> String {
         format!("subtype={subtype}")
     } else {
         format!("subtype={subtype} session_id={session}")
+    }
+}
+
+/// Whether a claude background-task type string names a SUB-AGENT (vs a
+/// background shell / teammate). claude's task-type vocabulary:
+/// `local_agent` / `remote_agent` / `agent` are sub-agents; `bash` /
+/// `local_bash` (background shells), `local_workflow`, `in_process_teammate`
+/// are not. A shell must never be counted as an outstanding agent — a dev
+/// server the base deliberately leaves running would otherwise wedge every
+/// settle. Conservative: an unknown type is NOT an agent (fail-open toward
+/// never over-waiting).
+fn task_type_is_agent(task_type: &str, subagent_type: &str) -> bool {
+    task_type.contains("agent") || !subagent_type.trim().is_empty()
+}
+
+/// Translate one `system` background-task frame into a
+/// [`SessionEvent::BackgroundTask`], or `None` for any other system frame.
+///
+/// Ground truth (claude 2.1.x stream-json):
+/// - `{"type":"system","subtype":"task_started","task_id":…,"task_type":…,
+///   "subagent_type":…}` — a background task started. Surfaced ONLY when the
+///   task is a sub-agent ([`task_type_is_agent`]).
+/// - `{"type":"system","subtype":"task_notification","task_id":…,"status":…}`
+///   — a task reached a state; `completed` / `failed` / `stopped` are
+///   terminal → `Finished`. A non-terminal `running` / `pending` yields no
+///   event.
+/// - `{"type":"system","subtype":"background_tasks_changed","tasks":
+///   [{"task_id":…,"task_type":…},…]}` — the LEVEL signal: the full live set,
+///   filtered here to sub-agents. Claude's own contract says consumers should
+///   REPLACE their set with each payload so a missed edge can't wedge a stale
+///   count.
+///
+/// Fail-open: a missing / non-string `task_id`, an unknown subtype, or any
+/// malformed payload yields `None` — never a panic. Exposed for tests.
+#[must_use]
+fn background_task_event(v: &Value) -> Option<SessionEvent> {
+    let subtype = v.get("subtype").and_then(Value::as_str)?;
+    match subtype {
+        "task_started" => {
+            let id = v
+                .get("task_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let task_type = v.get("task_type").and_then(Value::as_str).unwrap_or("");
+            let subagent = v.get("subagent_type").and_then(Value::as_str).unwrap_or("");
+            if !task_type_is_agent(task_type, subagent) {
+                return None; // a background shell / workflow — never waited on
+            }
+            Some(SessionEvent::BackgroundTask(
+                BackgroundTaskSignal::Started { id: id.to_string() },
+            ))
+        }
+        "task_notification" => {
+            let id = v
+                .get("task_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())?;
+            let status = v.get("status").and_then(Value::as_str).unwrap_or("");
+            if status == "running" || status == "pending" {
+                return None; // not terminal — the task is still live
+            }
+            Some(SessionEvent::BackgroundTask(
+                BackgroundTaskSignal::Finished { id: id.to_string() },
+            ))
+        }
+        "background_tasks_changed" => {
+            let tasks = v.get("tasks").and_then(Value::as_array)?;
+            let agent_ids = tasks
+                .iter()
+                .filter(|t| {
+                    task_type_is_agent(
+                        t.get("task_type").and_then(Value::as_str).unwrap_or(""),
+                        t.get("subagent_type").and_then(Value::as_str).unwrap_or(""),
+                    )
+                })
+                .filter_map(|t| t.get("task_id").and_then(Value::as_str))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            Some(SessionEvent::BackgroundTask(BackgroundTaskSignal::Live {
+                agent_ids,
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -1522,6 +1646,109 @@ mod tests {
             guarded_accept[accept_pos + 1],
             "acceptEdits",
             "a non-plan override is honored on the guarded tier"
+        );
+    }
+
+    #[test]
+    fn bypass_permissions_override_passes_through_on_both_tiers() {
+        // Report-2 contract: a user-level full bypass is expressible as
+        // `UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions` and must pass through
+        // VERBATIM on both tiers (UmaDev's explicit `--permission-mode` otherwise
+        // downgrades a claude-settings `defaultMode: bypassPermissions`).
+        let _lock = PERM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
+        std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", "bypassPermissions");
+        for autonomous in [true, false] {
+            let args = session_args("sid-b", None, autonomous, None);
+            let p = args.iter().position(|a| a == "--permission-mode").unwrap();
+            assert_eq!(
+                args[p + 1],
+                "bypassPermissions",
+                "bypassPermissions must pass through (autonomous={autonomous})"
+            );
+        }
+    }
+
+    #[test]
+    fn background_task_frames_surface_as_background_task_events() {
+        // task_started for an AGENT-typed task → Started.
+        let started = parse_stdout_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","task_type":"local_agent","description":"docs"}"#,
+        );
+        assert_eq!(
+            started,
+            vec![SessionEvent::BackgroundTask(
+                BackgroundTaskSignal::Started {
+                    id: "a1".to_string()
+                }
+            )]
+        );
+        // A background SHELL (a dev server) must NOT be surfaced — waiting on it
+        // would wedge every settle.
+        assert!(parse_stdout_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","task_type":"local_bash"}"#,
+        )
+        .is_empty());
+        // A subagent_type alone also marks an agent (older/newer shapes).
+        assert_eq!(
+            parse_stdout_line(
+                r#"{"type":"system","subtype":"task_started","task_id":"a2","subagent_type":"Explore"}"#,
+            ),
+            vec![SessionEvent::BackgroundTask(
+                BackgroundTaskSignal::Started {
+                    id: "a2".to_string()
+                }
+            )]
+        );
+        // Terminal task_notification → Finished (for ANY id — removal from an
+        // agents-only set is a harmless no-op for a shell id).
+        for status in ["completed", "failed", "stopped"] {
+            let line = format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"a1","status":"{status}"}}"#
+            );
+            assert_eq!(
+                parse_stdout_line(&line),
+                vec![SessionEvent::BackgroundTask(
+                    BackgroundTaskSignal::Finished {
+                        id: "a1".to_string()
+                    }
+                )],
+                "status {status} must be terminal"
+            );
+        }
+        // A non-terminal notification is NOT a completion.
+        for status in ["running", "pending"] {
+            let line = format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"a1","status":"{status}"}}"#
+            );
+            assert!(parse_stdout_line(&line).is_empty());
+        }
+        // The LEVEL signal replaces the set, filtered to agents only.
+        let level = parse_stdout_line(
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent"},{"task_id":"sh1","task_type":"bash"},{"task_id":"a3","task_type":"remote_agent"}]}"#,
+        );
+        assert_eq!(
+            level,
+            vec![SessionEvent::BackgroundTask(BackgroundTaskSignal::Live {
+                agent_ids: vec!["a1".to_string(), "a3".to_string()]
+            })]
+        );
+        // Fail-open: malformed frames yield no event, never a panic.
+        for bad in [
+            r#"{"type":"system","subtype":"task_started"}"#,
+            r#"{"type":"system","subtype":"task_notification","status":"completed"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":"x"}"#,
+        ] {
+            assert!(parse_stdout_line(bad).is_empty(), "must skip: {bad}");
+        }
+        // The init frame still surfaces the model (the task branch must not
+        // shadow it).
+        assert_eq!(
+            parse_stdout_line(r#"{"type":"system","subtype":"init","model":"m-1"}"#),
+            vec![SessionEvent::SessionModel("m-1".to_string())]
         );
     }
 

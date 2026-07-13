@@ -46,6 +46,7 @@ pub mod arch_fitness;
 pub mod ask_question;
 pub mod base_error;
 pub mod base_gate;
+pub mod bg_agents;
 pub mod checkpoint;
 pub mod coach;
 pub mod compaction;
@@ -109,6 +110,7 @@ pub use ask_question::{
     relay_or_passthrough as ask_question_relay_or_passthrough, set_prefer_text_questions,
     should_wait_for_question, surface as ask_question_surface, AskQuestionSurface, ExitPlanSurface,
 };
+pub use bg_agents::{BgAgentTracker, MAX_BG_REDRIVES};
 pub use checkpoint::{
     create_run_baseline, rollback_run, run_baseline, Checkpoint, RUN_BASELINE_PREFIX,
 };

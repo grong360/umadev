@@ -35,8 +35,20 @@
 "model.synced" = "已同步驱动模型 {}(来自 {})—— Agent 就用底座这个模型工作"
 "model.synced_default" = "{} 未在配置里固定模型 —— Agent 用它的登录/默认模型驱动(运行后可见真实模型)"
 "model.reasoning" = "思考强度 {}(底座配置,umadev 不覆盖)"
-"input.idle" = "问我任何事…（/help 查看命令）"
+"input.idle" = "问我任何事…"
 "input.aborted" = "本轮已中止 —— 重新输入需求再试"
+# 空闲输入框的轮换占位:示例需求（呼应欢迎语示例）+ 命令提示,每次提交后轮换一条;
+# 运行中/闸门/已完成等特殊状态优先,不参与轮换。原先常驻底部状态栏的
+# 「Enter 提交」「/help 查看全部命令」提示移到了这里。
+"input.ph.dashboard" = "试试「做一个带登录的数据仪表盘」"
+"input.ph.help" = "/help 查看全部命令"
+"input.ph.todo" = "试试「做一个支持分组和提醒的待办清单」"
+"input.ph.plan" = "/plan 查看当前计划"
+"input.ph.landing" = "试试「做一个能上架的产品落地页」"
+"input.ph.design" = "/design 更换设计风格"
+"input.ph.fix" = "试试「粘贴一段报错,让我来修」"
+"input.ph.keys" = "Enter 提交 · Esc 中断"
+"input.ph.blog" = "试试「做一个支持 Markdown 写作的博客」"
 # I9 首次启动的轮换示例提示（叠在 input.idle 之上，仅在空闲、空输入、本次会话还没发过消息时显示；{} 处替换为最近改过的真实文件，否则用通用占位）
 "input.example.refactor" = "试试 “重构 {}”"
 "input.example.tests" = "试试 “给 {} 补测试”"
@@ -317,6 +329,9 @@
 "chitchat.fallback" = "收到!如果你想做一个产品,直接描述需求即可启动流水线。\n\n例如:\n  做一个带邮箱登录的 SaaS 落地页\n  做一个 TODO 应用\n\n或输入 /help 看全部命令。"
 "chat.claims_unverified" = "[warn] 以上为对话内容,本轮未改动任何文件。任何\"已修改/已实现\"的说法请用实际文件 / `git status` 核对。"
 "chat.director_build_with_history" = "## 此前对话\n{}\n\n---\n\n{}"
+# Outstanding background sub-agents (the premature-final-report guard)
+"bg.redrive" = "[team] 底座还有 {} 个后台子代理未完成——已让它等待收齐结果后再写最终报告(第 {}/{} 次)"
+"bg.outstanding_note" = "[warn] 本轮结束时仍有 {} 个后台子代理未完成,产出可能不完整——请以「git status」与实际文件为准"
 
 # Delivery completion banner
 "delivery.latest_zip" = "\n  最新: {} ({} KiB)"
@@ -732,11 +747,10 @@
 "tui.hint.palette" = "↑↓ 选择 · Tab 补全 · Enter 执行"
 "tui.hint.gate_tag" = "[gate] 闸门 `{}`"
 "tui.hint.gate_action" = "· 输入修改意见或 /continue"
-"tui.hint.multiline" = "多行 · Enter 提交 · Ctrl+J 换行（Shift+Enter 视终端支持）"
-"tui.hint.typed" = "Enter 提交 · Ctrl+J / Shift+Enter 换行 · ↑↓ 调取历史"
+"tui.hint.multiline" = "多行 · Ctrl+J 换行（Shift+Enter 视终端支持）"
+"tui.hint.typed" = "Ctrl+J / Shift+Enter 换行 · ↑↓ 调取历史"
 "tui.hint.finished" = "[ok] 已完成 —— 输入新需求可重新开始"
 "tui.hint.running" = "[wait] 流水线运行中 —— 等待下一个闸门"
-"tui.hint.idle" = "Enter 提交 · /help 查看全部命令"
 "tui.hint.aborted" = "[aborted] 本轮已停止 —— 重新输入需求再启动"
 # 斜杠命令面板浮层标题
 "tui.palette.title" = "斜杠命令"
@@ -945,7 +959,7 @@
 "continuous.no_source_hardstop" = "[fail] 未产出真实代码 —— 流水线停止,未交付(持续会话路径硬门)。"
 "director.run_done" = "UmaDev —— 总监已完成本次构建。"
 "director.no_source_hardstop" = "UmaDev —— 总监声称完成了构建,但工作区没有任何真实源码文件:按客观核对,本次构建判为未完成(总监路径硬门)。"
-"continuous.dangerous_action_denied" = "[gate] 危险动作需用户确认,本回合按拒绝处理:{} -> {}"
+"continuous.dangerous_action_denied" = "[gate] 危险动作需用户确认,本回合按拒绝处理:{} -> {}(放宽:/mode auto;claude 底座要完全放行可设 UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
 "continuous.tool_call_blocked" = "[gov] {} 阶段:底座工具调用触发 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 阶段被截断(底座到达回合上限),保留已产出,继续。"
 "continuous.phase_truncated_degraded" = "[降级] {} 阶段被截断且关键产物缺失({}),产出不完整——下游质量门/硬门会拦截。请重跑或 /continue 补全。"

@@ -3752,6 +3752,15 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         text_acc = String::new();
         reactive = Arc::new(ReactiveBuild::new(true));
         let mut in_tool_call = false;
+        // Outstanding-background-agents guard (the premature-final-report fix): the
+        // base may dispatch its own background sub-agents mid-chat and then end the
+        // turn while they still run — settling would park/tear the session and their
+        // files never land ("claimed changes but the tree is unchanged"). A clean
+        // `Completed` with agents outstanding becomes a bounded "wait for your
+        // agents, collect their results, THEN report" re-drive (at most
+        // `umadev_agent::MAX_BG_REDRIVES` per turn). Fail-open: a base that
+        // surfaces no background signal keeps a zero count → today's behavior.
+        let mut bg = umadev_agent::BgAgentTracker::new();
 
         // Send the directive into the (resident or fresh) session. A send error means
         // the session is dead -- report an honest CHAT-turn failure (never a phantom
@@ -3851,6 +3860,8 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
             if let Some(t) = umadev_agent::director_loop::tool_phase_transition(&ev) {
                 in_tool_call = t;
             }
+            // Feed the outstanding-background-agents guard (cheap, fail-open).
+            bg.observe(&ev);
             match ev {
                 umadev_runtime::SessionEvent::TextDelta(delta) => {
                     text_acc.push_str(&delta);
@@ -4022,10 +4033,44 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                         return;
                     }
                 }
+                umadev_runtime::SessionEvent::BackgroundTask(_) => {
+                    // Already folded into the tracker above; carries no render row.
+                }
                 umadev_runtime::SessionEvent::TurnDone { status, .. } => match status {
                     // Carry the live session OUT of the loop so the post-turn park / QC
                     // drive the SAME base that just answered.
-                    umadev_runtime::TurnStatus::Completed => break 'attempt (false, session),
+                    umadev_runtime::TurnStatus::Completed => {
+                        // Outstanding-background-agents guard: a clean finish while
+                        // the base's own background sub-agents still run is a
+                        // premature settle (a park/teardown would strand or kill
+                        // them and their results are never collected). Re-drive the
+                        // base ONCE per credit with a bounded "wait for your
+                        // agents" directive; after `MAX_BG_REDRIVES`, settle with
+                        // an honest note instead of a false "done".
+                        if bg.begin_redrive() {
+                            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                "bg.redrive",
+                                &[
+                                    &bg.outstanding().to_string(),
+                                    &bg.redrives().to_string(),
+                                    &umadev_agent::MAX_BG_REDRIVES.to_string(),
+                                ],
+                            )));
+                            if session.send_turn(bg.wait_directive()).await.is_ok() {
+                                in_tool_call = false;
+                                continue;
+                            }
+                            // Send failed → the session is going away; settle
+                            // honestly on what landed (fail-open).
+                        }
+                        if bg.outstanding() > 0 {
+                            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                "bg.outstanding_note",
+                                &[&bg.outstanding().to_string()],
+                            )));
+                        }
+                        break 'attempt (false, session);
+                    }
                     // Truncated → the turn ended early (rate limit / retry / cut-off);
                     // accept what landed but flag the "may be incomplete" caveat below.
                     umadev_runtime::TurnStatus::Truncated => break 'attempt (true, session),
@@ -11922,6 +11967,121 @@ mod tests {
         async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
             Ok(())
         }
+    }
+
+    /// Scripted chat session for the outstanding-background-agents guard: turn 1
+    /// dispatches a background sub-agent and ends `Completed` (the premature
+    /// settle); the re-driven turn 2 resolves the agent and ends `Completed`.
+    struct BgThenCollectChatSession {
+        sent: Arc<std::sync::Mutex<Vec<String>>>,
+        current: std::collections::VecDeque<umadev_runtime::SessionEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl umadev_runtime::BaseSession for BgThenCollectChatSession {
+        async fn send_turn(&mut self, d: String) -> Result<(), umadev_runtime::SessionError> {
+            let n = {
+                let mut sent = self.sent.lock().unwrap();
+                sent.push(d);
+                sent.len()
+            };
+            self.current = if n == 1 {
+                [
+                    umadev_runtime::SessionEvent::BackgroundTask(
+                        umadev_runtime::BackgroundTaskSignal::Started { id: "a1".into() },
+                    ),
+                    umadev_runtime::SessionEvent::TextDelta("premature report".into()),
+                    umadev_runtime::SessionEvent::TurnDone {
+                        status: umadev_runtime::TurnStatus::Completed,
+                        usage: None,
+                    },
+                ]
+                .into_iter()
+                .collect()
+            } else {
+                [
+                    umadev_runtime::SessionEvent::BackgroundTask(
+                        umadev_runtime::BackgroundTaskSignal::Finished { id: "a1".into() },
+                    ),
+                    umadev_runtime::SessionEvent::TextDelta(" — collected, real report".into()),
+                    umadev_runtime::SessionEvent::TurnDone {
+                        status: umadev_runtime::TurnStatus::Completed,
+                        usage: None,
+                    },
+                ]
+                .into_iter()
+                .collect()
+            };
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            if let Some(ev) = self.current.pop_front() {
+                return Some(ev);
+            }
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_turn_with_outstanding_bg_agents_redrives_before_settling() {
+        // Report-1 fix on the CHAT drain: a turn that completes while the base's own
+        // background sub-agents still run must not settle — it re-drives the base once
+        // with the wait-and-collect directive, and settles only when the agent resolved.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(BgThenCollectChatSession {
+                sent: Arc::clone(&sent),
+                current: std::collections::VecDeque::new(),
+            })),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "process those docs",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone { reply, .. }) => {
+                assert!(
+                    reply.contains("real report"),
+                    "the settled reply carries the POST-collection text: {reply}"
+                );
+            }
+            other => panic!("expected a clean AgenticDone settle, got {other:?}"),
+        }
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            2,
+            "the user turn + exactly one bg re-drive: {sent:?}"
+        );
+        assert!(
+            sent[1].contains("background"),
+            "the re-drive is the wait-for-your-agents corrective: {}",
+            sent[1]
+        );
     }
 
     #[test]

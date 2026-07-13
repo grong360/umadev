@@ -61,6 +61,36 @@ pub struct ClaudeCodeDriver {
     workspace: Option<std::path::PathBuf>,
 }
 
+/// claude's print-mode background-task wind-down ceiling env var. In `--print`
+/// mode claude waits at wind-down (stdin closed, main thread done) for its OWN
+/// outstanding background tasks (async sub-agents) only up to this many
+/// milliseconds — default 600000 (10 min) — then SWEEPS them, killing a
+/// still-running background agent mid-write. `0` = wait indefinitely.
+pub(crate) const PRINT_BG_WAIT_CEILING_ENV: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+
+/// The raised ceiling UmaDev spawns `claude` with when the user has not set
+/// their own (30 min) — a belt so a headless single-shot run gives the base's
+/// background sub-agents room to land their files before the sweep. The
+/// PRIMARY guard is the observable outstanding-agents counter + bounded
+/// re-drive in the orchestrator (base-agnostic); this env only softens the
+/// claude-side sweep.
+pub(crate) const PRINT_BG_WAIT_CEILING_DEFAULT_MS: &str = "1800000";
+
+/// The env pairs a spawned `claude` gets beyond the inherited environment: the
+/// governance-root marker ([`govern_root_env`]) plus the raised background
+/// wind-down ceiling ([`PRINT_BG_WAIT_CEILING_ENV`]) when the user has not set
+/// their own value (the user's explicit value always wins — it is inherited).
+fn claude_call_env(ws: &std::path::Path) -> Vec<(String, String)> {
+    let mut env = govern_root_env(ws);
+    if std::env::var_os(PRINT_BG_WAIT_CEILING_ENV).is_none() {
+        env.push((
+            PRINT_BG_WAIT_CEILING_ENV.to_string(),
+            PRINT_BG_WAIT_CEILING_DEFAULT_MS.to_string(),
+        ));
+    }
+    env
+}
+
 /// Resolve the `claude` executable to spawn.
 ///
 /// Precedence: an explicit `UMADEV_CLAUDE_BIN` wins; otherwise, if `claude` was
@@ -338,8 +368,9 @@ impl Runtime for ClaudeCodeDriver {
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
         // Mark "UmaDev is driving" + the governed root for the PreToolUse hook,
         // so the hook governs THIS run's writes while leaving the user's other
-        // claude usage untouched (see `govern_root_env` / `umadev::hook`).
-        let govern_env = govern_root_env(&ws);
+        // claude usage untouched (see `govern_root_env` / `umadev::hook`). Also
+        // raises claude's background wind-down ceiling (see `claude_call_env`).
+        let govern_env = claude_call_env(&ws);
         let out = run_subprocess(SubprocessCall {
             program: &self.program,
             args: &args,
@@ -406,8 +437,9 @@ impl Runtime for ClaudeCodeDriver {
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
         // Scope the PreToolUse governance hook to THIS run's workspace (see
         // `govern_root_env`): the hook governs the run UmaDev drives, not the
-        // user's own claude sessions.
-        let govern_env = govern_root_env(&ws);
+        // user's own claude sessions. Also raises claude's background
+        // wind-down ceiling (see `claude_call_env`).
+        let govern_env = claude_call_env(&ws);
         // From here on, a pinned auto-resume session is ESTABLISHED — later
         // streaming/non-streaming calls resume it. Flip BEFORE the await so a
         // concurrent next call resumes, matching `complete()`.

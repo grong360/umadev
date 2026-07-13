@@ -2264,7 +2264,7 @@ async fn drive_build_step(
     // as every other step finding — never an open grind.
     let test_baseline = crate::test_integrity::snapshot(&options.project_root);
 
-    // ARCHITECTURE-FITNESS BASELINE (UD-CODE-005, spec prose pending). Snapshot
+    // ARCHITECTURE-FITNESS BASELINE (UD-CODE-006, spec §3.6). Snapshot
     // the source-shape surface (per-file line counts + content hashes + clone
     // windows) BEFORE this step's doer turn(s) so the deterministic floor can
     // judge what the step CHANGED: a new god file / a file grown past the
@@ -2386,14 +2386,14 @@ async fn drive_build_step(
             }
             verdict.evidence.extend(integrity);
         }
-        // ARCHITECTURE-FITNESS FLOOR (UD-CODE-005, spec prose pending). Compare
+        // ARCHITECTURE-FITNESS FLOOR (UD-CODE-006, spec §3.6). Compare
         // the tree to the pre-step baseline: a NEW source file over the line
-        // ceiling / a touched file GROWN past it (god-file, UD-CODE-005a) and an
+        // ceiling / a touched file GROWN past it (god-file, UD-CODE-006a) and an
         // import edge violating the architecture doc's declared layering
-        // (UD-CODE-005b) are BLOCKING — folded into the verdict so the SAME
+        // (UD-CODE-006b) are BLOCKING — folded into the verdict so the SAME
         // bounded re-drive that handles any failing acceptance fixes the cause
         // (split the file / invert the dependency). A duplicated added block
-        // (UD-CODE-005c) is ADVISORY only — the floor has no advisory channel,
+        // (UD-CODE-006c) is ADVISORY only — the floor has no advisory channel,
         // so it surfaces as a Note and never touches the verdict. Deterministic
         // + fail-open (no arch doc / huge repo / unreadable tree → no findings);
         // bounded by the same `max_fix_rounds` as every other step finding.
@@ -4444,6 +4444,14 @@ async fn drive_one_turn_with_backoff(
     // requires before a green CLAIM is trusted to skip UmaDev's own build/test read. Reset
     // alongside `text` on a transient re-drive so it reflects only the FINAL attempt.
     let mut ran_build_tool = false;
+    // Outstanding-background-agents guard (the premature-final-report fix): counts
+    // the base's OWN background sub-agents still running (observed via the driver's
+    // BackgroundTask frames + the "Async agent launched" tool_result fallback). A
+    // `Completed` settle with agents outstanding is converted into a bounded "wait
+    // for your agents, collect their results, THEN report" re-drive — at most
+    // `bg_agents::MAX_BG_REDRIVES` per turn, then an honest note. Fail-open: a base
+    // that surfaces no background signal keeps a zero count → today's behavior.
+    let mut bg = crate::bg_agents::BgAgentTracker::new();
     loop {
         // Wall-clock budget reached DURING a turn (not just between steps/rounds). A
         // base that stays ACTIVE — keeps emitting tool-calls / text deltas (e.g.
@@ -4592,6 +4600,8 @@ async fn drive_one_turn_with_backoff(
         if let Some(t) = tool_phase_transition(&ev) {
             in_tool_call = t;
         }
+        // Feed the outstanding-background-agents guard (cheap, fail-open).
+        bg.observe(&ev);
         match ev {
             SessionEvent::TextDelta(delta) => {
                 est_tokens = est_tokens.saturating_add(approx_tokens(&delta));
@@ -4707,11 +4717,54 @@ async fn drive_one_turn_with_backoff(
                     return Err(format!("session respond: {e}"));
                 }
             }
+            SessionEvent::BackgroundTask(_) => {
+                // Already folded into the tracker above; carries no render row.
+            }
             SessionEvent::TurnDone { status, usage } => match status {
                 // Completed / Truncated → accept the turn (the deterministic floor
                 // downstream is the real stop signal; forcing a fail here would
                 // hard-stop a build that may have produced usable output).
                 TurnStatus::Completed | TurnStatus::Truncated => {
+                    // Outstanding-background-agents guard: a CLEAN finish while the
+                    // base's own background sub-agents are still running is a
+                    // premature settle — the "final report" (if any) predates their
+                    // results, and settling would eventually tear the session down
+                    // and kill them mid-write. Convert it into a bounded "wait for
+                    // your agents" re-drive (at most `MAX_BG_REDRIVES`, and never
+                    // past the run deadline). Truncated is NOT re-driven — the base
+                    // hit a turn/budget ceiling, spending more would fight the cap.
+                    if matches!(status, TurnStatus::Completed)
+                        && std::time::Instant::now() < deadline
+                        && bg.begin_redrive()
+                    {
+                        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "bg.redrive",
+                            &[
+                                &bg.outstanding().to_string(),
+                                &bg.redrives().to_string(),
+                                &crate::bg_agents::MAX_BG_REDRIVES.to_string(),
+                            ],
+                        )));
+                        let wait = bg.wait_directive();
+                        est_tokens = est_tokens.saturating_add(approx_tokens(&wait));
+                        if session.send_turn(wait).await.is_ok() {
+                            // Keep `text` (nothing is lost; the re-driven turn
+                            // appends the REAL final report) and keep
+                            // `ran_build_tool` (tools genuinely ran this turn).
+                            in_tool_call = false;
+                            continue;
+                        }
+                        // A send failure means the session is going away — fall
+                        // through and settle honestly on what landed (fail-open).
+                    }
+                    if bg.outstanding() > 0 {
+                        // Bound exhausted (or the deadline/send blocked the
+                        // re-drive) — settle, but say so honestly.
+                        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "bg.outstanding_note",
+                            &[&bg.outstanding().to_string()],
+                        )));
+                    }
                     // Wave 2 deliverable 4: record usage + distil pitfalls on the
                     // DEFAULT loop, for every base. Both fail-open. F3: prefer the
                     // base's REAL reported usage, fall back to the chars/4 estimate.
@@ -5296,7 +5349,7 @@ fn acceptance_floor_blocking(options: &RunOptions, route: Option<&RoutePlan>) ->
         out.push(line);
     }
 
-    // ARCHITECTURE FITNESS (UD-CODE-005, spec prose pending): the REPO-GLOBAL
+    // ARCHITECTURE FITNESS (UD-CODE-006, spec §3.6): the REPO-GLOBAL
     // half of the anti-spaghetti floor — the architecture doc's declared
     // layer-dependency rules (`## Layering` order / `LAYER-RULE: a !-> b`),
     // verified against the repo-map's resolved import edges. The touched-file
@@ -5755,6 +5808,124 @@ mod tests {
             Ok(r) => assert_eq!(r.text, "done, real usage attached"),
             Err(e) => panic!("a turn with real usage must complete cleanly: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn outstanding_bg_agents_convert_the_settle_into_a_bounded_redrive() {
+        // Report-1 fix: the base dispatches background sub-agents, writes a premature
+        // "final report" and ends the turn. The pump must NOT settle — it re-drives the
+        // base with a "wait for your agents, collect their results" directive; once the
+        // agents resolve (turn 2 here), the turn settles cleanly with no honesty note.
+        use umadev_runtime::BackgroundTaskSignal;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, rec) = sink();
+        let turns = vec![
+            vec![
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
+                    id: "a1".to_string(),
+                }),
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
+                    id: "a2".to_string(),
+                }),
+                SessionEvent::TextDelta("dispatched 2 agents; final report: done".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+            vec![
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished {
+                    id: "a1".to_string(),
+                }),
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Live { agent_ids: vec![] }),
+                SessionEvent::TextDelta(" — collected; real final report".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let out = drive_one_turn(
+            &mut sess,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await
+        .expect("the re-driven turn settles cleanly");
+        // The re-drive happened: two directives were sent, the second being the
+        // bounded "wait for your background agents" corrective.
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "one build directive + one bg re-drive");
+        assert!(
+            sent[1].contains("background") && sent[1].contains("2"),
+            "the re-drive names the outstanding count: {}",
+            sent[1]
+        );
+        // Nothing outstanding at the final settle → NO honest-incomplete note.
+        assert_eq!(
+            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("[warn]")
+                && n.contains("git status"))),
+            0,
+            "no outstanding-work note once the agents resolved"
+        );
+        // The text keeps BOTH turns' output (the premature report + the real one).
+        assert!(out.text.contains("real final report"));
+    }
+
+    #[tokio::test]
+    async fn bg_redrive_is_bounded_then_settles_with_an_honest_note() {
+        // The bound: agents that NEVER resolve earn at most MAX_BG_REDRIVES re-drives,
+        // then the turn settles (terminating!) with the honest incomplete-work note.
+        use umadev_runtime::BackgroundTaskSignal;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, rec) = sink();
+        let stuck = |report: &str| {
+            vec![
+                SessionEvent::BackgroundTask(BackgroundTaskSignal::Started {
+                    id: "a1".to_string(),
+                }),
+                SessionEvent::TextDelta(report.to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ]
+        };
+        let turns = vec![stuck("report 1"), stuck("report 2"), stuck("report 3")];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let out = drive_one_turn(
+            &mut sess,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        )
+        .await
+        .expect("the bounded settle still completes the turn");
+        assert!(out.text.contains("report 3"));
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1 + usize::from(crate::bg_agents::MAX_BG_REDRIVES),
+            "exactly MAX_BG_REDRIVES re-drives, then settle"
+        );
+        // The settle is honest: the outstanding-work note was emitted.
+        assert!(
+            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("git status"))) >= 1,
+            "settling with outstanding agents must say so"
+        );
     }
 
     /// A turn that RUNS a shell command (a `ToolCall`) before finishing, for asserting
@@ -7647,7 +7818,7 @@ mod tests {
 
     #[test]
     fn acceptance_floor_blocks_a_layer_violation_declared_in_the_architecture_doc() {
-        // UD-CODE-005b (spec prose pending): the architecture doc declares a
+        // UD-CODE-006b (spec §3.6): the architecture doc declares a
         // one-way layering order; an import edge AGAINST it (repository →
         // controller) is a blocking finding on the deterministic floor, naming
         // both files. Without a declaration the check silently no-ops.
@@ -10198,7 +10369,7 @@ mod tests {
     /// A doer session that writes ONE giant NEW source file on every turn —
     /// real source (so the source-present floor passes), no test gaming. The
     /// ONLY thing that can fail the step is the architecture-fitness god-file
-    /// gate (`UD-CODE-005a`).
+    /// gate (`UD-CODE-006a`).
     struct GodFileSession {
         root: std::path::PathBuf,
         sent: Arc<std::sync::Mutex<Vec<String>>>,
@@ -10261,7 +10432,7 @@ mod tests {
 
     #[tokio::test]
     async fn arch_fitness_floor_blocks_a_god_file_step_with_a_split_directive() {
-        // UD-CODE-005a: a deliberate Build step whose doer ships one giant NEW
+        // UD-CODE-006a: a deliberate Build step whose doer ships one giant NEW
         // source file must NOT be accepted, even though real source is on disk
         // (the source-present acceptance passes). The god-file gate flips the
         // verdict, folds the split directive into the bounded re-drive, and is

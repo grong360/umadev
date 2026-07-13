@@ -35,8 +35,20 @@
 "model.synced" = "已同步驅動模型 {}(來自 {})—— Agent 就用底座這個模型工作"
 "model.synced_default" = "{} 未在設定裡固定模型 —— Agent 用它的登入/預設模型驅動(執行後可見真實模型)"
 "model.reasoning" = "思考強度 {}(底座設定,umadev 不覆寫)"
-"input.idle" = "問我任何事…（/help 查看指令）"
+"input.idle" = "問我任何事…"
 "input.aborted" = "本輪已中止 —— 重新輸入需求再試"
+# 閒置輸入框的輪換佔位:範例需求（呼應歡迎語範例）+ 指令提示,每次送出後輪換一條;
+# 執行中/閘門/已完成等特殊狀態優先,不參與輪換。原先常駐底部狀態列的
+# 「Enter 提交」「/help 查看全部指令」提示移到了這裡。
+"input.ph.dashboard" = "試試「做一個帶登入的資料儀表板」"
+"input.ph.help" = "/help 查看全部指令"
+"input.ph.todo" = "試試「做一個支援分組和提醒的待辦清單」"
+"input.ph.plan" = "/plan 查看目前計畫"
+"input.ph.landing" = "試試「做一個能上架的產品落地頁」"
+"input.ph.design" = "/design 更換設計風格"
+"input.ph.fix" = "試試「貼上一段報錯,讓我來修」"
+"input.ph.keys" = "Enter 提交 · Esc 中斷"
+"input.ph.blog" = "試試「做一個支援 Markdown 寫作的部落格」"
 # I9 首次啟動的輪換範例提示（疊在 input.idle 之上，僅在閒置、空輸入、本次工作階段還沒送過訊息時顯示；{} 處替換為最近改過的真實檔案，否則用通用佔位）
 "input.example.refactor" = "試試 「重構 {}」"
 "input.example.tests" = "試試 「為 {} 補測試」"
@@ -317,6 +329,9 @@
 "chitchat.fallback" = "收到!如果你想做一個產品,直接描述需求即可啟動流水線。\n\n例如:\n  做一個帶 Email 登入的 SaaS 登陸頁\n  做一個 TODO 應用\n\n或輸入 /help 看全部指令。"
 "chat.claims_unverified" = "[warn] 以上為對話內容,本輪未改動任何檔案。任何「已修改/已實作」的說法請用實際檔案 / `git status` 核對。"
 "chat.director_build_with_history" = "## 先前對話\n{}\n\n---\n\n{}"
+# Outstanding background sub-agents (the premature-final-report guard)
+"bg.redrive" = "[team] 底座還有 {} 個後台子代理未完成——已讓它等待收齊結果後再寫最終報告(第 {}/{} 次)"
+"bg.outstanding_note" = "[warn] 本輪結束時仍有 {} 個後台子代理未完成,產出可能不完整——請以「git status」與實際檔案為準"
 
 # Delivery completion banner
 "delivery.latest_zip" = "\n  最新: {} ({} KiB)"
@@ -732,11 +747,10 @@
 "tui.hint.palette" = "↑↓ 選擇 · Tab 補全 · Enter 執行"
 "tui.hint.gate_tag" = "[gate] 閘門 `{}`"
 "tui.hint.gate_action" = "· 輸入修改意見或 /continue"
-"tui.hint.multiline" = "多行 · Enter 提交 · Ctrl+J 換行（Shift+Enter 視終端支援）"
-"tui.hint.typed" = "Enter 提交 · Ctrl+J / Shift+Enter 換行 · ↑↓ 調取歷史"
+"tui.hint.multiline" = "多行 · Ctrl+J 換行（Shift+Enter 視終端支援）"
+"tui.hint.typed" = "Ctrl+J / Shift+Enter 換行 · ↑↓ 調取歷史"
 "tui.hint.finished" = "[ok] 已完成 —— 輸入新需求可重新開始"
 "tui.hint.running" = "[wait] 流水線執行中 —— 等待下一個閘門"
-"tui.hint.idle" = "Enter 提交 · /help 檢視全部命令"
 "tui.hint.aborted" = "[aborted] 本輪已停止 —— 重新輸入需求再啟動"
 # 斜線命令面板浮層標題
 "tui.palette.title" = "斜線命令"
@@ -945,7 +959,7 @@
 "continuous.no_source_hardstop" = "[fail] 未產出真實程式碼 —— 流水線停止,未交付(持續會話路徑硬關卡)。"
 "director.run_done" = "UmaDev —— 總監已完成本次建置。"
 "director.no_source_hardstop" = "UmaDev —— 總監聲稱完成了建置,但工作區沒有任何真實原始碼檔案:依客觀核對,本次建置判為未完成(總監路徑硬關卡)。"
-"continuous.dangerous_action_denied" = "[gate] 危險動作需使用者確認,本回合按拒絕處理:{} -> {}"
+"continuous.dangerous_action_denied" = "[gate] 危險動作需使用者確認,本回合按拒絕處理:{} -> {}(放寬:/mode auto;claude 底座要完全放行可設 UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
 "continuous.tool_call_blocked" = "[gov] {} 階段:底座工具呼叫觸發 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 階段被截斷(底座到達回合上限),保留已產出,繼續。"
 "continuous.phase_truncated_degraded" = "[降級] {} 階段被截斷且關鍵產物缺失({}),產出不完整——下游品質關卡/硬關卡會攔截。請重跑或 /continue 補全。"

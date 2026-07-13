@@ -988,6 +988,18 @@ pub enum SessionEvent {
         /// The target (file path / command / resource).
         target: String,
     },
+    /// A lifecycle signal for one of the base's OWN background **sub-agents**
+    /// (claude's `Agent`/`Task` tool with `run_in_background`). Claude emits
+    /// these as stream-json `system` frames: `task_started` (edge),
+    /// `task_notification` (terminal edge: completed / failed / stopped) and
+    /// `background_tasks_changed` (level: the full live set). The orchestrator
+    /// uses them to refuse to settle a turn as "done" while the base's own
+    /// background agents are still outstanding (the premature-final-report
+    /// fix) — background SHELLS (a dev server) are deliberately NOT surfaced,
+    /// so a long-running server can never wedge a settle. **Fail-open:** a
+    /// base that emits no such frames simply never produces this event; an
+    /// unparseable frame is skipped, never a panic.
+    BackgroundTask(BackgroundTaskSignal),
     /// The current turn ended — see [`TurnStatus`]. After this the orchestrator
     /// either sends the next phase's directive (same session, context retained)
     /// or stops at a gate.
@@ -1003,6 +1015,38 @@ pub enum SessionEvent {
         /// honest. **Fail-open:** an unparseable usage payload yields `None`,
         /// never a wrong number and never a panic.
         usage: Option<Usage>,
+    },
+}
+
+/// One background sub-agent lifecycle signal (see
+/// [`SessionEvent::BackgroundTask`]). The driver translates the base's own
+/// frames and pre-filters to SUB-AGENT tasks only (a background shell — e.g. a
+/// dev server the base deliberately leaves running — must never be waited on),
+/// so consumers stay base-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundTaskSignal {
+    /// A background sub-agent started (claude `system/task_started` with an
+    /// agent-typed task). `id` is the base's task id.
+    Started {
+        /// The base's task id for this background sub-agent.
+        id: String,
+    },
+    /// A background task reached a terminal state (claude
+    /// `system/task_notification` with status completed / failed / stopped).
+    /// Emitted for ANY task id — removing a non-agent id from an agents-only
+    /// set is a harmless no-op, and this keeps the terminal edge lossless.
+    Finished {
+        /// The base's task id that finished.
+        id: String,
+    },
+    /// The LEVEL signal (claude `system/background_tasks_changed`): the full
+    /// set of currently-live background SUB-AGENT ids. Consumers must REPLACE
+    /// their outstanding set with this payload rather than pairing edges, so a
+    /// missed edge can never wedge a stale count (the base's own documented
+    /// contract for this frame).
+    Live {
+        /// All currently-live background sub-agent task ids.
+        agent_ids: Vec<String>,
     },
 }
 

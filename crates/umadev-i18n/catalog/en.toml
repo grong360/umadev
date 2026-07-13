@@ -35,8 +35,21 @@
 "model.synced" = "synced driving model {} (from {}) — the agent runs on the base's own model"
 "model.synced_default" = "{} pins no model in config — the agent runs on its login/default model (the real model shows after a run)"
 "model.reasoning" = "reasoning effort {} (from the base config; UmaDev does not override)"
-"input.idle" = "Ask anything…  (/help for commands)"
+"input.idle" = "Ask anything…"
 "input.aborted" = "this round was aborted — type a new requirement to try again"
+# Rotating idle-empty placeholders: example requirements (echoing the welcome
+# examples) + command hints, rotated once per submit; special states (running /
+# gate / finished) take priority and never rotate. The `Enter submit` /
+# `/help for all commands` chips that used to live on the meta row moved here.
+"input.ph.dashboard" = "Try \"build a data dashboard with login\""
+"input.ph.help" = "/help for all commands"
+"input.ph.todo" = "Try \"build a todo app with groups and reminders\""
+"input.ph.plan" = "/plan to see the current plan"
+"input.ph.landing" = "Try \"build a launch-ready product landing page\""
+"input.ph.design" = "/design to switch the design style"
+"input.ph.fix" = "Try \"paste an error and let me fix it\""
+"input.ph.keys" = "Enter to submit · Esc to interrupt"
+"input.ph.blog" = "Try \"build a blog with Markdown posts\""
 # I9 first-run rotating example tip (layered over input.idle; shown only when idle, empty, and nothing sent yet this session; {} is a real recently-changed file, else a generic placeholder)
 "input.example.refactor" = "Try \"refactor {}\""
 "input.example.tests" = "Try \"add tests for {}\""
@@ -322,6 +335,9 @@
 "chitchat.fallback" = "Got it! If you want to build a product, just describe the requirement to start the pipeline.\n\nFor example:\n  A SaaS landing page with email login\n  A to-do app\n\nOr type /help for all commands."
 "chat.claims_unverified" = "[warn] The reply above is chat only — no files were changed this turn. Verify any claimed edits against the actual files / `git status`."
 "chat.director_build_with_history" = "## Conversation so far\n{}\n\n---\n\n{}"
+# Outstanding background sub-agents (the premature-final-report guard)
+"bg.redrive" = "[team] the base still has {} background sub-agent(s) running — asked it to collect their results before writing the final report (redrive {}/{})"
+"bg.outstanding_note" = "[warn] {} background sub-agent(s) were still running when this turn settled; output may be incomplete — verify with git status and the actual files"
 
 # Delivery completion banner
 "delivery.latest_zip" = "\n  latest: {} ({} KiB)"
@@ -746,11 +762,10 @@
 "tui.hint.palette" = "↑↓ choose · Tab autocomplete · Enter run"
 "tui.hint.gate_tag" = "[gate] gate `{}`"
 "tui.hint.gate_action" = "· type revision or /continue"
-"tui.hint.multiline" = "multi-line · Enter submit · Ctrl+J newline (Shift+Enter where supported)"
-"tui.hint.typed" = "Enter submit · Ctrl+J / Shift+Enter newline · ↑↓ recall"
+"tui.hint.multiline" = "multi-line · Ctrl+J newline (Shift+Enter where supported)"
+"tui.hint.typed" = "Ctrl+J / Shift+Enter newline · ↑↓ recall"
 "tui.hint.finished" = "[ok] complete — new requirement to start again"
 "tui.hint.running" = "[wait] pipeline running — wait for the next gate"
-"tui.hint.idle" = "Enter submit · /help for all commands"
 "tui.hint.aborted" = "[aborted] this round stopped — type a new requirement to start again"
 # Slash-command palette popover title
 "tui.palette.title" = "slash commands"
@@ -965,7 +980,7 @@
 "continuous.no_source_hardstop" = "[fail] No real source files produced — pipeline stopped, nothing delivered (continuous hard gate)."
 "director.run_done" = "UmaDev — the director finished this build."
 "director.no_source_hardstop" = "UmaDev — the director reported a build but the workspace has zero real source files: objectively this build is not done (director-path hard gate)."
-"continuous.dangerous_action_denied" = "[gate] Irreversible action needs user confirmation; denied this turn: {} -> {}"
+"continuous.dangerous_action_denied" = "[gate] Irreversible action needs user confirmation; denied this turn: {} -> {} (to relax: /mode auto; for full bypass on the claude base set UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
 "continuous.tool_call_blocked" = "[gov] {} phase: base tool call tripped {} — {} (target: {})"
 "continuous.phase_truncated" = "[warn] {} phase was truncated (base hit its turn limit); keeping what was produced, continuing."
 "continuous.phase_truncated_degraded" = "[DEGRADED] {} phase was truncated AND its key deliverables are missing ({}); the output is incomplete — the quality/hard gates downstream will catch this. Re-run or /continue to finish."
