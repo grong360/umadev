@@ -50,7 +50,8 @@ use crossterm::event::{
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, BeginSynchronizedUpdate,
-    EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    DisableLineWrap, EnableLineWrap, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
@@ -5131,7 +5132,236 @@ fn spawn_probe(sink: Arc<ChannelSink>) {
     });
 }
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+/// The **cursor-advance re-anchoring backend** — the structural fix for the
+/// East-Asian AMBIGUOUS-width garble.
+///
+/// ratatui's [`CrosstermBackend::draw`] suppresses the `MoveTo` for a cell whose
+/// predecessor sat at `x - 1` on the same row: it ASSUMES every printed cell
+/// advanced the real cursor by exactly one column. For an ambiguous-width glyph
+/// (`·` U+00B7, `─` U+2500, `—` U+2014, `…` U+2026) the narrow `unicode-width`
+/// table says 1, but a CJK-locale terminal renders it 2 columns wide — so the
+/// real cursor ends up one column FURTHER RIGHT than ratatui believes, and every
+/// remaining cell of that row is printed one column off. The row shifts, the tail
+/// spills, and — because ratatui diffs its OWN prev/next buffers and never
+/// reconciles against the terminal — the incremental diff can never repair it
+/// (it thinks the screen already matches). That single mechanism is the root of
+/// the Windows/CJK garble, the wrapped status bar, and the drift the old
+/// clear-everything heal was papering over.
+///
+/// This wrapper delegates EVERY [`Backend`] method to the inner
+/// [`CrosstermBackend`] except [`Backend::draw`], where it re-emits an explicit
+/// `MoveTo(x, y)` for any cell whose PREDECESSOR cell's symbol was non-ASCII
+/// instead of trusting the `x == prev.x + 1` shortcut. A width disagreement
+/// therefore self-corrects at the very next cell — the row can drift by at most
+/// one glyph, never cascade. Cost is one ~7-byte `MoveTo` per non-ASCII cell in
+/// the diff (a pure-ASCII frame is byte-for-byte identical to stock ratatui), so
+/// it is free on the common path.
+///
+/// The SGR state (fg / bg / underline color / modifier) is tracked across the
+/// WHOLE update stream exactly as ratatui does, so the anchoring adds cursor
+/// moves and nothing else — no per-cell style churn.
+struct AnchoredBackend<W: std::io::Write> {
+    inner: CrosstermBackend<W>,
+}
+
+impl<W: std::io::Write> AnchoredBackend<W> {
+    /// Wrap a [`CrosstermBackend`].
+    fn new(inner: CrosstermBackend<W>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for AnchoredBackend<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// The added/removed attribute diff between two [`ratatui::style::Modifier`]
+/// sets, rendered as crossterm `SetAttribute` commands — the same translation
+/// ratatui's own crossterm backend does internally (its `ModifierDiff` is
+/// private, so [`AnchoredBackend::draw`] carries its own copy in order to keep
+/// the SGR state across the whole stream rather than resetting it per run).
+fn queue_modifier_diff<W: std::io::Write>(
+    out: &mut W,
+    from: ratatui::style::Modifier,
+    to: ratatui::style::Modifier,
+) -> std::io::Result<()> {
+    use crossterm::queue;
+    use crossterm::style::{Attribute as CAttribute, SetAttribute};
+    use ratatui::style::Modifier;
+
+    let removed = from - to;
+    if removed.contains(Modifier::REVERSED) {
+        queue!(out, SetAttribute(CAttribute::NoReverse))?;
+    }
+    if removed.contains(Modifier::BOLD) {
+        queue!(out, SetAttribute(CAttribute::NormalIntensity))?;
+        if to.contains(Modifier::DIM) {
+            queue!(out, SetAttribute(CAttribute::Dim))?;
+        }
+    }
+    if removed.contains(Modifier::ITALIC) {
+        queue!(out, SetAttribute(CAttribute::NoItalic))?;
+    }
+    if removed.contains(Modifier::UNDERLINED) {
+        queue!(out, SetAttribute(CAttribute::NoUnderline))?;
+    }
+    if removed.contains(Modifier::DIM) {
+        queue!(out, SetAttribute(CAttribute::NormalIntensity))?;
+    }
+    if removed.contains(Modifier::CROSSED_OUT) {
+        queue!(out, SetAttribute(CAttribute::NotCrossedOut))?;
+    }
+    if removed.intersects(Modifier::SLOW_BLINK | Modifier::RAPID_BLINK) {
+        queue!(out, SetAttribute(CAttribute::NoBlink))?;
+    }
+
+    let added = to - from;
+    if added.contains(Modifier::REVERSED) {
+        queue!(out, SetAttribute(CAttribute::Reverse))?;
+    }
+    if added.contains(Modifier::BOLD) {
+        queue!(out, SetAttribute(CAttribute::Bold))?;
+    }
+    if added.contains(Modifier::ITALIC) {
+        queue!(out, SetAttribute(CAttribute::Italic))?;
+    }
+    if added.contains(Modifier::UNDERLINED) {
+        queue!(out, SetAttribute(CAttribute::Underlined))?;
+    }
+    if added.contains(Modifier::DIM) {
+        queue!(out, SetAttribute(CAttribute::Dim))?;
+    }
+    if added.contains(Modifier::CROSSED_OUT) {
+        queue!(out, SetAttribute(CAttribute::CrossedOut))?;
+    }
+    if added.contains(Modifier::SLOW_BLINK) {
+        queue!(out, SetAttribute(CAttribute::SlowBlink))?;
+    }
+    if added.contains(Modifier::RAPID_BLINK) {
+        queue!(out, SetAttribute(CAttribute::RapidBlink))?;
+    }
+    Ok(())
+}
+
+/// Whether `symbol` is pure ASCII — the ONLY case where the terminal's cursor
+/// advance is guaranteed to match `unicode-width`'s verdict of one column, so
+/// the `MoveTo` may safely be suppressed for the cell that follows it.
+fn cell_advance_is_certain(symbol: &str) -> bool {
+    symbol.is_ascii()
+}
+
+impl<W: std::io::Write> ratatui::backend::Backend for AnchoredBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        use crossterm::cursor::MoveTo;
+        use crossterm::queue;
+        use crossterm::style::{
+            Attribute as CAttribute, Color as CColor, Colors, Print, SetAttribute,
+            SetBackgroundColor, SetColors, SetForegroundColor, SetUnderlineColor,
+        };
+        use ratatui::layout::Position;
+        use ratatui::style::{Color, Modifier};
+
+        let out = &mut self.inner;
+        let mut fg = Color::Reset;
+        let mut bg = Color::Reset;
+        let mut underline_color = Color::Reset;
+        let mut modifier = Modifier::empty();
+        // The previous cell's position AND whether its glyph's column advance is
+        // trustworthy. `None` = no predecessor (stream start) → always MoveTo.
+        let mut last: Option<(Position, bool)> = None;
+        for (x, y, cell) in content {
+            // Suppress the MoveTo ONLY when the previous cell is the immediate
+            // left neighbour AND its symbol was pure ASCII (a guaranteed
+            // one-column advance). A non-ASCII predecessor re-anchors: that is
+            // the whole fix — an ambiguous-width glyph the terminal rendered
+            // double-wide can shift the cursor by one, and the very next cell
+            // puts it back.
+            let contiguous = matches!(
+                last,
+                Some((p, ascii)) if ascii && y == p.y && x == p.x + 1
+            );
+            if !contiguous {
+                queue!(out, MoveTo(x, y))?;
+            }
+            last = Some((Position { x, y }, cell_advance_is_certain(cell.symbol())));
+            if cell.modifier != modifier {
+                queue_modifier_diff(out, modifier, cell.modifier)?;
+                modifier = cell.modifier;
+            }
+            if cell.fg != fg || cell.bg != bg {
+                queue!(out, SetColors(Colors::new(cell.fg.into(), cell.bg.into())))?;
+                fg = cell.fg;
+                bg = cell.bg;
+            }
+            if cell.underline_color != underline_color {
+                let color = CColor::from(cell.underline_color);
+                queue!(out, SetUnderlineColor(color))?;
+                underline_color = cell.underline_color;
+            }
+            queue!(out, Print(cell.symbol()))?;
+        }
+        queue!(
+            out,
+            SetForegroundColor(CColor::Reset),
+            SetBackgroundColor(CColor::Reset),
+            SetUnderlineColor(CColor::Reset),
+            SetAttribute(CAttribute::Reset),
+        )
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        self.inner.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> std::io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.inner.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+
+    fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
+        self.inner.append_lines(n)
+    }
+
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        ratatui::backend::Backend::flush(&mut self.inner)
+    }
+}
+
+type Term = Terminal<AnchoredBackend<Stdout>>;
 
 /// Detect whether the terminal has a light background.
 ///
@@ -5399,20 +5629,27 @@ fn setup_terminal() -> Result<Term> {
         e.into()
     }
 
-    // Enter raw mode FIRST so the OSC 11 response isn't echoed to the screen
-    // (raw mode disables input echo + canonical processing — the response
-    // bytes come back through stdin silently). Then probe the background
-    // color, cache the result in the theme module, then apply the ONE shared
-    // enable block (raw mode itself stays out of it: a global console-input
-    // mode, not a writer command).
+    // Enter raw mode FIRST so a terminal-query response isn't echoed to the
+    // screen (raw mode disables input echo + canonical processing — the
+    // response bytes come back through stdin silently), then apply the ONE
+    // shared enable block (raw mode itself stays out of it: a global
+    // console-input mode, not a writer command).
     enable_raw_mode()?;
-    let is_light = detect_light_bg();
-    ui::set_light_theme(is_light);
 
     let mut stdout = std::io::stdout();
     // Mouse capture starts ON (the `/mouse` toggle re-asserts a changed
     // preference later through the same block via `reassert_terminal_modes`).
     enable_terminal_modes(&mut stdout, true).map_err(fail)?;
+    // Background probe AFTER the alternate screen is up. Order matters: a
+    // capability query (OSC 11 here, and the same holds for DA1 / DECRQM)
+    // issued BEFORE `EnterAlternateScreen` makes Windows Terminal / ConPTY
+    // stall its resize-event delivery for tens of seconds — the window is
+    // resized but no `Event::Resize` arrives, so the screen stays painted at
+    // the stale width. Probing once we are already on the alt screen costs the
+    // same round-trip and keeps ConPTY's event pump healthy. The probe is still
+    // in raw mode, so nothing echoes.
+    let is_light = detect_light_bg();
+    ui::set_light_theme(is_light);
     // Kitty keyboard protocol — GUARDED behind the terminal's own support query
     // (a DA1-backed round-trip, safe in the raw mode we're already in, same as
     // the OSC 11 probe above), so ONLY a terminal that reports support gets the
@@ -5427,7 +5664,11 @@ fn setup_terminal() -> Result<Term> {
     {
         KITTY_KEYBOARD_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(fail)?;
+    // The render backend is the cursor-advance re-anchoring wrapper (see
+    // [`AnchoredBackend`]) — an ambiguous-width glyph the terminal renders
+    // double-wide can no longer desync the rest of its row.
+    let terminal =
+        Terminal::new(AnchoredBackend::new(CrosstermBackend::new(stdout))).map_err(fail)?;
     Ok(terminal)
 }
 
@@ -5435,22 +5676,33 @@ fn setup_terminal() -> Result<Term> {
 /// UmaDev turns on, in setup order:
 ///
 /// 1. `EnterAlternateScreen` — the app screen (a no-op if already in alt).
-/// 2. `EnableBracketedPaste` — multi-char bursts (clipboard paste AND CJK IME
+/// 2. `DisableLineWrap` (DECAWM off, `\x1b[?7l`) — the CONTAINMENT half of the
+///    ambiguous-width fix. A TUI never wants autowrap: every cell it prints is
+///    explicitly positioned, so wrapping can only ever be a bug's amplifier. With
+///    DECAWM on, ONE glyph the terminal renders wider than `unicode-width`
+///    predicted (`·`, `─`, `—`, `…` in a CJK locale) pushes the row's tail past
+///    the right margin, the terminal spills it onto the NEXT line, and the
+///    corruption cascades down the whole screen — which ratatui's own-buffer diff
+///    can never see, let alone repair. With DECAWM off the overflow is simply
+///    dropped at the margin: the damage is contained to its own row, and the next
+///    row's `MoveTo` re-anchors. (The re-anchoring backend then stops the row from
+///    drifting at all — see [`AnchoredBackend`].)
+/// 3. `EnableBracketedPaste` — multi-char bursts (clipboard paste AND CJK IME
 ///    commits, which most terminals deliver as a paste) arrive as one atomic
 ///    `Event::Paste` instead of a scrambled stream of `Char` events.
-/// 3. Mouse capture per the CURRENT `/mouse` preference. On by default: we're
+/// 4. Mouse capture per the CURRENT `/mouse` preference. On by default: we're
 ///    on the alternate screen (no native scrollback), where the terminal can't
 ///    give us BOTH wheel-scroll AND native click-drag copy — so UmaDev runs its
 ///    OWN selection layer (the Claude Code approach): capture the mouse, page
 ///    the transcript on the wheel, render the drag-selection highlight
 ///    ourselves, copy via OSC 52. `/mouse` toggles capture OFF for users who
 ///    prefer the terminal's native click-drag selection.
-/// 4. `EnableFocusChange` (DEC private mode 1004). Some terminals — notably
+/// 5. `EnableFocusChange` (DEC private mode 1004). Some terminals — notably
 ///    the Windows console / Windows Terminal — scroll or redraw their own
 ///    buffer while unfocused, desyncing the incremental-diff render; with 1004
 ///    on, the terminal emits a FocusGained event on return and the event loop
 ///    forces a clean full repaint.
-/// 5. `cursor::Show` — the blinking caret in the input box (positioned via
+/// 6. `cursor::Show` — the blinking caret in the input box (positioned via
 ///    `frame.set_cursor_position` in `render_prompt`).
 ///
 /// Shared by BOTH [`setup_terminal`] (startup) and [`reassert_terminal_modes`]
@@ -5482,6 +5734,7 @@ fn enable_terminal_modes<W: std::io::Write>(out: &mut W, mouse_on: bool) -> std:
         }
     };
     note(out.execute(EnterAlternateScreen).map(|_| ()));
+    note(out.execute(DisableLineWrap).map(|_| ()));
     note(out.execute(EnableBracketedPaste).map(|_| ()));
     note(if mouse_on {
         out.execute(EnableMouseCapture).map(|_| ())
@@ -5509,16 +5762,18 @@ fn enable_terminal_modes<W: std::io::Write>(out: &mut W, mouse_on: bool) -> std:
 ///  1. (caller, first) `disable_raw_mode()` — restores console-input echo + line
 ///     editing while VT processing is still active.
 ///  2. `LeaveAlternateScreen` — back to the primary screen buffer.
-///  3. `DisableMouseCapture` — stop SGR mouse reports leaking as `;…M` text.
-///  4. `DisableFocusChange` (`\x1b[?1004l`) — stop focus-in/out reports (`\x1b[I`
+///  3. `EnableLineWrap` (`\x1b[?7h`) — undo the alt-screen `DisableLineWrap`,
+///     on the PRIMARY buffer, so the user's shell wraps long command lines again.
+///  4. `DisableMouseCapture` — stop SGR mouse reports leaking as `;…M` text.
+///  5. `DisableFocusChange` (`\x1b[?1004l`) — stop focus-in/out reports (`\x1b[I`
 ///     / `\x1b[O`) leaking as text once we've left; the symmetric off for the
 ///     `EnableFocusChange` setup turned on.
-///  5. `DisableBracketedPaste` (`\x1b[?2004l`).
-///  6. `EndSynchronizedUpdate` (`\x1b[?2026l`) — defensively clear DEC-2026 even
+///  6. `DisableBracketedPaste` (`\x1b[?2004l`).
+///  7. `EndSynchronizedUpdate` (`\x1b[?2026l`) — defensively clear DEC-2026 even
 ///     though every BSU is balanced by an ESU in the loop, so a process that
 ///     exits can never strand the terminal mid-update.
-///  7. `cursor::Show` (`\x1b[?25h`) — the caret must be visible at the shell.
-///  8. `ResetColor` (`\x1b[0m`) — drop any lingering SGR so the prompt isn't
+///  8. `cursor::Show` (`\x1b[?25h`) — the caret must be visible at the shell.
+///  9. `ResetColor` (`\x1b[0m`) — drop any lingering SGR so the prompt isn't
 ///     painted in the last frame's colors.
 ///
 /// Each step is best-effort (`let _ =`) so one failure can't short-circuit the
@@ -5545,6 +5800,12 @@ fn restore_sequence_inner<W: std::io::Write>(out: &mut W, kitty_on: bool) {
         let _ = out.execute(PopKeyboardEnhancementFlags);
     }
     let _ = out.execute(LeaveAlternateScreen);
+    // Autowrap back ON, and deliberately AFTER leaving the alternate screen so
+    // the mode lands on the PRIMARY buffer — the one the user's shell keeps. A
+    // shell with DECAWM off is unusable (every long command line overtypes
+    // itself at the right margin), so this is as load-bearing as the alt-screen
+    // leave. Idempotent, and harmless on a terminal we never disabled it on.
+    let _ = out.execute(EnableLineWrap);
     let _ = out.execute(DisableMouseCapture);
     let _ = out.execute(DisableFocusChange);
     let _ = out.execute(DisableBracketedPaste);
@@ -5580,87 +5841,6 @@ fn signal_teardown<W: std::io::Write>(app: &App, out: &mut W) {
     app.persist_chat();
     let _ = disable_raw_mode();
     restore_sequence(out);
-}
-
-/// Whether the terminal supports **DEC private mode 2026 (synchronized output)**
-/// — the BSU/ESU pair (`\x1b[?2026h` … `\x1b[?2026l`).
-///
-/// When supported, wrapping each frame write in
-/// [`BeginSynchronizedUpdate`] … [`EndSynchronizedUpdate`] makes the terminal
-/// buffer the WHOLE frame and swap it atomically, so a mid-paint flush can never
-/// surface a half-drawn / torn / garbled frame — the root fix for the "界面错乱
-/// after a while" symptom (the Ctrl+L / resize-clear / line-clip changes are the
-/// recovery + desync-source fixes; this stops corruption appearing in the first
-/// place).
-///
-/// Detection is by environment only — no terminal round-trip — so it is cheap,
-/// synchronous, and computed ONCE at startup (never per frame). Conservative: an
-/// unknown terminal returns `false` and simply draws exactly as before. Mirrors
-/// the terminal allow-list a capable host CLI uses.
-///
-/// P2 — this env allowlist is only the PRIOR / timeout fallback: right after
-/// the event loop starts, a DECRQM probe ([`SYNC_PROBE_QUERY`]) asks the
-/// terminal itself whether mode 2026 is implemented, and the terminal's DECRPM
-/// answer — when one arrives within [`SYNC_PROBE_TIMEOUT`] — overrides this
-/// value in both directions (see [`sync_probe_outcome`]).
-fn synchronized_output_supported() -> bool {
-    use std::env::{var, var_os};
-    // tmux proxies every byte but doesn't implement DEC 2026, and has already
-    // broken atomicity by chunking — BSU/ESU would just cost bytes. Skip it.
-    if var_os("TMUX").is_some() {
-        return false;
-    }
-    // Terminals with known DEC 2026 support, by TERM_PROGRAM.
-    if let Some(tp) = var_os("TERM_PROGRAM") {
-        if matches!(
-            tp.to_str(),
-            Some(
-                "iTerm.app"
-                    | "WezTerm"
-                    | "WarpTerminal"
-                    | "ghostty"
-                    | "contour"
-                    | "vscode"
-                    | "alacritty"
-            )
-        ) {
-            return true;
-        }
-    }
-    let term = var("TERM").unwrap_or_default();
-    // kitty sets TERM=xterm-kitty or KITTY_WINDOW_ID.
-    if term.contains("kitty") || var_os("KITTY_WINDOW_ID").is_some() {
-        return true;
-    }
-    // Ghostty may set TERM=xterm-ghostty without TERM_PROGRAM.
-    if term == "xterm-ghostty" {
-        return true;
-    }
-    // foot sets TERM=foot or foot-extra.
-    if term.starts_with("foot") {
-        return true;
-    }
-    // Alacritty may set TERM containing 'alacritty'.
-    if term.contains("alacritty") {
-        return true;
-    }
-    // Zed uses the alacritty_terminal crate (DEC 2026 capable).
-    if var_os("ZED_TERM").is_some() {
-        return true;
-    }
-    // Windows Terminal (important for the Windows console garble report).
-    if var_os("WT_SESSION").is_some() {
-        return true;
-    }
-    // VTE-based terminals (GNOME Terminal, Tilix, …) since VTE 0.68 (6800).
-    if var("VTE_VERSION")
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .is_some_and(|v| v >= 6800)
-    {
-        return true;
-    }
-    false
 }
 
 /// How far into the `Esc [ < <num> ; <num> ; <num> (M|m)` SGR-mouse shape the
@@ -5868,107 +6048,104 @@ impl MouseSeqFilter {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering self-heal (UX maturity roadmap §1).
+// Rendering self-heal.
 //
 // ratatui's flush diffs its OWN prev-buffer vs next-buffer and never
-// reconciles against terminal reality: once the real screen drifts (a
-// mid-paint tear, a concurrent external write, a terminal-side scroll) while
-// the two buffers are identical — the bottom-pinned steady state — the diff is
-// EMPTY and the garble persists forever. The only escape is `terminal.clear()`
-// (a real `Clear(All)` + a back-buffer reset, so the next draw re-emits every
-// cell). Instead of enumerating drift sources, two primitives cover them all:
+// reconciles against terminal reality: once the real screen DRIFTS (an
+// ambiguous-width glyph the terminal rendered two columns wide where
+// `unicode-width` predicted one, a terminal-side scroll, a mid-paint tear)
+// while the two buffers are identical — the bottom-pinned steady state — the
+// diff is EMPTY and the garble persists forever.
 //
-// * **P0** — under CONFIRMED DEC-2026 synchronized output, EVERY frame clears
-//   and fully repaints inside the BSU/ESU brackets: the whole clear+redraw
-//   swaps atomically (invisible), so no drift survives past one frame. Cost is
-//   O(screen cells) per drawn frame — affordable, and only frames that would
-//   draw anyway pay it.
-// * **P3** — on every other terminal (where an every-frame clear would visibly
-//   flicker) the contamination flag ([`App::contaminate_terminal`]) forces
-//   exactly ONE clear+repaint after any out-of-band write or discrete layout
-//   transition. Also armed on the sync path as the draw-forcing catch-all.
+// The old escape was `terminal.clear()`: an `ED(2)` erase + a back-buffer
+// reset. It worked, but the erase is the expensive, VISIBLE half — it blanks
+// the screen for a beat (flicker on any terminal without honest DEC-2026), and
+// crossterm's Windows `clear_entire_screen` explicitly `move_to(0, 0)`s, which
+// is the cursor-sweep the user saw. So the heal is now split in two:
 //
-// All callers are fail-open; behavior is identical when no drift is present
-// (the flag simply stays `false`).
+// * [`HealMode::Invalidate`] — DRIFT (streaming heartbeat, resize / focus /
+//   size-poll settle). Reset ratatui's previous buffer WITHOUT touching the
+//   screen ([`invalidate_frame`]): the next `draw()` then diffs against a
+//   poisoned previous buffer, so it re-emits EVERY cell IN PLACE. No `ED(2)`,
+//   no `move_to(0, 0)`, no flash, no dependence on synchronized-output support
+//   — just the same cells, correctly positioned, painted over the drifted ones.
+// * [`HealMode::Erase`] — true CONTAMINATION (an out-of-band write, `Ctrl+L` /
+//   `/redraw`, a discrete layout transition): the screen genuinely holds bytes
+//   we never wrote, so an erase is what the user asked for. One `terminal.clear()`,
+//   once, on a discrete event — never on a cadence.
+//
+// All callers are fail-open; behavior is identical when no drift is present.
 // ---------------------------------------------------------------------------
 
-/// P0 — whether this frame must `terminal.clear()` (wipe the real screen and
-/// reset ratatui's back buffer so the draw that follows re-emits EVERY cell)
-/// before drawing. Clears when EITHER a sync-heal is due (`sync_heal_due` — on a
-/// confirmed-sync terminal, throttled to the streaming-drift cadence, NOT every
-/// frame: an unthrottled per-frame clear flickered on imperfect-sync terminals
-/// while scrolling) OR a discrete heal was requested (`heal_requested` — the P3
-/// contamination drain / resize / focus, once each). Pure, so the guard is
-/// unit-tested. The caller decides `sync_heal_due` from the streaming-activity +
-/// cadence gate; here it is a plain OR so the truth table stays trivial.
-fn frame_needs_clear(sync_heal_due: bool, heal_requested: bool) -> bool {
-    sync_heal_due || heal_requested
+/// What this frame must do to the real screen before drawing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealMode {
+    /// Nothing — an ordinary incremental-diff frame (the overwhelmingly common case).
+    None,
+    /// Repaint every cell IN PLACE, with no erase (see [`invalidate_frame`]).
+    Invalidate,
+    /// Erase the screen (`ED(2)`) and repaint — reserved for true contamination.
+    Erase,
 }
 
-/// P4 — whether the NON-sync repaint heartbeat is due. On a terminal without
-/// synchronized output (classic conhost: no `WT_SESSION`, and the DECRQM probe
-/// never answers) the every-frame full repaint is unreachable AND a long steady
-/// streaming run trips no discrete contamination trigger, so ratatui's own
-/// prev-vs-next diff never reconciles against terminal reality — drift
-/// accumulates and is never wiped (the reported Windows 界面错乱 after a while).
-/// This forces ONE full clear+repaint on a bounded `cadence` **while the app is
-/// live** (streaming), so accumulated streaming drift can never outlive it.
-///
-/// TYPING IS DELIBERATELY NOT A TRIGGER. A keystroke is NOT a drift source —
-/// ratatui's cell diff already rewrites an edited/vacated cell correctly (a
-/// backspace emits a space over the old glyph), so a same-line edit needs no full
-/// repaint. The heartbeat's clear is a NAKED whole-screen wipe on classic conhost
-/// (no sync output to hide it), so firing it while the user types blanked the
-/// screen ~1x/sec DURING typing — the reported "Windows 输入闪屏". Keying the
-/// heartbeat off live/streaming only (not "edited recently") heals the real drift
-/// case while an idle prompt — typed at or not — never pays a clear.
-///
-/// Gated to the non-sync path: under confirmed sync output every frame already
-/// clears+repaints (P0), so adding heartbeat clears there is pointless and would
-/// only cost bytes; and an idle, non-streaming screen has nothing to drift, so it
-/// never pays a clear (no flicker on a settled chat). Pure, so the truth table is
-/// unit-tested.
-fn periodic_repaint_due(
-    sync_output: bool,
-    live: bool,
-    since_last_full_repaint: Duration,
-    cadence: Duration,
-) -> bool {
-    !sync_output && live && since_last_full_repaint >= cadence
+/// Decide this frame's heal. `contaminated` (an out-of-band write / `Ctrl+L` /
+/// `/redraw` / a discrete layout transition) wins: the screen holds bytes we did
+/// not write, so only an erase is honest. `drift_due` (the streaming heartbeat,
+/// the resize / focus / size-poll settle windows) is the cheap, invisible
+/// in-place repaint. Pure, so the truth table is unit-tested.
+fn heal_mode(drift_due: bool, contaminated: bool) -> HealMode {
+    if contaminated {
+        HealMode::Erase
+    } else if drift_due {
+        HealMode::Invalidate
+    } else {
+        HealMode::None
+    }
 }
 
-/// P4b — the ATOMIC streaming heartbeat for a terminal that supports the
-/// synchronized-output brackets (`sync_output`) but whose per-frame P0 heal is
-/// off because sync was never CONFIRMED by a real DECRQM reply.
+/// The cell a heal poisons ratatui's previous buffer with. A `NUL` symbol can
+/// never be the symbol of a real rendered cell, so EVERY cell of the next frame
+/// — INCLUDING the ones that are blank in it — compares unequal to it and is
+/// re-emitted. That closes the one hole a plain `Buffer::reset()` leaves: reset
+/// fills with `Cell::EMPTY` (a space in the default style), so a cell that is
+/// ALSO blank in the new frame would diff equal and be SKIPPED, and whatever
+/// garbage the drift left there would survive the "full" repaint.
+fn poison_cell() -> ratatui::buffer::Cell {
+    let mut cell = ratatui::buffer::Cell::EMPTY;
+    cell.set_symbol("\u{0}");
+    cell
+}
+
+/// [`HealMode::Invalidate`] — invalidate WITHOUT erasing.
 ///
-/// The reported gap: **Windows Terminal** is allowlisted as `sync_output == true`,
-/// yet on Windows the DEC 2026 probe is never sent (the legacy input path has no
-/// lane for the reply), so `sync_confirmed` stays `false` for the whole session.
-/// Such a terminal gets NEITHER P0 (which keys off `sync_confirmed`) NOR the
-/// classic-conhost heartbeat ([`periodic_repaint_due`], which needs `!sync_output`
-/// and `is_legacy_conhost()`), so accumulated incremental-diff drift never heals
-/// during a long heavy stream.
-///
-/// This heals it with the SAME throttled streaming heartbeat as conhost, but —
-/// crucially — because `sync_output` is `true`, the resulting `terminal.clear()`
-/// lands INSIDE the frame's BSU/ESU brackets, so the wipe swaps atomically and is
-/// INVISIBLE (no flicker). Gated to active streaming + the throttle exactly like
-/// [`periodic_repaint_due`], so an idle screen never pays a clear.
-///
-/// Deliberately requires `sync_output == true`: a NON-sync terminal that is not
-/// `is_legacy_conhost()` (macOS Terminal.app / plain non-sync) is `sync_output ==
-/// false`, so it does NOT match here and keeps getting no heartbeat — a naked
-/// clear there would reintroduce flicker. And when sync IS confirmed, P0 already
-/// heals every frame, so this must not add a second clear: `!sync_confirmed`
-/// excludes that case. Pure, so the truth table is unit-tested.
-fn atomic_unconfirmed_heartbeat_due(
-    sync_output: bool,
-    sync_confirmed: bool,
-    live: bool,
-    since_last_full_repaint: Duration,
-    cadence: Duration,
-) -> bool {
-    sync_output && !sync_confirmed && live && since_last_full_repaint >= cadence
+/// Poison the buffer the next frame will render into, then
+/// [`ratatui::Terminal::swap_buffers`] (reset the other buffer + swap), which
+/// leaves the POISONED buffer as the "previous" one. The next `draw()` renders
+/// the real frame into the fresh buffer and diffs it against the poison: every
+/// cell differs, so every cell is re-emitted at its correct `(x, y)` — a full,
+/// in-place repaint that overwrites drifted glyphs and blanks alike, with no
+/// `ED(2)`, no `move_to(0, 0)`, and no reliance on the terminal honoring DEC
+/// 2026. Costs one screen's worth of cells on a heal frame — exactly what the
+/// old clear+repaint already paid — and nothing at all on an ordinary frame.
+fn invalidate_frame<B: ratatui::backend::Backend>(terminal: &mut ratatui::Terminal<B>) {
+    let poison = poison_cell();
+    for cell in &mut terminal.current_buffer_mut().content {
+        cell.clone_from(&poison);
+    }
+    terminal.swap_buffers();
+}
+
+/// Apply this frame's [`HealMode`] to the terminal, immediately before the draw.
+/// Fail-open: an erase that errors is ignored — a heal hiccup must never block
+/// the render loop.
+fn apply_heal<B: ratatui::backend::Backend>(terminal: &mut ratatui::Terminal<B>, mode: HealMode) {
+    match mode {
+        HealMode::None => {}
+        HealMode::Invalidate => invalidate_frame(terminal),
+        HealMode::Erase => {
+            let _ = terminal.clear();
+        }
+    }
 }
 
 /// Whether the tick-time terminal-size poll detected a resize whose
@@ -6000,50 +6177,18 @@ fn size_poll_detected_resize(prev: Option<(u16, u16)>, polled: Option<(u16, u16)
 
 /// The ONE resize reaction, shared by BOTH detection paths — a delivered
 /// `Event::Resize` and the tick-time size-poll fallback
-/// ([`size_poll_detected_resize`]): open the [`RESIZE_HEAL_WINDOW`] (every
-/// frame clears for a short spell so the multi-frame drag + terminal-buffer
-/// settle fully heals, not just one frame) and contaminate the terminal (P3)
-/// so the NEXT frame does one clear+repaint back-to-back — never an immediate
-/// `clear()` here (that blanks the screen for a frame → flicker; on a sync
-/// terminal the deferred clear lands inside the loop-top BSU/ESU and swaps
-/// atomically). The new dimensions themselves are picked up by ratatui's
-/// autoresize inside `terminal.draw`. Fail-open: only flags are set.
-fn apply_resize_heal(app: &App, last_resize_at: &mut Option<Instant>) {
+/// ([`size_poll_detected_resize`]): open the [`RESIZE_HEAL_WINDOW`], so every
+/// frame for a short spell invalidates + repaints in place ([`HealMode::Invalidate`])
+/// and the multi-frame drag + terminal-buffer settle fully heals, not just one
+/// frame. A resize is DRIFT, not contamination: the screen holds cells WE wrote,
+/// merely at the wrong geometry — so the heal repaints them in place rather than
+/// erasing (a real size change is erased anyway by ratatui's own `autoresize` →
+/// `Terminal::resize` → `clear`, inside `draw`). Never an immediate heal here —
+/// that would blank/repaint outside the frame's synchronized-update bracket.
+/// The new dimensions themselves are picked up by that autoresize. Fail-open:
+/// only a timestamp is set.
+fn apply_resize_heal(last_resize_at: &mut Option<Instant>) {
     *last_resize_at = Some(Instant::now());
-    app.contaminate_terminal();
-}
-
-/// P2 — the DECRQM query asking the terminal whether DEC private mode 2026
-/// (synchronized output) is implemented: `CSI ? 2026 $ p`. Sent ONCE right
-/// after the event loop starts, and only on the owned-input path — the DECRPM
-/// reply (`\x1b[?2026;<n>$y`) arrives over stdin, where the owned tokenizer
-/// consumes it as a terminal response (never keystrokes) and parks the verdict
-/// for [`InputSource::take_sync_output_reply`]. The legacy `EventStream` path
-/// (Windows default / `UMADEV_LEGACY_INPUT=1`) has no lane for the reply — its
-/// parser could surface an error the stdin-EOF guard would misread as a closed
-/// FD — so the probe is never sent there and the allowlist verdict stands.
-const SYNC_PROBE_QUERY: &[u8] = b"\x1b[?2026$p";
-
-/// P2 — how long the event loop waits for the DECRPM reply before falling back
-/// to the env allowlist ([`synchronized_output_supported`]). A terminal that
-/// implements DECRQM answers in one round-trip (microseconds locally, one RTT
-/// over ssh); one that doesn't never answers, so the probe must time out
-/// rather than gate the session. Checked on the loop's 80ms tick, so the
-/// fallback lands well inside the first second either way.
-const SYNC_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// P2 — fold the probe state into the session's CONFIRMED synchronized-output
-/// capability. The terminal's own DECRPM reply is authoritative the moment it
-/// lands (it can both UPGRADE an unknown terminal and OVERRIDE a wrong
-/// allowlist entry); no reply by the deadline falls back to the env-allowlist
-/// prior; `None` while the probe is still pending. Cached by the caller for
-/// the whole session. Pure, so the resolution order is unit-tested.
-fn sync_probe_outcome(reply: Option<bool>, deadline_passed: bool, allowlist: bool) -> Option<bool> {
-    match reply {
-        Some(confirmed) => Some(confirmed),
-        None if deadline_passed => Some(allowlist),
-        None => None,
-    }
 }
 
 /// R5 resume-gap threshold — an input event arriving after a gap this long looks
@@ -6122,15 +6267,46 @@ fn tick_needs_draw(app: &App, continuous_active: bool) -> bool {
 ///
 /// Delegates to [`enable_terminal_modes`] — the ONE enable block shared with
 /// [`setup_terminal`] (Wave 2 P2), so resume re-asserts EXACTLY what startup
-/// enabled (alt screen, bracketed paste, the *current* `/mouse` mouse-capture
-/// preference, focus-change reporting, cursor visibility) and a future mode
-/// can never be enabled at startup yet missed here. These are OUT-OF-BAND
-/// writes (P3), so the caller marks the terminal contaminated
-/// ([`App::contaminate_terminal`]) and the next frame repaints every cell.
+/// enabled (alt screen, autowrap OFF, bracketed paste, the *current* `/mouse`
+/// mouse-capture preference, focus-change reporting, cursor visibility) and a
+/// future mode can never be enabled at startup yet missed here.
 /// Writes go through the render's single backend writer, BETWEEN frames;
-/// best-effort (the first error is ignored), never blocking the loop.
-fn reassert_terminal_modes(terminal: &mut Term, mouse_on: bool) {
+/// best-effort (the first error is ignored), never blocking the loop. Generic
+/// over the backend so the recording-backend tests can assert the exact escapes.
+fn reassert_terminal_modes<B>(terminal: &mut ratatui::Terminal<B>, mouse_on: bool)
+where
+    B: ratatui::backend::Backend + std::io::Write,
+{
     let _ = enable_terminal_modes(terminal.backend_mut(), mouse_on);
+}
+
+/// The ONE focus-return reaction (the `FocusGained` arm of the event loop, and
+/// the resume-gap backstop for terminals that never deliver DEC-1004).
+///
+/// 1. **Re-assert the terminal modes.** Windows Terminal / ConPTY STRIP DEC
+///    private modes while the window is unfocused — so on return, focus
+///    reporting, bracketed paste, mouse capture, and (now load-bearing)
+///    `DisableLineWrap` may simply be gone, and the very next ambiguous-width
+///    glyph would wrap and cascade again. `reassert_terminal_modes` is the same
+///    idempotent enable block startup uses, so this restores exactly what setup
+///    asserted.
+/// 2. **Open the focus-heal window.** The terminal redraws its OWN buffer over
+///    SEVERAL frames on focus return (worse across a multi-monitor compositor),
+///    so a single healing frame races that and loses. Healing for a short window
+///    makes OUR repaint the last word. It is an in-place repaint
+///    ([`HealMode::Invalidate`]), not an erase: what is on screen is our own
+///    cells, mis-placed — not foreign bytes.
+///
+/// Fail-open: a mode-write error is ignored.
+fn apply_focus_heal<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    mouse_on: bool,
+    last_focus_gained_at: &mut Option<Instant>,
+) where
+    B: ratatui::backend::Backend + std::io::Write,
+{
+    reassert_terminal_modes(terminal, mouse_on);
+    *last_focus_gained_at = Some(Instant::now());
 }
 
 /// Unix job-control resume signal (SIGCONT) the event loop selects on (R5). On
@@ -6304,39 +6480,6 @@ async fn next_termination_signal(sigs: &mut TermSignals) {
 /// `select!` arm.
 const FRAME_MIN: Duration = Duration::from_millis(16);
 
-/// P4 — the non-sync live-run repaint heartbeat: the longest a classic-conhost
-/// session may go without a full clear+repaint while streaming, so accumulated
-/// incremental-diff drift can never outlive it. Set well above [`FRAME_MIN`] so
-/// it is at most ~one extra clear per second (NOT a per-frame clear), and it
-/// only applies while the app is live — an idle screen never pays it. See
-/// [`periodic_repaint_due`].
-/// Whether we are on CLASSIC Windows conhost — the ONLY terminal that actually accumulates
-/// incremental-diff drift and needs the 1Hz full-clear heartbeat. Every known-good terminal
-/// (Windows Terminal, git bash / mintty, WezTerm, VS Code, kitty, alacritty …) reconciles fine
-/// and only FLICKERS under a naked periodic clear, so they are all excluded: the gate now keys
-/// off "is this the drift-prone legacy console," not the far-too-broad "is Windows".
-#[cfg(windows)]
-fn is_legacy_conhost() -> bool {
-    use std::env::{var, var_os};
-    var_os("WT_SESSION").is_none()            // not Windows Terminal
-        && var_os("MSYSTEM").is_none()        // not git bash / mintty (MSYS2)
-        && var_os("KITTY_WINDOW_ID").is_none()
-        && !matches!(
-            var("TERM_PROGRAM").ok().as_deref(),
-            Some("WezTerm" | "vscode" | "alacritty" | "ghostty" | "WarpTerminal")
-        )
-        // mintty & other VT terminals set TERM=xterm*; classic conhost does not.
-        && !var("TERM")
-            .map(|t| t.starts_with("xterm") || t.contains("kitty"))
-            .unwrap_or(false)
-}
-
-/// Non-Windows: the legacy-conhost heartbeat never applies.
-#[cfg(not(windows))]
-fn is_legacy_conhost() -> bool {
-    false
-}
-
 /// Max engine events applied in ONE drain pass of the event loop's `engine_rx` select arm
 /// before yielding back to `select!`. The base's extended-thinking tokens stream back-to-back
 /// with no gap, so an UNBOUNDED drain (`while try_recv().is_some()`) stayed inside that arm -
@@ -6346,6 +6489,14 @@ fn is_legacy_conhost() -> bool {
 /// per token) while guaranteeing the loop re-enters `select!` every few ms so input is polled.
 const ENGINE_DRAIN_BURST_CAP: usize = 128;
 
+/// The streaming drift-heal cadence: the longest a live session may go without a
+/// full in-place repaint ([`HealMode::Invalidate`]) while output is streaming, so
+/// drift ratatui's own-buffer diff cannot see can never outlive it. Set well above
+/// [`FRAME_MIN`] so it is at most ~one extra full repaint per second (never a
+/// per-frame one), and it only applies while output is actively STREAMING — an idle
+/// or merely-being-typed-at screen never pays it. The heal is now erase-free, so it
+/// is invisible on EVERY terminal (no synchronized-output support required) and the
+/// cadence runs on every platform rather than being gated to a Windows console.
 const REPAINT_HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// P4 — how long after the last streaming/engine write the classic-conhost repaint
@@ -6490,7 +6641,7 @@ async fn bounded_session_close(mut session: Box<dyn umadev_runtime::BaseSession>
 }
 
 /// R3 — the per-loop draw decision (pure, so it is unit-tested directly). Draw
-/// when a self-heal repaint is forced (`force_full_repaint`), when a latency-
+/// when a self-heal repaint is forced (`heal_due`), when a latency-
 /// sensitive source asked for an immediate frame (`draw_now` — input / the
 /// animation tick / a cancel drain), or when the transcript is dirty
 /// (`needs_redraw`) AND at least one `budget` has elapsed since the last paint.
@@ -6498,13 +6649,13 @@ async fn bounded_session_close(mut session: Box<dyn umadev_runtime::BaseSession>
 /// so the redraws coalesce to ~one per budget instead of one per token, yet a
 /// forced or interactive frame never waits.
 fn frame_budget_allows_draw(
-    force_full_repaint: bool,
+    heal_due: bool,
     draw_now: bool,
     needs_redraw: bool,
     since_last_draw: Duration,
     budget: Duration,
 ) -> bool {
-    force_full_repaint || draw_now || (needs_redraw && since_last_draw >= budget)
+    heal_due || draw_now || (needs_redraw && since_last_draw >= budget)
 }
 
 /// Whether an input event may COALESCE onto the budgeted redraw cadence
@@ -6675,58 +6826,25 @@ async fn event_loop(
     // [`MouseSeqFilter`]. Lives across iterations so a sequence split over
     // several polls is still recognized.
     let mut mouse_seq_filter = MouseSeqFilter::default();
-    // DEC 2026 synchronized-output (BSU/ESU) support. Starts from the cheap env
-    // allowlist and is CONFIRMED (or corrected) by the runtime DECRQM probe
-    // below within ~SYNC_PROBE_TIMEOUT, then cached for the session. When
-    // `true`, each frame write is wrapped in BSU/ESU AND fully repainted from a
-    // cleared buffer (P0): the terminal buffers the whole frame and swaps it
-    // atomically, so neither a mid-paint tear NOR accumulated drift can survive
-    // a frame. See [`synchronized_output_supported`] / [`sync_probe_outcome`].
-    let mut sync_output = synchronized_output_supported();
-    // Fix A — the every-frame P0 clear is only invisible when DEC 2026 is TRULY honored, which
-    // only a real DECRPM probe reply confirms. `sync_output` above is a mere env-allowlist
-    // GUESS; on Windows the probe never runs (legacy input path) and conpty may not honor 2026,
-    // so trusting the guess blanked the whole screen every frame = the WezTerm/WT flicker. P0
-    // keys off this CONFIRMED flag instead (stays false until a real reply lands).
-    let mut sync_confirmed = false;
-    // P2 — runtime capability query. Send the DECRQM through the render's OWN
-    // backend writer (single-writer discipline; raw mode is on, so nothing
-    // echoes) and arm the reply deadline. OWNED input path only: the owned
-    // tokenizer routes the DECRPM reply to a consumed `Response` (never
-    // keystrokes) and parks the verdict for `take_sync_output_reply`; the
-    // legacy `EventStream` (Windows default / `UMADEV_LEGACY_INPUT=1`) has no
-    // lane for the reply, so there the allowlist verdict stands unprobed.
-    // Fail-open: a write error just skips the probe (deadline stays `None`).
-    let mut sync_probe_deadline: Option<Instant> = None;
-    if use_owned {
-        use std::io::Write as _;
-        let backend = terminal.backend_mut();
-        if backend
-            .write_all(SYNC_PROBE_QUERY)
-            .and_then(|()| backend.flush())
-            .is_ok()
-        {
-            sync_probe_deadline = Some(Instant::now() + SYNC_PROBE_TIMEOUT);
-        }
-    }
 
-    // --- Rendering self-heal state (P0/P3) ------------------------------------
-    // When `true`, the next frame clears the screen + back buffer INSIDE the
-    // BSU/ESU block (so the heal swaps atomically where sync output is on),
-    // healing any drift ratatui's prev-vs-next diff can't see. Fed each
-    // iteration by the P3 contamination drain (`App::take_terminal_contaminated`
-    // — out-of-band writes, discrete layout transitions, Ctrl+L / `/redraw`)
-    // plus the loop-local input-height guard. Under CONFIRMED sync output the
-    // clear happens every frame regardless (P0) and this flag only guarantees
-    // the healing frame actually draws. Cleared after each draw. Always starts
-    // `false`, so behavior is identical when no drift.
-    let mut force_full_repaint = false;
-    // P4 — non-sync repaint-heartbeat clock: the last time the screen was fully
-    // cleared+repainted. On a classic-conhost session (no sync output) a long
-    // steady streaming run forces no full repaint, so drift ratatui's diff can't
-    // see would accumulate; `periodic_repaint_due` consults this to force one
-    // clear+repaint per `REPAINT_HEARTBEAT` while live. Reset on every real
-    // clear below. Inert on the sync path (which clears every frame anyway).
+    // --- Rendering self-heal state --------------------------------------------
+    // The screen holds bytes we never wrote (an out-of-band write, `Ctrl+L` /
+    // `/redraw`, a discrete layout transition): the next frame ERASES and
+    // repaints ([`HealMode::Erase`]). Fed each iteration by the contamination
+    // drain (`App::take_terminal_contaminated`) plus the loop-local input-height
+    // guard. Cleared after each draw; starts `false`, so an undrifted session
+    // behaves exactly as before.
+    let mut erase_due = false;
+    // The screen drifted from cells WE wrote (an ambiguous-width glyph the
+    // terminal rendered wider than `unicode-width` predicted, a terminal-side
+    // scroll, a resize/focus settle): the next frame repaints every cell IN
+    // PLACE, with no erase ([`HealMode::Invalidate`]) — invisible on every
+    // terminal, sync-output support or not. Recomputed from the heal windows +
+    // the streaming cadence each iteration.
+    let mut invalidate_due;
+    // Drift-heal clock: the last time the screen was fully repainted (by ANY
+    // heal). The streaming heartbeat consults it so the in-place repaint runs at
+    // most once per `REPAINT_HEARTBEAT` while output streams.
     let mut last_full_repaint = Instant::now();
     // Paste-burst timing: arrival Instant of the previous key, to flag a pasted newline
     // (Windows delivers a bracketed paste as raw keys) apart from a genuine submit Enter.
@@ -6969,28 +7087,6 @@ async fn event_loop(
             needs_redraw = true;
         }
 
-        // P2 — resolve the startup sync-output probe. The DECRPM verdict is
-        // captured inside `input.next()` (the reply yields no input event, so
-        // it can't wake the loop itself); polling it here — the 80ms tick
-        // guarantees an iteration — picks it up promptly, and the deadline
-        // falls back to the env allowlist. Cheap once resolved: the deadline
-        // is `None` and this whole block is skipped for the session.
-        if let Some(deadline) = sync_probe_deadline {
-            let reply = input.take_sync_output_reply();
-            let got_reply = reply.is_some();
-            if let Some(confirmed) =
-                sync_probe_outcome(reply, Instant::now() >= deadline, sync_output)
-            {
-                sync_output = confirmed;
-                // Fix A: only a REAL reply confirms 2026 end-to-end; a timeout-fallback to the
-                // allowlist does NOT enable the every-frame P0 clear.
-                if got_reply {
-                    sync_confirmed = confirmed;
-                }
-                sync_probe_deadline = None;
-            }
-        }
-
         // Live→settled contamination. On a NON-sync terminal nothing repaints
         // in full DURING a long streaming run, so any incremental-diff drift it
         // accumulated (the reported "rows overlapping / `本轮已中止` stacked
@@ -7010,18 +7106,17 @@ async fn event_loop(
         }
         was_live = now_live;
 
-        // P3 — drain the terminal-contamination flag into this frame's heal
-        // gate. Raised by ANY out-of-band write (the completion BEL, a
-        // terminal-mode reassert, an OSC 52 clipboard copy, a `/mouse` toggle)
-        // and by the discrete layout transitions the incremental diff can't
-        // survive (a transcript reflow / re-base / scroll jump, a
-        // height-changing recall or `/clear`, focus gain, a resize, the settle
-        // edge above, Ctrl+L / `/redraw`): the next frame does one real
-        // `Clear` + ratatui back-buffer reset, so no stale row survives.
-        // One-shot; fail-open — a missed flag only forgoes one heal, and under
-        // confirmed sync output every frame repaints in full anyway.
+        // Drain the terminal-contamination flag into this frame's heal gate.
+        // Raised by ANY out-of-band write (the completion BEL, a terminal-mode
+        // reassert, an OSC 52 clipboard copy, a `/mouse` toggle) and by the
+        // discrete layout transitions the incremental diff can't survive (a
+        // transcript reflow / re-base / scroll jump, a height-changing recall or
+        // `/clear`, the settle edge above, Ctrl+L / `/redraw`). These are the
+        // cases where the screen genuinely holds bytes we never wrote, so the
+        // next frame ERASES and repaints. One-shot; fail-open — a missed flag
+        // only forgoes one heal.
         if app.take_terminal_contaminated() {
-            force_full_repaint = true;
+            erase_due = true;
         }
         // Generic input-height-change guard: if the rendered input-box height
         // differs from the last frame's, the prompt grew/shrank and the content
@@ -7032,84 +7127,50 @@ async fn event_loop(
         // very first iteration so the initial paint is never forced spuriously.
         let input_rows_now = app.input_block_height();
         if last_input_block_rows.is_some_and(|prev| prev != input_rows_now) {
-            force_full_repaint = true;
+            erase_due = true;
         }
         last_input_block_rows = Some(input_rows_now);
 
-        // P4 — non-sync live-run repaint heartbeat. On a terminal WITHOUT
-        // synchronized output (classic conhost) nothing forces a full repaint
-        // during a long steady streaming run, so incremental-diff drift would
-        // accumulate unwiped (the Windows 界面错乱 after a while). Force ONE full
-        // clear+repaint on a bounded cadence while live OR while the prompt was
-        // edited recently (P4b — the idle-edit heal gap: a same-line
-        // backspace/insert on an idle prompt drifts under the incremental diff
-        // and otherwise only a resize recovers). Gated to the non-sync path so
-        // sync-output terminals (which already clear every frame — P0) and idle,
-        // un-edited screens (nothing to drift) are untouched. The cadence still
-        // throttles it to ~1x/sec, so editing never triggers a per-keystroke
-        // clear. Fail-open: it only sets the existing heal flag, so it can never
-        // wedge the loop.
-        // Gated to Windows. This full-clear heartbeat exists ONLY to wipe classic
-        // conhost's incremental-diff drift while STREAMING (the "Windows 界面错乱
-        // after a while"). On macOS/Linux ratatui's incremental diff reconciles
-        // reliably, so a periodic full clear there is pure harm: a ~1Hz whole-screen
-        // flash during a long streaming run (reported on macOS Terminal.app). Unix
-        // terminals never drift this way, and their event-driven heals (resize/paste
-        // contamination, input-height change, /clear) still fire — so nothing is left
-        // un-healed. Typing is NOT a trigger (see `periodic_repaint_due`): a naked
-        // full clear while the user types WAS the "Windows 输入闪屏".
+        // --- Drift heals (erase-free, in-place repaint) --------------------------
+        // Every one of these is DRIFT — the screen shows cells WE wrote, merely in
+        // the wrong place (an ambiguous-width glyph the terminal drew two columns
+        // wide, a terminal-side scroll, a resize/focus settle). None of them wants
+        // an erase, so they all route to `HealMode::Invalidate`: reset the previous
+        // buffer and repaint every cell IN PLACE. That is flicker-free on EVERY
+        // terminal — no `ED(2)`, no `move_to(0, 0)` cursor sweep, and no dependence
+        // on the terminal honoring DEC 2026 — which is why the whole
+        // sync-probe / allowlist / conhost-detection apparatus that used to gate a
+        // *clear*-based heal is gone.
         //
-        // The heartbeat fires ONLY while output is actively STREAMING (drift accrues
-        // from cell writes). A STATIC screen — a live run stalled on a tool, a settled
-        // prompt, an idle chat — has no new drift, so it must never flash. The settle
-        // edge is healed once by `contaminate_terminal()` above, not by a timed window.
+        // The streaming heartbeat fires ONLY while output is actively STREAMING
+        // (drift accrues from cell WRITES). A STATIC screen — a live run stalled on
+        // a tool, a settled prompt, an idle chat, a prompt being typed at — has no
+        // new drift, so it never heals. The settle edge is healed once by the
+        // contamination above, not by a timed window.
         let stream_active_recently =
             last_stream_activity.is_some_and(|t| t.elapsed() < STREAM_HEAL_WINDOW);
-        // Resize heal window - force a full clear+repaint for a short spell after the last
-        // resize so a multi-frame drag + terminal-buffer settle heals completely (one
-        // contamination clear on a single Resize left stale cells from the pre-settle sizes).
+        invalidate_due = stream_active_recently && last_full_repaint.elapsed() >= REPAINT_HEARTBEAT;
+        // Resize heal window — a window drag fires many Resize events over several
+        // frames and the terminal settles its own buffer across them, so healing on
+        // ONE of them leaves stale cells from the pre-settle sizes. Repaint in place
+        // every frame for a short spell past the LAST resize.
         if last_resize_at.is_some_and(|t| t.elapsed() < RESIZE_HEAL_WINDOW) {
-            force_full_repaint = true;
+            invalidate_due = true;
         }
-        // Focus-return heal window - the SAME multi-frame settle problem as resize. On focus
-        // return the terminal (notably the Windows console, and worse across a multi-monitor
-        // compositor) redraws its OWN buffer over SEVERAL frames; a single contamination clear
-        // races that and gets overwritten by the terminal's later stale redraw, so the garble
-        // survives (the reported "focus away for minutes, focus back → 乱码" on a 2-external-
-        // monitor laptop). Healing every frame for a short window past focus return makes OUR
-        // repaint the last word after the terminal settles. Also opened on the resume-gap path
-        // below, so a terminal that never delivers a DEC-1004 focus event still heals on the
-        // first interaction after returning.
+        // Focus-return heal window — the SAME multi-frame settle problem as resize.
+        // On focus return the terminal (notably the Windows console, and worse across
+        // a multi-monitor compositor) redraws its OWN buffer over SEVERAL frames; a
+        // single heal races that and gets overwritten by the terminal's later stale
+        // redraw, so the garble survives (the reported "focus away for minutes, focus
+        // back → 乱码"). Healing every frame for a short window past focus return
+        // makes OUR repaint the last word after the terminal settles. Also opened on
+        // the resume-gap path below, so a terminal that never delivers a DEC-1004
+        // focus event still heals on the first interaction after returning.
         if last_focus_gained_at.is_some_and(|t| t.elapsed() < FOCUS_HEAL_WINDOW) {
-            force_full_repaint = true;
+            invalidate_due = true;
         }
-        // P4b — a terminal that supports the synchronized-output brackets
-        // (`sync_output`) but whose per-frame P0 heal is off because sync was never
-        // CONFIRMED (notably Windows Terminal: the DECRQM probe is never sent on
-        // Windows, so `sync_confirmed` stays false forever) gets NEITHER P0 nor the
-        // conhost P4 heartbeat — drift never heals. Heal it with the SAME throttled
-        // streaming heartbeat; because `sync_output` is true the forced clear lands
-        // inside the BSU/ESU bracket below → atomic → invisible (no flicker). Gated
-        // to active streaming + the throttle, exactly like the conhost heartbeat, so
-        // an idle screen never pays a clear. macOS Terminal.app (sync_output=false)
-        // does NOT match here, so it keeps getting no heartbeat and stays clean.
-        if (is_legacy_conhost()
-            && periodic_repaint_due(
-                sync_output,
-                stream_active_recently,
-                last_full_repaint.elapsed(),
-                REPAINT_HEARTBEAT,
-            ))
-            || atomic_unconfirmed_heartbeat_due(
-                sync_output,
-                sync_confirmed,
-                stream_active_recently,
-                last_full_repaint.elapsed(),
-                REPAINT_HEARTBEAT,
-            )
-        {
-            force_full_repaint = true;
-        }
+        // This frame's single heal decision.
+        let heal = heal_mode(invalidate_due, erase_due);
 
         // R3 — frame-budget gate. Draw when a self-heal repaint is forced, when a
         // latency-sensitive source asked for an immediate frame (`draw_now` —
@@ -7120,62 +7181,50 @@ async fn event_loop(
         // ~one repaint per frame interval. A still-pending redraw is flushed
         // within the budget by the frame-deadline `select!` arm below.
         let do_draw = frame_budget_allows_draw(
-            force_full_repaint,
+            heal != HealMode::None,
             draw_now,
             needs_redraw,
             last_draw.elapsed(),
             FRAME_MIN,
         );
         if do_draw {
-            // Wrap the frame in a synchronized-output update when supported: the
-            // terminal holds back the paint until ESU, then swaps atomically, so a
-            // half-drawn frame can never surface (the root fix for mid-render
-            // garble). ESU is emitted UNCONDITIONALLY after the draw — even if it
+            // Wrap the frame in a synchronized-output update — ALWAYS. The DEC-2026
+            // brackets are a private mode: a terminal that doesn't implement them
+            // silently ignores the two escapes (and crossterm's Windows path has a
+            // literal no-op `execute_winapi` for them), so emitting is free — four
+            // bytes each. A terminal that DOES implement them holds the paint back
+            // until ESU and swaps it atomically, so a half-drawn frame can never
+            // surface. That makes the whole env-allowlist + DECRQM-probe apparatus
+            // that used to decide whether to emit them pure dead weight — it is
+            // gone. ESU is emitted UNCONDITIONALLY after the draw — even if the draw
             // errored — so the terminal can never get stuck in synchronized mode.
             // Both ends fail-open (`let _ =`): a write error never blocks the loop.
             //
-            // R3 — BSU/ESU go through ratatui's OWN backend writer
+            // The brackets go through ratatui's OWN backend writer
             // (`terminal.backend_mut()`), NOT a separate `std::io::stdout()` handle,
-            // so the synchronized-update brackets share buffering + flush ordering
-            // with the cell writes (no interleave between the wrapper and the frame).
-            if sync_output {
-                let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
-            }
-            // P5 — the caret is HIDDEN for the whole paint, and only revealed again
-            // (by `ui::place_caret`, below) once it is back on its real cell. Painting
-            // drags the caret: `terminal.clear()` parks it at (0,0) — on Windows
-            // crossterm's `clear_entire_screen` explicitly `move_to(0,0)`s — and the
-            // cell writes then walk it through every changed cell, the entire screen
-            // on a full repaint. A terminal that repaints on its own timer rather than
-            // per write (conhost, which has no DEC-2026 sync to hide any of this)
-            // renders those intermediate states, and the user sees the caret jumping
-            // to the top-left / sweeping the screen. Hiding first costs one 6-byte
-            // write and makes the whole paint caret-invisible. Fail-open.
+            // so they share buffering + flush ordering with the cell writes.
+            let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
+            // The caret is HIDDEN for the whole paint, and only revealed again (by
+            // `ui::place_caret`, below) once it is back on its real cell. Painting
+            // drags the caret: an ERASE parks it at (0,0) — on Windows crossterm's
+            // `clear_entire_screen` explicitly `move_to(0,0)`s — and the cell writes
+            // then walk it through every changed cell. A terminal that repaints on
+            // its own timer rather than per write renders those intermediate states,
+            // and the user sees the caret sweeping the screen. Hiding first costs one
+            // 6-byte write and makes the whole paint caret-invisible. Fail-open.
             let _ = terminal.hide_cursor();
-            // P0 — heal terminal-side drift, but NOT on every frame. ratatui's flush
-            // diffs its OWN prev/next buffers and never reconciles against the real
-            // terminal, so a drifted screen under identical buffers produces an empty
-            // diff. Under CONFIRMED sync output a full clear+repaint is bracketed by
-            // BSU/ESU and swaps atomically, so it is INVISIBLE on a well-behaved sync
-            // terminal — but doing it EVERY frame flickered on a terminal whose sync
-            // is imperfect (a GPU terminal with its own smooth-scroll): scrolling
-            // (many frames) poured out the flicker, worst at the bottom (reported on
-            // otty; zed's solid sync and non-sync Terminal.app — which never takes this
-            // path — both stay clean). So the sync clear is now gated the SAME way as
-            // the conhost heartbeat: it heals ONLY while output is actively STREAMING
-            // (drift accrues from cell WRITES) and only on the throttled cadence —
-            // never during a pure scroll or on an idle screen. Discrete heals
-            // (`force_full_repaint`: resize / focus / contamination) still clear
-            // immediately, once each. Fail-open: a clear error never blocks the draw.
-            let sync_heal_due = sync_confirmed
-                && stream_active_recently
-                && last_full_repaint.elapsed() >= REPAINT_HEARTBEAT;
-            if frame_needs_clear(sync_heal_due, force_full_repaint) {
-                let _ = terminal.clear();
-                // P4 — a full wipe just happened; restart the non-sync repaint
-                // heartbeat from here so it measures the gap since the last real
-                // full repaint (whatever forced it — heal, contamination, or the
-                // heartbeat itself), never re-firing sooner than the cadence.
+            // Heal terminal-side drift, but never on every frame. `Invalidate` (the
+            // streaming cadence + the resize/focus settle windows) repaints every
+            // cell IN PLACE with no erase — invisible on every terminal, so it needs
+            // no sync-output support to be safe. `Erase` (true contamination) does
+            // the one `ED(2)` the user actually asked for. Fail-open: a heal error
+            // never blocks the draw.
+            apply_heal(terminal, heal);
+            if heal != HealMode::None {
+                // A full repaint just happened; restart the drift-heal cadence from
+                // here so it measures the gap since the last real full repaint
+                // (whatever forced it — a window, contamination, or the heartbeat
+                // itself), never re-firing sooner than the cadence.
                 last_full_repaint = Instant::now();
             }
             // `.map(|f| f.area)` drops the `CompletedFrame`'s borrow of `terminal`
@@ -7192,14 +7241,13 @@ async fn event_loop(
             // too-small) publishes `None` and correctly leaves it hidden.
             // Fail-open: a caret write error never blocks the loop.
             let _ = ui::place_caret(terminal, app);
-            if sync_output {
-                let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
-            }
-            // The contamination heal (if any) has now been painted.
-            force_full_repaint = false;
+            let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
+            // The contamination erase (if any) has now been painted. The drift
+            // windows are time-based and re-evaluate themselves next iteration.
+            erase_due = false;
             // Propagate a draw error; the drawn `Rect` is no longer needed (a
-            // resize contaminates the terminal — one full clear+repaint — so
-            // there is no last-drawn-size debounce to feed).
+            // resize opens its own heal window, so there is no last-drawn-size
+            // debounce to feed).
             draw_result?;
 
             // Feature A — completion notification. A turn/run that reached a terminal
@@ -7482,7 +7530,7 @@ async fn event_loop(
                     // autoresize inside `terminal.draw`; recording them as the poll
                     // baseline keeps the tick's size poll from re-firing on a resize
                     // this event path already healed. Fail-open.
-                    apply_resize_heal(app, &mut last_resize_at);
+                    apply_resize_heal(&mut last_resize_at);
                     last_known_size = Some((*w, *h));
                 } else if let Some(Ok(Event::FocusGained)) = &maybe_key {
                     // Focus regained (DEC mode 1004). While the window was
@@ -7496,12 +7544,11 @@ async fn event_loop(
                     // no repaint and falls through as a no-op. Fail-open (harmless
                     // on unix: returning to a well-behaved xterm just repaints one
                     // clean frame).
-                    app.contaminate_terminal();
-                    // Open the focus-heal WINDOW (not just one frame): the terminal's own
-                    // redraw on focus return spans several frames on a multi-monitor / Windows
-                    // console setup, so keep healing briefly so its later stale redraw can't
-                    // overwrite our clean frame (the reported focus-return 乱码).
-                    last_focus_gained_at = Some(Instant::now());
+                    // The ONE focus-return reaction: re-assert the DEC modes ConPTY
+                    // strips while unfocused (incl. the load-bearing autowrap-off)
+                    // AND open the multi-frame focus-heal window. See
+                    // [`apply_focus_heal`].
+                    apply_focus_heal(terminal, app.mouse_scroll, &mut last_focus_gained_at);
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
                     // Mouse → wheel scrollback + the in-app drag-to-select/copy layer
                     // (the Claude Code approach: WE render the selection highlight and
@@ -8553,7 +8600,7 @@ async fn event_loop(
                 // and an unchanged size never clears (no per-frame flicker).
                 let polled = terminal.size().ok().map(|s| (s.width, s.height));
                 if size_poll_detected_resize(last_known_size, polled) {
-                    apply_resize_heal(app, &mut last_resize_at);
+                    apply_resize_heal(&mut last_resize_at);
                     // Repaint promptly at the new size — an idle screen has no
                     // other draw trigger pending.
                     draw_now = true;
@@ -10018,55 +10065,6 @@ mod tests {
         let ctrl_esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL);
         assert_eq!(f.feed(ctrl_esc), vec![ctrl_esc]);
         assert!(f.flush().is_empty(), "modified key was not buffered");
-    }
-
-    #[test]
-    fn synchronized_output_supported_detects_known_terminals() {
-        // Env is process-global: snapshot every var the detector reads, force a
-        // clean slate for each case, then restore even if an assertion fails.
-        let keys = [
-            "TMUX",
-            "TERM_PROGRAM",
-            "TERM",
-            "KITTY_WINDOW_ID",
-            "ZED_TERM",
-            "WT_SESSION",
-            "VTE_VERSION",
-        ];
-        let _env: Vec<_> = keys.iter().map(|k| EnvRestore::remove(k)).collect();
-        let clear = || {
-            for k in keys {
-                std::env::remove_var(k);
-            }
-        };
-
-        clear();
-        // Unknown terminal → conservative false (just draws as before).
-        assert!(!synchronized_output_supported(), "unknown env → false");
-
-        // Windows Terminal (the reported Windows garble case) → true.
-        std::env::set_var("WT_SESSION", "session-id");
-        assert!(synchronized_output_supported(), "WT_SESSION → true");
-        clear();
-
-        // tmux disables it even when an otherwise-supported terminal is present.
-        std::env::set_var("TMUX", "/tmp/tmux-0/default,1,0");
-        std::env::set_var("TERM_PROGRAM", "iTerm.app");
-        assert!(!synchronized_output_supported(), "TMUX wins → false");
-        clear();
-
-        // A spread of known-supported signals.
-        std::env::set_var("TERM_PROGRAM", "WezTerm");
-        assert!(synchronized_output_supported(), "WezTerm → true");
-        clear();
-        std::env::set_var("TERM", "xterm-kitty");
-        assert!(synchronized_output_supported(), "kitty TERM → true");
-        clear();
-        std::env::set_var("VTE_VERSION", "6800");
-        assert!(synchronized_output_supported(), "VTE >= 6800 → true");
-        clear();
-        std::env::set_var("VTE_VERSION", "5400");
-        assert!(!synchronized_output_supported(), "old VTE < 6800 → false");
     }
 
     /// A minimal [`RoutePlan`] of a given class for driving [`drive_agentic_stream`]
@@ -14762,34 +14760,6 @@ mod tests {
     // contamination) ------------------------------------------------------------
 
     #[test]
-    fn frame_clears_on_sync_heal_due_or_a_requested_heal_else_never() {
-        // P0 — a full clear+repaint fires when a SYNC-heal is due (throttled to the
-        // streaming-drift cadence — NOT every frame; the caller gates it on streaming
-        // activity, so a pure scroll / idle screen never clears — the otty scroll-
-        // flicker fix) OR when a discrete heal (contamination / resize / focus) was
-        // requested.
-        assert!(
-            frame_needs_clear(true, false),
-            "a due sync heal forces the (atomic, BSU/ESU-wrapped) clear+repaint"
-        );
-        assert!(
-            frame_needs_clear(true, true),
-            "sync heal + a pending discrete heal → still exactly one clear"
-        );
-        // Neither a sync heal due NOR a requested heal → NEVER clear. This is the
-        // steady state during a pure scroll or an idle screen: rely on ratatui's diff,
-        // so nothing flickers (the case that flickered on otty when it was `sync` alone).
-        assert!(
-            !frame_needs_clear(false, false),
-            "no sync heal due and no requested heal must not clear (scroll/idle = no flicker)"
-        );
-        assert!(
-            frame_needs_clear(false, true),
-            "a discrete heal (contamination drain) clears exactly once"
-        );
-    }
-
-    #[test]
     fn size_poll_detects_a_lost_resize_event_only_on_a_real_change() {
         // No baseline yet (startup / first poll) → record only, never heal: the
         // initial paint must not be preceded by a spurious clear.
@@ -14824,186 +14794,373 @@ mod tests {
     #[test]
     fn poll_detected_resize_runs_the_same_heal_as_an_event_resize() {
         // The shared reaction (`apply_resize_heal`) — used by BOTH a delivered
-        // Event::Resize and the tick-time size-poll fallback — raises the P3
-        // contamination flag (one full clear+repaint on the next frame) AND opens
-        // the RESIZE_HEAL_WINDOW (every frame keeps clearing for a short spell so
-        // the terminal's multi-frame buffer settle heals too, not just one frame).
-        let tmp = tempfile::TempDir::new().unwrap();
-        let app = App::new(
-            "demo".to_string(),
-            crate::config::UserConfig::default(),
-            tmp.path().join("config.toml"),
-            tmp.path().to_path_buf(),
-        );
+        // Event::Resize and the tick-time size-poll fallback — opens the
+        // RESIZE_HEAL_WINDOW, so every frame for a short spell repaints IN PLACE
+        // (HealMode::Invalidate) and the terminal's multi-frame buffer settle heals
+        // too, not just one frame. It deliberately does NOT contaminate: a resize
+        // shows OUR cells at the wrong geometry (drift), not foreign bytes, so it
+        // must not pay an ED(2) erase + its (0,0) cursor sweep.
         let mut last_resize_at = None;
-        apply_resize_heal(&app, &mut last_resize_at);
-        assert!(
-            app.take_terminal_contaminated(),
-            "a detected resize contaminates → one healing clear+repaint next frame"
-        );
+        apply_resize_heal(&mut last_resize_at);
         assert!(
             last_resize_at.is_some_and(|t| t.elapsed() < RESIZE_HEAL_WINDOW),
             "a detected resize opens the resize heal window for the settle frames"
         );
     }
 
+    // --- The heal split: drift repaints in place, contamination erases -----------
+
     #[test]
-    fn non_sync_live_run_gets_a_bounded_repaint_heartbeat() {
-        // P4 — the classic-conhost STREAMING-drift wipe. The heartbeat fires ONLY on
-        // the non-sync path, ONLY while live (streaming), and ONLY once the cadence
-        // has elapsed. Signature: (sync, live, elapsed, cadence).
-        let cadence = Duration::from_secs(1);
-        // Non-sync + live + past the cadence → force one full repaint.
-        assert!(
-            periodic_repaint_due(false, true, Duration::from_millis(1200), cadence),
-            "non-sync live run past the cadence must force a full repaint"
+    fn heal_mode_erases_only_for_contamination_and_invalidates_for_drift() {
+        // Drift (the streaming cadence / the resize + focus settle windows): repaint
+        // every cell IN PLACE. No ED(2), no (0,0) cursor park, no flash, and no
+        // dependence on the terminal honoring DEC 2026.
+        assert_eq!(
+            heal_mode(true, false),
+            HealMode::Invalidate,
+            "drift heals in place — never an erase"
         );
-        // At the boundary (>=) it counts.
-        assert!(
-            periodic_repaint_due(false, true, cadence, cadence),
-            "the cadence boundary itself is due"
+        // True contamination (an out-of-band write / Ctrl+L / /redraw): the screen
+        // holds bytes we never wrote, so only an erase is honest.
+        assert_eq!(
+            heal_mode(false, true),
+            HealMode::Erase,
+            "contamination erases"
         );
-        // Within the cadence → not yet (bounded, never a per-frame clear).
+        // Contamination wins when both are pending — the erase subsumes the repaint,
+        // so a frame never pays two heals.
+        assert_eq!(
+            heal_mode(true, true),
+            HealMode::Erase,
+            "contamination subsumes a concurrent drift heal (exactly one heal per frame)"
+        );
+        // The steady state — a pure scroll, an idle screen, a prompt being typed at:
+        // NOTHING. This is the anti-flicker contract: no per-frame heal, ever.
+        assert_eq!(
+            heal_mode(false, false),
+            HealMode::None,
+            "no drift and no contamination → plain incremental diff (no flicker)"
+        );
+    }
+
+    /// A `Write` sink that keeps its bytes reachable — `CrosstermBackend`'s own
+    /// writer is private, so a recording backend has to own the tap itself.
+    #[derive(Clone, Default)]
+    struct Tap(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl Tap {
+        /// Take everything written so far, as a lossy string.
+        fn drain(&self) -> String {
+            let bytes = std::mem::take(&mut *self.0.borrow_mut());
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    impl std::io::Write for Tap {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A `Terminal` over the REAL `AnchoredBackend` + `CrosstermBackend`, writing its
+    /// escape sequences into a [`Tap`] instead of a TTY — so a test can assert on the
+    /// EXACT bytes a frame put on the wire.
+    fn recording_terminal(w: u16, h: u16) -> (ratatui::Terminal<AnchoredBackend<Tap>>, Tap) {
+        let tap = Tap::default();
+        let backend = AnchoredBackend::new(CrosstermBackend::new(tap.clone()));
+        let terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, w, h)),
+            },
+        )
+        .expect("a Tap-backed terminal cannot fail");
+        (terminal, tap)
+    }
+
+    /// Paint `text` at (0, 0) — a tiny stand-in for a real frame.
+    fn draw_text(terminal: &mut ratatui::Terminal<AnchoredBackend<Tap>>, text: &str) {
+        terminal
+            .draw(|f| {
+                f.render_widget(
+                    ratatui::widgets::Paragraph::new(text),
+                    ratatui::layout::Rect::new(0, 0, f.area().width, 1),
+                );
+            })
+            .expect("a Tap-backed draw cannot fail");
+    }
+
+    /// Whether the wire carries ANY screen-erase op — the thing a drift heal must
+    /// never emit. `ED(2)` (`\x1b[2J`, what `Clear(All)` sends on a fullscreen
+    /// viewport) and `ED(0)` (`\x1b[J` / `\x1b[0J`, the erase-to-end a fixed
+    /// viewport's per-row clear sends) both blank real cells and, on Windows, park
+    /// the cursor at (0, 0) — the flash + the cursor sweep.
+    fn erases_the_screen(wire: &str) -> bool {
+        wire.contains("\x1b[2J") || wire.contains("\x1b[J") || wire.contains("\x1b[0J")
+    }
+
+    #[test]
+    fn a_drift_heal_repaints_without_erasing_while_contamination_still_erases() {
+        // THE central behavioral claim of the heal split, asserted on the wire.
+        let (mut terminal, tap) = recording_terminal(12, 2);
+        draw_text(&mut terminal, "hello");
+        let _first = tap.drain();
+
+        // A second identical frame with NO heal: ratatui's own-buffer diff is empty,
+        // so nothing is repainted. (This is exactly why drift can never self-heal —
+        // and why the heal below has to exist at all.)
+        draw_text(&mut terminal, "hello");
+        let steady = tap.drain();
         assert!(
-            !periodic_repaint_due(false, true, Duration::from_millis(200), cadence),
-            "within the cadence the heartbeat must not fire (no per-frame clear)"
+            !steady.contains('h'),
+            "an unchanged frame emits no cells (the empty diff that lets drift persist): {steady:?}"
         );
 
-        // --- THE FLICKER FIX: typing / an idle prompt is NEVER a heartbeat reason.
-        // `live` is false when no run streams (an idle prompt, whether or not the
-        // user is typing at it). Even long past the cadence it must NOT force a
-        // clear — a naked whole-screen wipe while the user types WAS the reported
-        // "Windows 输入闪屏". ratatui's cell diff heals a same-line edit on its own.
+        // DRIFT heal → repaint every cell IN PLACE. No erase, and the cells come back.
+        apply_heal(&mut terminal, HealMode::Invalidate);
+        draw_text(&mut terminal, "hello");
+        let healed = tap.drain();
         assert!(
-            !periodic_repaint_due(false, false, Duration::from_secs(10), cadence),
-            "an idle / typed-at non-streaming prompt must NEVER pay a heartbeat clear"
+            !erases_the_screen(&healed),
+            "a drift heal must emit NO erase op — the erase is the flash + the (0,0) cursor sweep: {healed:?}"
+        );
+        assert!(
+            healed.contains("hello"),
+            "a drift heal must re-emit the frame's cells in place: {healed:?}"
         );
 
-        // Sync output → NEVER on this path — every frame already repaints (P0),
-        // so the heartbeat must add no clears there, live or idle.
+        // CONTAMINATION heal → the erase the caller actually asked for.
+        apply_heal(&mut terminal, HealMode::Erase);
+        draw_text(&mut terminal, "hello");
+        let erased = tap.drain();
         assert!(
-            !periodic_repaint_due(true, true, Duration::from_secs(10), cadence),
-            "sync output must not take the heartbeat path (already clears every frame)"
+            erases_the_screen(&erased),
+            "contamination must still erase the screen: {erased:?}"
         );
+        assert!(erased.contains("hello"), "…and repaint: {erased:?}");
+
+        // And HealMode::None touches nothing.
+        apply_heal(&mut terminal, HealMode::None);
+        draw_text(&mut terminal, "hello");
+        let none = tap.drain();
         assert!(
-            !periodic_repaint_due(true, false, Duration::from_secs(10), cadence),
-            "sync output idle must not take the heartbeat path either"
+            !erases_the_screen(&none) && !none.contains('h'),
+            "no heal → plain (here: empty) incremental diff: {none:?}"
         );
     }
 
     #[test]
-    fn atomic_unconfirmed_heartbeat_heals_sync_output_but_unconfirmed_terminals() {
-        // P4b — the ATOMIC streaming heartbeat that closes the Windows Terminal gap:
-        // a terminal that supports the BSU/ESU brackets (`sync_output`) but never got
-        // sync CONFIRMED (the DECRQM probe is never sent on Windows) gets NEITHER the
-        // per-frame P0 clear (keys off `sync_confirmed`) NOR the conhost heartbeat
-        // (needs `!sync_output`). This helper heals it, and because `sync_output` is
-        // true the clear lands inside BSU/ESU → atomic → no flicker.
-        // Signature: (sync_output, sync_confirmed, live, elapsed, cadence).
-        let cadence = Duration::from_secs(1);
+    fn a_drift_heal_repaints_cells_that_are_blank_in_the_new_frame() {
+        // The trap in a plain `Buffer::reset()`-based invalidation: reset fills with
+        // `Cell::EMPTY` (a space in the default style), so a cell that is ALSO blank
+        // in the new frame diffs EQUAL and is SKIPPED — and whatever garbage the
+        // drift left in that cell survives the "full" repaint. `invalidate_frame`
+        // poisons the previous buffer with a symbol no real cell can hold, so every
+        // cell — blanks included — is re-emitted. Assert it on the wire: a heal frame
+        // whose content is entirely blank must still write spaces over the screen.
+        let (mut terminal, tap) = recording_terminal(6, 1);
+        draw_text(&mut terminal, "abcdef");
+        let _ = tap.drain();
 
-        // --- THE FIX: sync_output=true, sync_confirmed=false, streaming, past cadence
-        // → fire (atomic wipe under BSU/ESU). This is Windows Terminal.
+        apply_heal(&mut terminal, HealMode::Invalidate);
+        // The new frame is BLANK — every cell is a default-styled space.
+        draw_text(&mut terminal, "");
+        let healed = tap.drain();
         assert!(
-            atomic_unconfirmed_heartbeat_due(
-                true,
-                false,
-                true,
-                Duration::from_millis(1200),
-                cadence
-            ),
-            "sync_output-but-unconfirmed (Windows Terminal) must heal during streaming"
+            healed.contains("      "),
+            "a drift heal must paint the blank cells too, or stale glyphs survive it: {healed:?}"
         );
-        // Boundary (>=) counts.
         assert!(
-            atomic_unconfirmed_heartbeat_due(true, false, true, cadence, cadence),
-            "the cadence boundary itself is due"
+            !erases_the_screen(&healed),
+            "…and still without an erase: {healed:?}"
         );
-        // Within the cadence → not yet (throttled, never per-frame).
+    }
+
+    // --- Cursor-advance re-anchoring (the ambiguous-width root cause) ------------
+
+    #[test]
+    fn the_backend_re_anchors_the_cursor_after_a_non_ascii_cell() {
+        use ratatui::backend::Backend as _;
+        use ratatui::buffer::Cell;
+
+        // ratatui's stock crossterm backend suppresses the MoveTo whenever the next
+        // cell sits at `prev.x + 1` — it ASSUMES every printed cell advanced the real
+        // cursor exactly one column. For an East-Asian AMBIGUOUS-width glyph (`·`,
+        // `─`, `—`, `…`) `unicode-width` says 1 but a CJK-locale terminal renders 2,
+        // so the real cursor ends up one column further right and EVERY later cell in
+        // the row lands in the wrong place. `AnchoredBackend` re-emits an explicit
+        // MoveTo after any non-ASCII cell, so the disagreement self-corrects at the
+        // very next cell instead of cascading.
+        let tap = Tap::default();
+        let mut backend = AnchoredBackend::new(CrosstermBackend::new(tap.clone()));
+        let cells: Vec<(u16, u16, Cell)> = "a·b"
+            .chars()
+            .enumerate()
+            .map(|(i, ch)| {
+                let mut c = Cell::EMPTY;
+                c.set_symbol(&ch.to_string());
+                (u16::try_from(i).unwrap(), 0, c)
+            })
+            .collect();
+        backend
+            .draw(cells.iter().map(|(x, y, c)| (*x, *y, c)))
+            .expect("a Tap-backed draw cannot fail");
+        let wire = tap.drain();
+
+        // The cell AFTER the ambiguous-width `·` is re-anchored with an explicit
+        // MoveTo (1-based CSI row;col H → column index 2 = `\x1b[1;3H`).
         assert!(
-            !atomic_unconfirmed_heartbeat_due(
-                true,
-                false,
-                true,
-                Duration::from_millis(200),
-                cadence
-            ),
-            "within the cadence the heartbeat must not fire (no per-frame clear)"
+            wire.contains("\x1b[1;3H"),
+            "the cell after a non-ASCII glyph must be re-anchored with an explicit MoveTo: {wire:?}"
         );
-        // Not streaming → never (an idle screen has no fresh drift → no flash).
+        // …while the cell after the pure-ASCII `a` still rides the contiguous-run
+        // shortcut (no MoveTo at column index 1 → `\x1b[1;2H`), so a pure-ASCII frame
+        // is byte-for-byte what stock ratatui would emit — the anchoring is free.
         assert!(
-            !atomic_unconfirmed_heartbeat_due(true, false, false, Duration::from_secs(10), cadence),
-            "an idle sync_output-but-unconfirmed screen must NEVER pay a heartbeat clear"
+            !wire.contains("\x1b[1;2H"),
+            "an ASCII predecessor must keep the MoveTo suppression (no per-cell cost): {wire:?}"
+        );
+        assert!(wire.contains('a') && wire.contains('·') && wire.contains('b'));
+    }
+
+    #[test]
+    fn ascii_advance_is_the_only_certain_one() {
+        assert!(cell_advance_is_certain("a"));
+        assert!(cell_advance_is_certain(" "));
+        // Every ambiguous-width glyph UmaDev's own chrome uses — the actual garble
+        // sources — must force a re-anchor.
+        for amb in ["·", "─", "—", "…", "│", "▸"] {
+            assert!(
+                !cell_advance_is_certain(amb),
+                "{amb:?} is ambiguous/wide — its column advance is NOT certain"
+            );
+        }
+        // …and so must a plain CJK glyph.
+        assert!(!cell_advance_is_certain("中"));
+    }
+
+    #[test]
+    fn autowrap_is_disabled_on_enter_and_restored_on_exit() {
+        // DECAWM off (`\x1b[?7l`) for the alt-screen session: with autowrap ON, one
+        // glyph the terminal renders wider than `unicode-width` predicted pushes the
+        // row's tail past the right margin, the terminal SPILLS it onto the next
+        // line, and the corruption cascades down the whole screen — invisible to
+        // ratatui's own-buffer diff, so it can never be repaired. With DECAWM off the
+        // overflow is dropped at the margin and the damage cannot leave its row.
+        let mut enable = Vec::new();
+        enable_terminal_modes(&mut enable, true).expect("a Vec sink cannot fail");
+        let enable = String::from_utf8_lossy(&enable).into_owned();
+        assert!(
+            enable.contains("\x1b[?7l"),
+            "the enable block must disable autowrap: {enable:?}"
         );
 
-        // --- NO-REGRESSION MATRIX (the four rows the fix must preserve) ---
-
-        // Row 1: sync_confirmed=true (probe succeeded, e.g. a modern mac/linux sync
-        // terminal) → NO heartbeat here — P0 already clears every frame, so a second
-        // clear would be wasted bytes. `!sync_confirmed` excludes it.
+        // …and the shell gets it back: a primary buffer with DECAWM off is unusable
+        // (long command lines overtype themselves at the right margin).
+        let mut restore = Vec::new();
+        restore_sequence_inner(&mut restore, false);
+        let restore = String::from_utf8_lossy(&restore).into_owned();
         assert!(
-            !atomic_unconfirmed_heartbeat_due(true, true, true, Duration::from_secs(10), cadence),
-            "a CONFIRMED sync terminal is healed by P0 every frame — must NOT double-clear"
+            restore.contains("\x1b[?7h"),
+            "the restore sequence must re-enable autowrap: {restore:?}"
         );
-
-        // Row 4 (the critical one): sync_output=false + NOT is_legacy_conhost, i.e.
-        // macOS Terminal.app / plain non-sync (sync_output=false, sync_confirmed=false).
-        // It must get NO heartbeat here — a naked clear (no BSU/ESU) would reintroduce
-        // the very flicker the current gating avoids. `sync_output` being required
-        // excludes it, live or idle, however long past the cadence.
+        // On the PRIMARY buffer: the re-enable must land AFTER LeaveAlternateScreen
+        // (`\x1b[?1049l`), or it would only restore the alt screen we are discarding.
+        let leave = restore.find("\x1b[?1049l").expect("leaves the alt screen");
+        let wrap_on = restore.find("\x1b[?7h").expect("re-enables autowrap");
         assert!(
-            !atomic_unconfirmed_heartbeat_due(false, false, true, Duration::from_secs(10), cadence),
-            "macOS Terminal.app (non-sync) must NOT get this heartbeat — no naked clear, no new flicker"
-        );
-        assert!(
-            !atomic_unconfirmed_heartbeat_due(
-                false,
-                false,
-                false,
-                Duration::from_secs(10),
-                cadence
-            ),
-            "idle non-sync Terminal.app must stay clean too"
-        );
-        // Row 3: classic conhost (sync_output=false) is handled by `periodic_repaint_due`,
-        // NOT here — this helper never fires on the non-sync path.
-        assert!(
-            !atomic_unconfirmed_heartbeat_due(false, true, true, Duration::from_secs(10), cadence),
-            "the non-sync path belongs to the conhost heartbeat, never to this one"
+            wrap_on > leave,
+            "autowrap must be restored on the PRIMARY buffer, after the alt-screen leave"
         );
     }
 
     #[test]
-    fn sync_probe_resolution_prefers_the_terminals_own_reply() {
-        // P2 — the DECRPM reply is authoritative the moment it lands, and it
-        // overrides the env allowlist in BOTH directions.
-        assert_eq!(
-            sync_probe_outcome(Some(true), false, false),
-            Some(true),
-            "a supported reply upgrades a terminal the allowlist missed"
+    fn focus_gain_reasserts_the_dec_modes_and_opens_the_heal_window() {
+        // Windows Terminal / ConPTY STRIP DEC private modes while the window is
+        // unfocused. Coming back, focus reporting (1004), bracketed paste (2004),
+        // mouse capture and — now load-bearing — autowrap-OFF (?7l) may simply be
+        // gone, so the very next ambiguous-width glyph would wrap and cascade again.
+        // The focus-return reaction therefore re-asserts the WHOLE enable block
+        // (idempotent, the same one startup uses) before it heals, and opens the
+        // multi-frame heal window so the terminal's own settle-redraw can't win.
+        let (mut terminal, tap) = recording_terminal(20, 3);
+        let mut last_focus_gained_at = None;
+        apply_focus_heal(&mut terminal, true, &mut last_focus_gained_at);
+        let wire = tap.drain();
+
+        assert!(
+            wire.contains("\x1b[?7l"),
+            "focus return must re-assert autowrap-OFF — ConPTY drops it while unfocused: {wire:?}"
         );
-        assert_eq!(
-            sync_probe_outcome(Some(false), true, true),
-            Some(false),
-            "an unsupported reply overrides a wrong allowlist entry"
+        assert!(
+            wire.contains("\x1b[?1004h"),
+            "…and focus reporting, or the NEXT focus return is never even delivered: {wire:?}"
         );
-        // No reply and the deadline hasn't passed → keep waiting (the allowlist
-        // prior keeps driving frames meanwhile).
-        assert_eq!(
-            sync_probe_outcome(None, false, true),
-            None,
-            "probe still pending before the deadline"
+        assert!(
+            wire.contains("\x1b[?2004h"),
+            "…and bracketed paste: {wire:?}"
         );
-        // Timeout → the env-allowlist prior stands, whichever way it points.
-        assert_eq!(
-            sync_probe_outcome(None, true, true),
-            Some(true),
-            "timeout keeps an allowlisted terminal on the sync path"
+        assert!(
+            wire.contains("\x1b[?1049h"),
+            "…and the alternate screen: {wire:?}"
         );
+        assert!(
+            last_focus_gained_at.is_some_and(|t| t.elapsed() < FOCUS_HEAL_WINDOW),
+            "focus return opens the heal window for the terminal's multi-frame settle"
+        );
+    }
+
+    #[test]
+    fn the_background_probe_runs_after_the_alternate_screen_is_up() {
+        // A capability query (the OSC 11 background probe here — and the same holds
+        // for DA1 / DECRQM) issued BEFORE `EnterAlternateScreen` makes Windows
+        // Terminal / ConPTY stall its resize-event delivery for tens of seconds: the
+        // window is resized but no `Event::Resize` ever arrives, so the screen stays
+        // painted at the stale width and garbles. `setup_terminal` therefore enters
+        // the alt screen FIRST and probes second. The order is invisible to a unit
+        // test at runtime (it needs a real TTY), so lock it structurally.
+        let source = include_str!("lib.rs");
+        let body_start = source
+            .find("fn setup_terminal() -> Result<Term> {")
+            .expect("setup_terminal exists");
+        let body = &source[body_start..];
+        let body_end = body.find("\n}\n").expect("setup_terminal is a closed fn");
+        let body = &body[..body_end];
+
+        let alt_screen = body
+            .find("enable_terminal_modes(&mut stdout, true)")
+            .expect("setup_terminal enters the alternate screen via the shared enable block");
+        let probe = body
+            .find("detect_light_bg()")
+            .expect("setup_terminal probes the background");
+        assert!(
+            alt_screen < probe,
+            "the alt screen must be entered BEFORE the OSC 11 probe (opentui #933: a pre-alt-screen \
+             capability query stalls Windows Terminal's resize events for 5-30s)"
+        );
+    }
+
+    #[test]
+    fn synchronized_output_brackets_are_emitted_unconditionally() {
+        // DEC 2026 is a PRIVATE mode: a terminal that doesn't implement it silently
+        // ignores the escape, and crossterm's Windows path has a literal no-op
+        // `execute_winapi` for both. Emitting is therefore free — which is what makes
+        // the whole env-allowlist + DECRQM-probe apparatus (deleted) unnecessary.
+        // Locked here as a byte-level contract so nobody re-introduces a capability
+        // gate around it.
+        let mut buf = Vec::new();
+        buf.execute(BeginSynchronizedUpdate)
+            .expect("a Vec sink cannot fail");
+        buf.execute(EndSynchronizedUpdate)
+            .expect("a Vec sink cannot fail");
+        let wire = String::from_utf8_lossy(&buf).into_owned();
         assert_eq!(
-            sync_probe_outcome(None, true, false),
-            Some(false),
-            "timeout keeps an unknown terminal on the non-sync path"
+            wire, "\x1b[?2026h\x1b[?2026l",
+            "BSU/ESU are 8 bytes each and are always safe to emit"
         );
     }
 

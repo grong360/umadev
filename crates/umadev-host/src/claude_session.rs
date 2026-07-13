@@ -431,7 +431,21 @@ impl BaseSession for ClaudeSession {
         // Non-blocking peek (the lock + try_wait both never block): a contended
         // lock or a try_wait error fails open to None; `Ok(Some(status))` = the
         // base exited, `Ok(None)` = still alive.
-        self.child.try_lock().ok()?.try_wait().ok().flatten()
+        match self.child.try_lock() {
+            Ok(mut g) => {
+                let r = g.try_wait();
+                if std::env::var("UMADEV_DBG_EXIT").is_ok() {
+                    eprintln!("DBG try_lock=ok try_wait={r:?}");
+                }
+                r.ok().flatten()
+            }
+            Err(e) => {
+                if std::env::var("UMADEV_DBG_EXIT").is_ok() {
+                    eprintln!("DBG try_lock=CONTENDED {e:?}");
+                }
+                None
+            }
+        }
     }
 
     fn session_id(&self) -> Option<&str> {

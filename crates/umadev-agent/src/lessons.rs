@@ -4097,40 +4097,17 @@ pub fn pitfall_efficacy_summary(project_root: &Path) -> PitfallEfficacySummary {
 mod tests {
     use super::*;
 
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Isolate $HOME (hence `global_learned_dir()`) to a throwaway temp dir, so a real
+    /// sediment/promotion can't READ or POLLUTE the developer's actual ~/.umadev/learned.
+    ///
+    /// This used to own a private `HOME_ENV_LOCK`. It does not any more, and must not
+    /// again: `test_support` guards the same process-global `HOME` for the
+    /// knowledge-corpus tests, and two mutexes over one global is no mutex at all — this
+    /// guard's `Drop` would restore the real `HOME` underneath a `NoBundledCorpus` holder
+    /// and leak the developer's staged `~/.umadev/knowledge` into tests that assert no
+    /// corpus is reachable. Both now serialise on the single shared lock.
+    use crate::test_support::TempHome;
 
-    /// Isolate $HOME (hence global_learned_dir()) to a throwaway temp dir for a test, so a
-    /// real sediment/promotion can't READ or POLLUTE the developer actual ~/.umadev/learned
-    /// (now that promote_to_global actually works). $HOME is process-global, so serialize via
-    /// HOME_ENV_LOCK; HOME is restored on drop.
-    struct TempHome {
-        _tmp: TempDir,
-        prior: Option<std::ffi::OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-    impl TempHome {
-        fn new() -> Self {
-            let lock = HOME_ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let tmp = TempDir::new().unwrap();
-            let prior = std::env::var_os("HOME");
-            std::env::set_var("HOME", tmp.path());
-            Self {
-                _tmp: tmp,
-                prior,
-                _lock: lock,
-            }
-        }
-    }
-    impl Drop for TempHome {
-        fn drop(&mut self) {
-            match self.prior.take() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
     use crate::phases::QualityCheck;
     use tempfile::TempDir;
 

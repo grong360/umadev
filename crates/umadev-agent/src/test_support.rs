@@ -6,12 +6,27 @@ use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
-/// Serialises env-mutating tests. [`crate::phases::knowledge_root`] consults
-/// `UMADEV_KNOWLEDGE_DIR` and `~/.umadev/knowledge`; tests that assert "no
-/// corpus found" must neutralise both deterministically (regardless of the host
-/// machine having run the `umadev` binary, which stages the embedded corpus to
-/// `~/.umadev/knowledge`). Process env is global, so they take this lock.
+/// The crate's **one** home/knowledge env lock.
+///
+/// `HOME` / `USERPROFILE` / `UMADEV_KNOWLEDGE_DIR` are process-global, and the
+/// libtest harness runs this crate's tests on parallel threads of a *single*
+/// process. Any test that mutates one of those three vars must serialise against
+/// **every other** test that mutates or reads them — and it must do so on this
+/// exact mutex. Two separate mutexes guarding the same global is the same as no
+/// mutex at all: guard A can restore the real `HOME` out from under a test that
+/// only holds guard B, at which point the developer's real
+/// `~/.umadev/knowledge` (staged there by the `umadev` binary) leaks into a test
+/// that asserts "no corpus reachable". So: **do not add a second HOME lock.**
+/// Route new home-mutating tests through [`NoBundledCorpus`] or [`TempHome`].
 static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+/// Take the shared home/knowledge env lock. Poison is deliberately ignored: a
+/// panicking test elsewhere must not cascade into unrelated failures here.
+fn env_guard() -> MutexGuard<'static, ()> {
+    ENV_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// RAII guard that points `HOME`/`USERPROFILE` at a corpus-free temp dir and
 /// clears `UMADEV_KNOWLEDGE_DIR`, so `knowledge_root`'s bundled-corpus fallbacks
@@ -28,9 +43,7 @@ pub(crate) struct NoBundledCorpus {
 impl NoBundledCorpus {
     /// Take the env lock and isolate `HOME`/`USERPROFILE`/`UMADEV_KNOWLEDGE_DIR`.
     pub(crate) fn new() -> Self {
-        let lock = ENV_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lock = env_guard();
         let prev_home = std::env::var_os("HOME");
         let prev_userprofile = std::env::var_os("USERPROFILE");
         let prev_kdir = std::env::var_os("UMADEV_KNOWLEDGE_DIR");
@@ -60,6 +73,44 @@ impl Drop for NoBundledCorpus {
         restore("HOME", self.prev_home.take());
         restore("USERPROFILE", self.prev_userprofile.take());
         restore("UMADEV_KNOWLEDGE_DIR", self.prev_kdir.take());
+    }
+}
+
+/// RAII guard that isolates `$HOME` (hence `global_learned_dir()`) to a throwaway
+/// temp dir, so a real sediment/promotion can neither READ nor POLLUTE the
+/// developer's actual `~/.umadev/learned`. Restores the prior env on drop.
+///
+/// Shares [`ENV_GUARD`] with [`NoBundledCorpus`] on purpose — both mutate the
+/// same process-global `HOME`, so they must be mutually exclusive.
+pub(crate) struct TempHome {
+    _lock: MutexGuard<'static, ()>,
+    _tmp: TempDir,
+    prev_home: Option<OsString>,
+    prev_userprofile: Option<OsString>,
+}
+
+impl TempHome {
+    /// Take the shared env lock and repoint `HOME`/`USERPROFILE` at a temp dir.
+    pub(crate) fn new() -> Self {
+        let lock = env_guard();
+        let prev_home = std::env::var_os("HOME");
+        let prev_userprofile = std::env::var_os("USERPROFILE");
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("USERPROFILE", tmp.path());
+        Self {
+            _lock: lock,
+            _tmp: tmp,
+            prev_home,
+            prev_userprofile,
+        }
+    }
+}
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        restore("HOME", self.prev_home.take());
+        restore("USERPROFILE", self.prev_userprofile.take());
     }
 }
 
