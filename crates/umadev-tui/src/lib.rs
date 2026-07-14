@@ -30,6 +30,7 @@
 )]
 
 pub mod app;
+mod clipboard_image;
 pub mod config;
 pub mod input;
 pub mod link;
@@ -95,6 +96,9 @@ impl LaunchOptions {
 
 /// Launch the TUI. Blocks until the user quits.
 pub async fn run(opts: LaunchOptions) -> Result<()> {
+    // Best-effort retention sweep for materialised clipboard images. This runs
+    // once per session, never on the ordinary text-paste path.
+    clipboard_image::cleanup_old(&opts.project_root);
     let config_path = config::default_path();
     // Run the once-per-upgrade config migration runner at startup (fail-soft):
     // repairs config drift across releases, then persists the bumped version.
@@ -137,6 +141,7 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     // exit below.
     set_terminal_title(app.backend.as_deref().unwrap_or("offline"));
     let result = event_loop(&mut terminal, &mut app, opts, win_console_guard.as_ref()).await;
+    clipboard_image::cleanup_old(&app.project_root);
     // Graceful cleanup: kill any preview dev server the user started via
     // /preview, so quitting UmaDev never leaves an orphaned process. Kill the whole
     // process GROUP — the dev server (npm/pnpm) forks the real node/vite server as a
@@ -5395,45 +5400,26 @@ impl<W: std::io::Write> ratatui::backend::Backend for AnchoredBackend<W> {
 
 type Term = Terminal<AnchoredBackend<Stdout>>;
 
-/// Detect whether the terminal has a light background.
-///
-/// Cross-platform, layered strategy (most-reliable first), mirroring how
-/// `Claude Code` and `OpenCode` probe the terminal:
-///
-/// 1. **`$COLORFGBG`** — synchronous hint set by some terminals at launch
-///    (rxvt-family, Konsole, iTerm2 with the option). rxvt convention:
-///    bg ≤ 6 or 8 is dark; 7 / 9–15 are light.
-/// 2. **Known-terminal allowlist** — `$TERM_PROGRAM` / `$WT_SESSION` /
-///    `$COLORTERM` etc. Some terminals (Windows Terminal, Apple Terminal)
-///    carry a known default or expose their theme via env vars. We only use
-///    this for terminals we're confident ship a light default.
-/// 3. **OSC 11 query** — send `\e]11;?\e\\`, read the terminal's actual
-///    background RGB (`\e]11;rgb:RR/GG/BB\e\\`), classify by BT.709 luminance.
-///    Run AFTER entering raw mode so the response isn't echoed to the screen.
-///    Short timeout (200ms) so a non-responding terminal (Windows conhost,
-///    dumb terminals, some SSH setups) never blocks launch.
-/// 4. **Default dark** — the common case for developer terminals.
-///
-/// Returns `true` if light, `false` if dark or undetectable.
+/// Initial light/dark choice. A safe asynchronous OSC 11 probe may refine it
+/// after the owned input reader starts; this function never reads stdin.
 #[must_use]
 pub fn detect_light_bg() -> bool {
-    // 1. COLORFGBG synchronous hint.
-    if let Some(theme) = theme_from_colorfgbg() {
-        return theme;
-    }
+    theme_override()
+        .or_else(theme_from_colorfgbg)
+        .unwrap_or(false)
+}
 
-    // 2. Known-terminal allowlist (env-var based).
-    if let Some(theme) = theme_from_known_terminal() {
-        return theme;
+fn theme_override() -> Option<bool> {
+    match std::env::var("UMADEV_THEME")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "light" => Some(true),
+        "dark" => Some(false),
+        _ => None,
     }
-
-    // 3. OSC 11 query (must run in raw mode — see setup_terminal).
-    if let Some(theme) = theme_from_osc11() {
-        return theme;
-    }
-
-    // 4. Default: assume dark (the common developer setup).
-    false
 }
 
 /// Parse `$COLORFGBG` ("fg;bg") via the rxvt convention.
@@ -5449,40 +5435,9 @@ fn theme_from_colorfgbg() -> Option<bool> {
     Some(!(bg_num <= 6 || bg_num == 8))
 }
 
-/// Known-terminal allowlist. We only assert a theme here for terminals where
-/// we're confident about the default OR where the terminal explicitly exposes
-/// its current theme via an env var. Conservative: when in doubt, return None
-/// and let OSC 11 decide.
-fn theme_from_known_terminal() -> Option<bool> {
-    // Apple Terminal exposes its background via COLORFGBG (handled above) but
-    // doesn't set TERM_PROGRAM usefully. iTerm2, Ghostty, WezTerm, kitty all
-    // respond to OSC 11 correctly, so we let that path handle them.
-    //
-    // Windows Terminal: sets WT_SESSION. Its default profile is a dark scheme,
-    // but users can pick light — we still try OSC 11 first (Windows Terminal
-    // 1.x responds). Only if OSC fails do we fall back here.
-    if std::env::var_os("WT_SESSION").is_some() {
-        // WT responds to OSC 11 on Windows 10+, so this is just a last-resort
-        // default if the query timed out (older Windows / conhost).
-        return None;
-    }
-    None
-}
-
-/// OSC 11 query: send the background-color query, read the RGB response,
-/// classify by BT.709 luminance. Must run in raw mode (no echo).
-fn theme_from_osc11() -> Option<bool> {
-    // OSC 11 background-color detection is DISABLED. Reading the reply needed a stdin
-    // read off the main thread (a worker thread blocking in `read()`), which — once
-    // the event loop started — RACED crossterm's `EventStream` for stdin and split
-    // incoming mouse-wheel SGR bursts: the ESC bytes parsed as stray Esc keypresses
-    // (a FALSE "本轮已中止") and the rest leaked into the input as raw text like
-    // `[<65;126;45M` (user-reported with a screenshot after wheel-scroll was enabled).
-    // A safe, race-free probe would need a non-blocking tty read (forbidden `unsafe` /
-    // a new dep). `COLORFGBG`, the known-terminal allowlist, and default-dark cover the
-    // common cases; an OSC 11-only terminal (iTerm2 / Ghostty / WezTerm / kitty) keeps
-    // its default-dark assumption rather than risk corrupting input.
-    None
+fn request_background_color<W: std::io::Write>(out: &mut W) -> std::io::Result<()> {
+    out.write_all(b"\x1b]11;?\x1b\\")?;
+    out.flush()
 }
 
 /// Whether this is a REMOTE session where a native OS clipboard command would
@@ -5643,6 +5598,12 @@ fn push_kitty_keyboard<W: std::io::Write>(out: &mut W) -> std::io::Result<()> {
     .map(|_| ())
 }
 
+fn kitty_keyboard_allowed_on(os: &str) -> bool {
+    // Windows IMEs and the Kitty protocol both consume key translation. Keeping
+    // the native console path avoids lost or garbled CJK composition commits.
+    os != "windows"
+}
+
 fn setup_terminal() -> Result<Term> {
     // Best-effort teardown for a MID-SETUP failure. If raw mode is already on
     // and a LATER step (alt screen, mouse capture, …) fails, a bare `?` would
@@ -5671,27 +5632,24 @@ fn setup_terminal() -> Result<Term> {
     let mut stdout = std::io::stdout();
     // Mouse capture starts ON (the `/mouse` toggle re-asserts a changed
     // preference later through the same block via `reassert_terminal_modes`).
+    stdout.execute(EnterAlternateScreen).map_err(fail)?;
     enable_terminal_modes(&mut stdout, true).map_err(fail)?;
-    // Background probe AFTER the alternate screen is up. Order matters: a
-    // capability query (OSC 11 here, and the same holds for DA1 / DECRQM)
-    // issued BEFORE `EnterAlternateScreen` makes Windows Terminal / ConPTY
-    // stall its resize-event delivery for tens of seconds — the window is
-    // resized but no `Event::Resize` arrives, so the screen stays painted at
-    // the stale width. Probing once we are already on the alt screen costs the
-    // same round-trip and keeps ConPTY's event pump healthy. The probe is still
-    // in raw mode, so nothing echoes.
+    // Apply the synchronous theme hints now; the OSC 11 query starts later,
+    // after the single owned input reader exists.
     let is_light = detect_light_bg();
     ui::set_light_theme(is_light);
     // Kitty keyboard protocol — GUARDED behind the terminal's own support query
-    // (a DA1-backed round-trip, safe in the raw mode we're already in, same as
-    // the OSC 11 probe above), so ONLY a terminal that reports support gets the
+    // (a DA1-backed round-trip, safe in the raw mode we're already in), so ONLY
+    // a terminal that reports support gets the
     // push. An unsupported terminal degrades cleanly — no flags on the wire, no
     // pop on exit — and Ctrl+J still delivers the universal newline. Pushing
     // here (once at startup), not in the resume-shared enable block, keeps the
     // kitty stack from growing on every reassert; the symmetric pop lives in
     // `restore_sequence`. Best-effort: a failed query/push just skips the
-    // enhancement (fail-open).
-    if matches!(supports_keyboard_enhancement(), Ok(true))
+    // enhancement (fail-open). Windows deliberately stays on native key input:
+    // Kitty negotiation interferes with CJK IME composition there.
+    if kitty_keyboard_allowed_on(std::env::consts::OS)
+        && matches!(supports_keyboard_enhancement(), Ok(true))
         && push_kitty_keyboard(&mut stdout).is_ok()
     {
         KITTY_KEYBOARD_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5704,11 +5662,14 @@ fn setup_terminal() -> Result<Term> {
     Ok(terminal)
 }
 
-/// The ONE terminal-mode enable block (Wave 2 P2) — every writer-side mode
-/// UmaDev turns on, in setup order:
+/// Re-assert the session's level-triggered terminal modes.
 ///
-/// 1. `EnterAlternateScreen` — the app screen (a no-op if already in alt).
-/// 2. `DisableLineWrap` (DECAWM off, `\x1b[?7l`) — the CONTAINMENT half of the
+/// `EnterAlternateScreen` deliberately lives in [`setup_terminal`], not here:
+/// DECSET 1049 also saves cursor/screen state, so replaying it after focus or
+/// resume is not an idempotent mode refresh. The modes below are safe to
+/// re-assert between frames.
+///
+/// 1. `DisableLineWrap` (DECAWM off, `\x1b[?7l`) — the CONTAINMENT half of the
 ///    ambiguous-width fix. A TUI never wants autowrap: every cell it prints is
 ///    explicitly positioned, so wrapping can only ever be a bug's amplifier. With
 ///    DECAWM on, ONE glyph the terminal renders wider than `unicode-width`
@@ -5719,22 +5680,22 @@ fn setup_terminal() -> Result<Term> {
 ///    dropped at the margin: the damage is contained to its own row, and the next
 ///    row's `MoveTo` re-anchors. (The re-anchoring backend then stops the row from
 ///    drifting at all — see [`AnchoredBackend`].)
-/// 3. `EnableBracketedPaste` — multi-char bursts (clipboard paste AND CJK IME
+/// 2. `EnableBracketedPaste` — multi-char bursts (clipboard paste AND CJK IME
 ///    commits, which most terminals deliver as a paste) arrive as one atomic
 ///    `Event::Paste` instead of a scrambled stream of `Char` events.
-/// 4. Mouse capture per the CURRENT `/mouse` preference. On by default: we're
+/// 3. Mouse capture per the CURRENT `/mouse` preference. On by default: we're
 ///    on the alternate screen (no native scrollback), where the terminal can't
 ///    give us BOTH wheel-scroll AND native click-drag copy — so UmaDev runs its
 ///    OWN selection layer (the Claude Code approach): capture the mouse, page
 ///    the transcript on the wheel, render the drag-selection highlight
 ///    ourselves, copy via OSC 52. `/mouse` toggles capture OFF for users who
 ///    prefer the terminal's native click-drag selection.
-/// 5. `EnableFocusChange` (DEC private mode 1004). Some terminals — notably
+/// 4. `EnableFocusChange` (DEC private mode 1004). Some terminals — notably
 ///    the Windows console / Windows Terminal — scroll or redraw their own
 ///    buffer while unfocused, desyncing the incremental-diff render; with 1004
 ///    on, the terminal emits a FocusGained event on return and the event loop
 ///    forces a clean full repaint.
-/// 6. `cursor::Show` — the blinking caret in the input box (positioned via
+/// 5. `cursor::Show` — the blinking caret in the input box (positioned via
 ///    `frame.set_cursor_position` in `render_prompt`).
 ///
 /// Shared by BOTH [`setup_terminal`] (startup) and [`reassert_terminal_modes`]
@@ -5751,8 +5712,8 @@ fn setup_terminal() -> Result<Term> {
 /// ONCE in [`setup_terminal`] (guarded by [`supports_keyboard_enhancement`])
 /// and popped once in [`restore_sequence`], NOT re-asserted here.
 ///
-/// Every escape is level-triggered, so the block is IDEMPOTENT — safe to run
-/// on every resume. Every step is attempted even if an earlier one fails (a
+/// Every escape is level-triggered, so the block is safe to run on every
+/// resume. Every step is attempted even if an earlier one fails (a
 /// resume must re-assert as much as it can); the FIRST error is returned so
 /// startup can still abort and restore via its `fail` wrapper, while the
 /// resume path ignores it (best-effort, fail-open).
@@ -5765,7 +5726,6 @@ fn enable_terminal_modes<W: std::io::Write>(out: &mut W, mouse_on: bool) -> std:
             }
         }
     };
-    note(out.execute(EnterAlternateScreen).map(|_| ()));
     note(out.execute(DisableLineWrap).map(|_| ()));
     note(out.execute(EnableBracketedPaste).map(|_| ()));
     note(if mouse_on {
@@ -5812,12 +5772,11 @@ fn enable_terminal_modes<W: std::io::Write>(out: &mut W, mouse_on: bool) -> std:
 /// rest, and the whole sequence is IDEMPOTENT (every mode is level-triggered),
 /// so running it from several exit paths is harmless.
 fn restore_sequence<W: std::io::Write>(out: &mut W) {
-    // Pop kitty ONLY if `setup_terminal` actually pushed it (the global flag),
-    // so the context-free teardown paths never emit a stray pop.
-    restore_sequence_inner(
-        out,
-        KITTY_KEYBOARD_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-    );
+    // Kitty is stack-based, unlike the level-triggered modes below. Consume the
+    // flag before writing so a signal teardown followed by normal teardown pops
+    // exactly once instead of disturbing the caller's keyboard-protocol stack.
+    let kitty_on = KITTY_KEYBOARD_ENABLED.swap(false, std::sync::atomic::Ordering::AcqRel);
+    restore_sequence_inner(out, kitty_on);
 }
 
 /// The restore body, with the kitty-pop decision passed IN so it can be
@@ -6293,13 +6252,13 @@ fn tick_needs_draw(app: &App, continuous_active: bool) -> bool {
     app_is_live(app, continuous_active) || app.has_active_run() || app.cancelling
 }
 
-/// Re-emit the terminal-mode setup escapes (idempotent) after a long input gap
+/// Re-emit the level-triggered terminal modes after a long input gap
 /// or a job-control resume (R5), healing a dead mouse / stale alt-screen after a
 /// laptop sleep, tmux re-attach, or ssh reconnect.
 ///
 /// Delegates to [`enable_terminal_modes`] — the ONE enable block shared with
 /// [`setup_terminal`] (Wave 2 P2), so resume re-asserts EXACTLY what startup
-/// enabled (alt screen, autowrap OFF, bracketed paste, the *current* `/mouse`
+/// enabled (autowrap OFF, bracketed paste, the *current* `/mouse`
 /// mouse-capture preference, focus-change reporting, cursor visibility) and a
 /// future mode can never be enabled at startup yet missed here.
 /// Writes go through the render's single backend writer, BETWEEN frames;
@@ -6717,6 +6676,26 @@ fn input_event_coalesces(ev: &Event) -> bool {
     )
 }
 
+/// A committed IME string may have been drawn directly by the terminal while
+/// it was composing. Repaint once after non-ASCII input so stale preedit cells
+/// cannot survive ratatui's incremental diff.
+fn input_may_leave_preedit_cells(ev: &Event) -> bool {
+    match ev {
+        Event::Paste(text) => !text.is_ascii(),
+        Event::Key(key) => {
+            matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && matches!(key.code, KeyCode::Char(ch) if !ch.is_ascii())
+        }
+        _ => false,
+    }
+}
+
+const PREEDIT_CLEANUP_DEBOUNCE: Duration = Duration::from_millis(100);
+
+fn preedit_cleanup_due(since_last: Option<Duration>) -> bool {
+    since_last.is_none_or(|elapsed| elapsed >= PREEDIT_CLEANUP_DEBOUNCE)
+}
+
 /// How many CONSECUTIVE legacy-input errors park the input arm. A single
 /// transient `Some(Err(_))` from `crossterm::EventStream` (the Windows default)
 /// must NOT disable the keyboard — only a sustained run of errors (a genuinely
@@ -6747,6 +6726,47 @@ fn legacy_input_park_decision(streak: u32, ok: bool, eof: bool, threshold: u32) 
     }
 }
 
+/// Fold one completed blocking clipboard capture into app state. Split from the
+/// `select!` arm so the full result contract — image→chip, silent text/no-image,
+/// one-shot Linux guidance, oversize refusal — is unit-testable without a TTY.
+fn apply_clipboard_capture(
+    app: &mut App,
+    result: Option<clipboard_image::CaptureResult>,
+    tool_hint_shown: &mut bool,
+) -> bool {
+    match result {
+        Some(clipboard_image::CaptureResult::Image(path)) => {
+            // Reuse the proven drag-path → chip → @absolute-path pipeline. The
+            // generated name is ASCII, but lossy is a fail-open guard for an
+            // exotic non-UTF-8 workspace root.
+            app.handle_paste(&path.to_string_lossy());
+            true
+        }
+        // Text clipboard / no PNG: stay silent. A terminal text paste arrives
+        // independently as Event::Paste and follows the old, zero-overhead path.
+        Some(clipboard_image::CaptureResult::NoImage) | None => false,
+        Some(clipboard_image::CaptureResult::MissingTool(package)) => {
+            // Linux dependency guidance is useful once, not on every attempted
+            // paste for the remainder of the session.
+            if *tool_hint_shown {
+                return false;
+            }
+            *tool_hint_shown = true;
+            app.push_clipboard_image_notice("clipboard.image.missing_tool", &[package]);
+            true
+        }
+        Some(clipboard_image::CaptureResult::TooLarge(bytes)) => {
+            let mib = bytes.div_ceil(1024 * 1024).to_string();
+            app.push_clipboard_image_notice("clipboard.image.too_large", &[&mib]);
+            true
+        }
+        Some(clipboard_image::CaptureResult::Failed) => {
+            app.push_clipboard_image_notice("clipboard.image.failed", &[]);
+            true
+        }
+    }
+}
+
 async fn event_loop(
     terminal: &mut Term,
     app: &mut App,
@@ -6762,6 +6782,10 @@ async fn event_loop(
     // (the summary runs on a forked base, off the resident chat session).
     let (compaction_tx, mut compaction_rx) =
         tokio::sync::mpsc::unbounded_channel::<CompactionOutcome>();
+    // `Ctrl+V` image capture runs on the blocking pool and reports back here so
+    // a slow/wedged OS clipboard command can never stall input or rendering.
+    let (clipboard_image_tx, mut clipboard_image_rx) =
+        tokio::sync::mpsc::unbounded_channel::<clipboard_image::CaptureResult>();
 
     // Probe in the background so the picker labels refresh as data arrives.
     spawn_probe(sink.clone());
@@ -6776,7 +6800,15 @@ async fn event_loop(
     // filter would re-introduce the Esc latency the root fix removes).
     let mut input = InputSource::from_env();
     let use_owned = input.is_owned();
+    // Query only when the owned reader can consume the response. It is sent
+    // after alternate-screen entry, avoiding ConPTY's pre-alt query/resize
+    // stall, and an explicit UMADEV_THEME always wins.
+    if use_owned && theme_override().is_none() {
+        let _ = request_background_color(terminal.backend_mut());
+    }
     let mut tick = tokio::time::interval(Duration::from_millis(80));
+    let mut clipboard_image_in_flight = false;
+    let mut clipboard_tool_hint_shown = false;
     // Handle to the in-flight pipeline task, so `/cancel` can abort it.
     let mut run_task: Option<tokio::task::JoinHandle<()>> = None;
     // An aborted task that is winding down after a cancel. `abort()` only
@@ -6881,6 +6913,7 @@ async fn event_loop(
     // Paste-burst timing: arrival Instant of the previous key, to flag a pasted newline
     // (Windows delivers a bracketed paste as raw keys) apart from a genuine submit Enter.
     let mut last_key_instant: Option<Instant> = None;
+    let mut last_preedit_cleanup: Option<Instant> = None;
     // Resize heal: Instant of the last Resize event, to force a clear+repaint for a short
     // window afterwards so a multi-frame drag + settle fully heals (not just one frame).
     let mut last_resize_at: Option<Instant> = None;
@@ -7095,6 +7128,13 @@ async fn event_loop(
     }
 
     loop {
+        if let Some(is_light) = input.take_background_reply() {
+            if theme_override().is_none() {
+                ui::set_light_theme(is_light);
+                app.contaminate_terminal();
+                draw_now = true;
+            }
+        }
         // A2#4/#5: while a director build is in flight, hand any queued steering
         // (`/plan skip|veto|add`, text typed mid-build) to the shared intake the
         // loop drains at each STEP BOUNDARY — so mid-run steering applies at the
@@ -7305,6 +7345,18 @@ async fn event_loop(
         }
 
         tokio::select! {
+            maybe_clipboard = clipboard_image_rx.recv(), if clipboard_image_in_flight => {
+                clipboard_image_in_flight = false;
+                let changed = apply_clipboard_capture(
+                    app,
+                    maybe_clipboard,
+                    &mut clipboard_tool_hint_shown,
+                );
+                if changed {
+                    needs_redraw = true;
+                    draw_now = true;
+                }
+            }
             maybe_route = route_rx.recv() => {
                 // R3 — a turn-completion decision changes the transcript; mark it
                 // dirty (budget-gated — route decisions aren't bursty).
@@ -7543,6 +7595,13 @@ async fn event_loop(
                         last_focus_gained_at = Some(now);
                     }
                     last_input = now;
+                }
+                if matches!(&maybe_key, Some(Ok(ev)) if input_may_leave_preedit_cells(ev)) {
+                    let now = Instant::now();
+                    if preedit_cleanup_due(last_preedit_cleanup.map(|last| now.duration_since(last))) {
+                        app.contaminate_terminal();
+                        last_preedit_cleanup = Some(now);
+                    }
                 }
                 if let Some(Ok(Event::Resize(w, h))) = &maybe_key {
                     // R4 — resize heal, via the ONE path shared with the tick-time
@@ -7841,6 +7900,40 @@ async fn event_loop(
                                 // the inner replay loop, not the event loop.) None is
                                 // likewise a no-op, so the two share an arm.
                                 Action::Quit | Action::None => {}
+                                Action::PasteImage => {
+                                    use clipboard_image::Preflight;
+                                    let offline = matches!(app.brain_spec(), BrainSpec::Offline);
+                                    match clipboard_image::preflight(
+                                        clipboard_is_remote(),
+                                        clipboard_in_tmux(),
+                                        offline,
+                                    ) {
+                                        Preflight::Ready if !clipboard_image_in_flight => {
+                                            clipboard_image_in_flight = true;
+                                            let root = app.project_root.clone();
+                                            let tx = clipboard_image_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let _ = tx.send(clipboard_image::capture(&root));
+                                            });
+                                        }
+                                        Preflight::Ready => {
+                                            // Key-repeat while the first capture is
+                                            // pending is a no-op, never a process storm.
+                                        }
+                                        Preflight::Remote => app.push_clipboard_image_notice(
+                                            "clipboard.image.remote",
+                                            &[],
+                                        ),
+                                        Preflight::Tmux => app.push_clipboard_image_notice(
+                                            "clipboard.image.tmux",
+                                            &[],
+                                        ),
+                                        Preflight::Offline => app.push_clipboard_image_notice(
+                                            "clipboard.image.offline",
+                                            &[],
+                                        ),
+                                    }
+                                }
                                 Action::ApprovalReply(allow) => {
                                     // A2#5 — the user TYPED the approval decision
                                     // (「批准」/"approve" → allow, 「拒绝」/"deny" →
@@ -9105,10 +9198,8 @@ mod tests {
         );
     }
 
-    /// Wave 2 P2 — the ONE enable block must turn on the complete mode set
-    /// (alt screen, bracketed paste, mouse capture, focus reporting, cursor
-    /// visibility). Both `setup_terminal` and `reassert_terminal_modes` emit
-    /// through this single function, so this is the whole enable surface.
+    /// The re-assert block contains only level-triggered modes. Alternate-screen
+    /// entry is setup-only because DECSET 1049 also saves terminal state.
     #[test]
     #[cfg(unix)] // crossterm/console API + CI-env/timing differ on Windows; logic covered on unix
     fn enable_terminal_modes_is_the_one_complete_enable_set() {
@@ -9116,7 +9207,6 @@ mod tests {
         enable_terminal_modes(&mut buf, true).expect("a Vec sink cannot fail");
         let s = String::from_utf8_lossy(&buf);
         for (esc, what) in [
-            ("\x1b[?1049h", "enter the alternate screen"),
             ("\x1b[?2004h", "enable bracketed paste"),
             ("\x1b[?1000h", "enable mouse capture"),
             ("\x1b[?1004h", "enable focus-change reporting"),
@@ -9124,6 +9214,10 @@ mod tests {
         ] {
             assert!(s.contains(esc), "the enable block must {what} ({esc:?})");
         }
+        assert!(
+            !s.contains("\x1b[?1049h"),
+            "a focus/resume reassert must not re-enter the alternate screen"
+        );
     }
 
     /// Wave 2 P2 — the enable block respects the current `/mouse` preference:
@@ -9311,6 +9405,13 @@ mod tests {
         assert!(pop < leave, "kitty pop must precede the alt-screen leave");
     }
 
+    #[test]
+    fn kitty_keyboard_is_disabled_on_windows_for_ime_compatibility() {
+        assert!(!kitty_keyboard_allowed_on("windows"));
+        assert!(kitty_keyboard_allowed_on("linux"));
+        assert!(kitty_keyboard_allowed_on("macos"));
+    }
+
     /// A terminal WITHOUT kitty support (the guard skipped the push, so
     /// `kitty_on = false`) must get ZERO kitty bytes on teardown — no stray
     /// `CSI < u` pop that could disturb another program's kitty stack — while
@@ -9462,6 +9563,22 @@ mod tests {
         assert!(!input_event_coalesces(&Event::Paste("hello".into())));
         assert!(!input_event_coalesces(&Event::Resize(80, 24)));
         assert!(!input_event_coalesces(&Event::FocusGained));
+    }
+
+    #[test]
+    fn cjk_input_requests_a_preedit_cleanup_repaint() {
+        assert!(input_may_leave_preedit_cells(&Event::Paste("中文".into())));
+        assert!(input_may_leave_preedit_cells(&Event::Key(KeyEvent::new(
+            KeyCode::Char('界'),
+            KeyModifiers::NONE,
+        ))));
+        assert!(!input_may_leave_preedit_cells(&Event::Paste(
+            "ascii".into()
+        )));
+        assert!(!input_may_leave_preedit_cells(&Event::Resize(80, 24)));
+        assert!(preedit_cleanup_due(None));
+        assert!(!preedit_cleanup_due(Some(Duration::from_millis(20))));
+        assert!(preedit_cleanup_due(Some(PREEDIT_CLEANUP_DEBOUNCE)));
     }
 
     /// Scroll-lag fix — a VS Code-style burst of wheel events inside one frame
@@ -9667,6 +9784,75 @@ mod tests {
         let (streak, park) = legacy_input_park_decision(streak, true, false, threshold);
         assert_eq!(streak, 0, "a successful read resets the error streak");
         assert!(!park, "a successful read never parks");
+    }
+
+    #[test]
+    fn clipboard_capture_result_runs_the_full_image_chip_to_submit_path() {
+        let (mut app, _tmp) = build_test_app();
+        let dir = app.project_root.join(".umadev/pasted");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("123-1.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        let canonical = path.canonicalize().unwrap();
+        let mut hint = false;
+
+        assert!(apply_clipboard_capture(
+            &mut app,
+            Some(clipboard_image::CaptureResult::Image(path.clone())),
+            &mut hint,
+        ));
+        assert_eq!(app.attachments, vec![canonical.clone()]);
+        assert!(app.input.contains("[图片 1]"));
+
+        let action = app.apply_key(KeyCode::Enter);
+        let Action::Route(sent) = action else {
+            panic!("an attached image should submit as a normal routed turn");
+        };
+        assert!(
+            sent.contains(&format!("@{}", canonical.display())),
+            "the base receives the generated workspace path: {sent}"
+        );
+        assert!(
+            app.attachments.is_empty(),
+            "submit clears the backing chip state"
+        );
+    }
+
+    #[test]
+    fn missing_linux_clipboard_tool_is_quiet_after_the_first_hint() {
+        let (mut app, _tmp) = build_test_app();
+        let mut hint = false;
+        let before = app.history.len();
+        assert!(apply_clipboard_capture(
+            &mut app,
+            Some(clipboard_image::CaptureResult::MissingTool("wl-clipboard")),
+            &mut hint,
+        ));
+        assert!(hint);
+        assert_eq!(app.history.len(), before + 1);
+        assert!(!apply_clipboard_capture(
+            &mut app,
+            Some(clipboard_image::CaptureResult::MissingTool("wl-clipboard")),
+            &mut hint,
+        ));
+        assert_eq!(app.history.len(), before + 1, "the hint is emitted once");
+    }
+
+    #[test]
+    fn a_text_clipboard_result_is_a_zero_state_change_noop() {
+        let (mut app, _tmp) = build_test_app();
+        let mut hint = false;
+        let history = app.history.len();
+        let input = app.input.clone();
+        assert!(!apply_clipboard_capture(
+            &mut app,
+            Some(clipboard_image::CaptureResult::NoImage),
+            &mut hint,
+        ));
+        assert_eq!(app.history.len(), history);
+        assert_eq!(app.input, input);
+        assert!(app.attachments.is_empty());
+        assert!(!hint);
     }
 
     /// A SUSTAINED run of errors (a genuinely dead FD) parks exactly at the
@@ -15184,8 +15370,8 @@ mod tests {
             "…and bracketed paste: {wire:?}"
         );
         assert!(
-            wire.contains("\x1b[?1049h"),
-            "…and the alternate screen: {wire:?}"
+            !wire.contains("\x1b[?1049h"),
+            "focus return must not replay stateful alternate-screen entry: {wire:?}"
         );
         assert!(
             last_focus_gained_at.is_some_and(|t| t.elapsed() < FOCUS_HEAL_WINDOW),
@@ -15195,35 +15381,18 @@ mod tests {
 
     #[test]
     fn the_background_probe_runs_after_the_alternate_screen_is_up() {
-        // A capability query (the OSC 11 background probe here — and the same holds
-        // for DA1 / DECRQM) issued BEFORE `EnterAlternateScreen` makes Windows
-        // Terminal / ConPTY stall its resize-event delivery for tens of seconds: the
-        // window is resized but no `Event::Resize` ever arrives, so the screen stays
-        // painted at the stale width and garbles. `setup_terminal` therefore enters
-        // the alt screen FIRST and probes second. The order is invisible to a unit
-        // test at runtime (it needs a real TTY), so lock it structurally.
-        // Normalize the line endings first: git checks this file out with CRLF on
-        // Windows (autocrlf), so a scan for a literal "\n}\n" finds nothing there and
-        // the test dies on its own `expect` rather than on the property it guards.
-        // Source-text introspection must never assume the developer's line endings.
+        // A pre-alt capability query can stall ConPTY resize delivery. Lock the
+        // startup order structurally; normalize CRLF for Windows checkouts.
         let source = include_str!("lib.rs").replace("\r\n", "\n");
-        let body_start = source
-            .find("fn setup_terminal() -> Result<Term> {")
-            .expect("setup_terminal exists");
-        let body = &source[body_start..];
-        let body_end = body.find("\n}\n").expect("setup_terminal is a closed fn");
-        let body = &body[..body_end];
-
-        let alt_screen = body
-            .find("enable_terminal_modes(&mut stdout, true)")
-            .expect("setup_terminal enters the alternate screen via the shared enable block");
-        let probe = body
-            .find("detect_light_bg()")
-            .expect("setup_terminal probes the background");
+        let alt_screen = source
+            .find("stdout.execute(EnterAlternateScreen)")
+            .expect("setup_terminal enters the alternate screen once");
+        let probe = source
+            .find("request_background_color(terminal.backend_mut())")
+            .expect("event_loop sends the OSC 11 query through its writer");
         assert!(
             alt_screen < probe,
-            "the alt screen must be entered BEFORE the OSC 11 probe (opentui #933: a pre-alt-screen \
-             capability query stalls Windows Terminal's resize events for 5-30s)"
+            "alternate-screen entry must precede the OSC 11 query"
         );
     }
 

@@ -75,9 +75,11 @@ DEAD_REGISTRY="https://127.0.0.1:1"
 # Materialize a fake global install of umadev rooted at $1 (which must be a
 # `node_modules` dir — that is what marks an install as package-manager-owned).
 make_install() {
-  mkdir -p "$1/umadev/bin" "$1/@umacloud"
+  mkdir -p "$1/umadev/bin" "$1/@umacloud/cli-$PLATFORM/bin"
   cp "$NPM_ROOT/umadev/bin/cli.js" "$1/umadev/bin/"
   cp "$NPM_ROOT/umadev/package.json" "$1/umadev/"
+  cp "$NPM_ROOT/cli-$PLATFORM/package.json" "$1/@umacloud/cli-$PLATFORM/"
+  cp "$NPM_ROOT/cli-$PLATFORM/bin/umadev" "$1/@umacloud/cli-$PLATFORM/bin/"
 }
 
 # A stand-in package manager on PATH. It answers `--version` (so the shim sees it
@@ -91,6 +93,21 @@ case "\$1" in
   --version) echo "9.9.9"; exit 0 ;;
   view)      echo "$2"; exit 0 ;;
 esac
+if [ -n "\${SMOKE_INSTALL_ROOT:-}" ]; then
+  node -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    for (const dir of [process.argv[1], process.argv[2]]) {
+      const file = path.join(dir, "package.json");
+      const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+      pkg.version = process.argv[3];
+      fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + "\\n");
+    }
+  ' "\$SMOKE_INSTALL_ROOT/umadev" "\$SMOKE_INSTALL_ROOT/@umacloud/cli-$PLATFORM" "$2"
+  printf '%s\n' '#!/bin/sh' 'echo "umadev $2"' > \
+    "\$SMOKE_INSTALL_ROOT/@umacloud/cli-$PLATFORM/bin/umadev"
+  chmod +x "\$SMOKE_INSTALL_ROOT/@umacloud/cli-$PLATFORM/bin/umadev"
+fi
 echo "$1-called: \$*"
 STUB
   chmod +x "$UPD_TMP/bin/$1"
@@ -111,6 +128,7 @@ mkdir -p "$UPD_TMP/node_modules/.umadev-vv1jMlhy" \
 # tried to exec the binary it would say so — which is exactly what we assert
 # against. A `y` on stdin carries it past the confirmation.
 UPD_OUT="$(cd "$UPD_TMP" && echo y | PATH="$UPD_TMP/bin:$PATH" \
+  SMOKE_INSTALL_ROOT="$UPD_TMP/node_modules" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$UPD_TMP/node_modules/umadev/bin/cli.js" update 2>&1)"
 
@@ -129,11 +147,17 @@ if [[ -d "$UPD_TMP/node_modules/.umadev-vv1jMlhy" ]] ||
   echo "✗ smoke.sh: abandoned npm staging dirs were not swept" >&2
   exit 1
 fi
-echo "✓ smoke.sh: update ran in the shim, binary untouched, debris swept"
+if [[ "$UPD_OUT" != *"upgraded and verified"* ]]; then
+  echo "✗ smoke.sh: the shim did not verify the upgraded executable" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: update ran in the shim, executable verified, debris swept"
 
 # ── 2. A closed stdin must read as "no" — a scripted caller that never answered
 # must not be upgraded behind its back.
 UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
+  SMOKE_INSTALL_ROOT="$UPD_TMP/node_modules" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$UPD_TMP/node_modules/umadev/bin/cli.js" update < /dev/null 2>&1)"
 if [[ "$UPD_OUT" == *"npm-called: install"* ]]; then
@@ -148,6 +172,7 @@ echo "✓ smoke.sh: an unanswered update aborts"
 PNPM_ROOT="$UPD_TMP/pnpm/global/5/node_modules"
 make_install "$PNPM_ROOT"
 UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
+  SMOKE_INSTALL_ROOT="$PNPM_ROOT" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$PNPM_ROOT/umadev/bin/cli.js" update -y 2>&1)"
 if [[ "$UPD_OUT" != *"pnpm-called: add -g umadev@latest"* ]]; then
@@ -166,6 +191,7 @@ echo "✓ smoke.sh: a pnpm-owned install upgrades via pnpm"
 BUN_ROOT="$UPD_TMP/.bun/install/global/node_modules"
 make_install "$BUN_ROOT"
 UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
+  SMOKE_INSTALL_ROOT="$BUN_ROOT" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$BUN_ROOT/umadev/bin/cli.js" update -y 2>&1)"
 if [[ "$UPD_OUT" != *"bun-called: add -g umadev@latest"* ]]; then
@@ -181,6 +207,7 @@ fi
 echo "✓ smoke.sh: a bun-owned install upgrades via bun"
 
 # ── 5. Already on the latest version: say so and reinstall NOTHING.
+make_install "$UPD_TMP/node_modules"
 mkdir -p "$UPD_TMP/latest-bin"
 cat > "$UPD_TMP/latest-bin/npm" <<STUB
 #!/bin/sh
@@ -206,7 +233,38 @@ if [[ "$UPD_OUT" == *"npm-called: install"* ]]; then
 fi
 echo "✓ smoke.sh: an already-latest install short-circuits"
 
-# ── 6. A ROOT-OWNED install (`sudo npm i -g`) must be REFUSED with the repair, not
+# ── 6. The exact reported split: package.json is current but the optional
+# platform executable is stale. This MUST repair, never short-circuit on the
+# main package and never print success before executing the replacement binary.
+cat > "$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev" <<STUB
+#!/bin/sh
+echo "umadev 0.0.1"
+STUB
+chmod +x "$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev"
+cat > "$UPD_TMP/latest-bin/npm" <<STUB
+#!/bin/sh
+case "\$1" in
+  --version) echo "9.9.9"; exit 0 ;;
+  view)      echo "$INSTALLED_VERSION"; exit 0 ;;
+esac
+cp "$NPM_ROOT/cli-$PLATFORM/bin/umadev" \
+  "$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev"
+echo "npm-called: \$*"
+STUB
+chmod +x "$UPD_TMP/latest-bin/npm"
+UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/latest-bin:$PATH" \
+  UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
+  node "$UPD_TMP/node_modules/umadev/bin/cli.js" update -y 2>&1)"
+if [[ "$UPD_OUT" == *"Nothing to do"* ]] ||
+   [[ "$UPD_OUT" != *"Version split detected"* ]] ||
+   [[ "$UPD_OUT" != *"upgraded and verified"* ]]; then
+  echo "✗ smoke.sh: a current package with a stale executable was not repaired" >&2
+  echo "$UPD_OUT" >&2
+  exit 1
+fi
+echo "✓ smoke.sh: a package/executable version split is detected and repaired"
+
+# ── 7. A ROOT-OWNED install (`sudo npm i -g`) must be REFUSED with the repair, not
 # handed to a package manager that dies with EACCES half-way through and aborts the
 # whole global transaction (taking the user's other global packages with it).
 #
@@ -250,7 +308,7 @@ else
   echo "✓ smoke.sh: a root-owned install refuses with the repair"
 fi
 
-# ── 7. Ownership detection, per layout. The e2e cases above cover npm/pnpm/bun;
+# ── 8. Ownership detection, per layout. The e2e cases above cover npm/pnpm/bun;
 # this pins yarn's layouts and the env-var evidence (PNPM_HOME / BUN_INSTALL), which
 # have no fabricable global install here.
 node -e '

@@ -31,6 +31,29 @@ PLATFORM_PACKAGES=(
   "cli-win32-x64"
 )
 
+# Refuse a split release before the first irreversible publish. The main
+# package, every platform package, the knowledge package, Cargo, and each exact
+# optional-dependency pin must name the same version.
+CARGO_VERSION="$(sed -n 's/^version = "\([0-9][0-9.]*\)"/\1/p' "$NPM_ROOT/../Cargo.toml" | head -1)"
+node - "$NPM_ROOT" "$CARGO_VERSION" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const [root, expected] = process.argv.slice(2);
+const dirs = fs.readdirSync(root, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(root, entry.name, 'package.json')))
+  .map((entry) => entry.name);
+for (const dir of dirs) {
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, dir, 'package.json'), 'utf8'));
+  if (pkg.version !== expected) throw new Error(`${pkg.name}: ${pkg.version} != Cargo ${expected}`);
+  if (pkg.name === 'umadev') {
+    for (const [name, version] of Object.entries(pkg.optionalDependencies || {})) {
+      if (version !== expected) throw new Error(`${name} pin ${version} != ${expected}`);
+    }
+  }
+}
+console.log(`publish.sh: version lockstep verified (${expected})`);
+NODE
+
 # 1) Verify every platform package has its binary staged.
 for pkg in "${PLATFORM_PACKAGES[@]}"; do
   case "$pkg" in

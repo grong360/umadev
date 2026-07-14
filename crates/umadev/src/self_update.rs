@@ -228,6 +228,7 @@ pub fn swap_plan(exe: &Path, tmp: &Path, windows: bool) -> Vec<SwapStep> {
 /// is atomic; the download was already verified, so nothing here can produce a
 /// half-written binary.
 fn apply_swap(steps: &[SwapStep]) -> Result<()> {
+    let mut parked: Option<(&Path, &Path)> = None;
     for step in steps {
         match step {
             SwapStep::RenameAside { from, to } => {
@@ -240,11 +241,24 @@ fn apply_swap(steps: &[SwapStep]) -> Result<()> {
                         to.display()
                     )
                 })?;
+                parked = Some((from, to));
             }
             SwapStep::Install { from, to } => {
-                std::fs::rename(from, to).with_context(|| {
-                    format!("could not install the new binary at {}", to.display())
-                })?;
+                if let Err(install_err) = std::fs::rename(from, to) {
+                    if let Some((original, backup)) = parked {
+                        if let Err(rollback_err) = std::fs::rename(backup, original) {
+                            bail!(
+                                "could not install the new binary at {} ({install_err}); \
+                                 rollback from {} also failed ({rollback_err})",
+                                to.display(),
+                                backup.display()
+                            );
+                        }
+                    }
+                    return Err(install_err).with_context(|| {
+                        format!("could not install the new binary at {}", to.display())
+                    });
+                }
             }
         }
     }
@@ -659,6 +673,23 @@ mod tests {
                     to: exe.to_path_buf(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_failed_windows_install_rolls_the_running_binary_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("umadev.exe");
+        let missing_download = tmp.path().join("umadev.exe.new-missing");
+        std::fs::write(&exe, b"old executable").unwrap();
+
+        let result = apply_swap(&swap_plan(&exe, &missing_download, true));
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"old executable");
+        assert!(
+            !backup_path(&exe).exists(),
+            "rollback restores the original path instead of stranding only .old"
         );
     }
 

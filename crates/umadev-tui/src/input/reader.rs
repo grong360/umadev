@@ -174,25 +174,31 @@ async fn next_winch(sig: &mut Option<WinchSignal>) {
     }
 }
 
-/// P2 — parse a **DECRPM reply** to the startup DEC-2026 (synchronized output)
-/// DECRQM probe: `\x1b[?2026;<n>$y`. `n = 1` (set) or `2` (reset) mean the
-/// terminal implements the mode → `Some(true)`; any other recognized reply
-/// value (`0` = not recognized, `3`/`4` = permanently locked) → `Some(false)`;
-/// bytes that are not a 2026 DECRPM at all → `None` (not our reply). The event
-/// loop sends the query once at startup and reads the verdict via
-/// [`InputSource::take_sync_output_reply`]; routing the reply through the ONE
-/// owned tokenizer (instead of a second stdin reader) is what keeps it from
-/// racing the input stream or leaking as keystrokes.
-fn decrpm_2026_verdict(bytes: &[u8]) -> Option<bool> {
-    let n = bytes
-        .strip_prefix(b"\x1b[?2026;")?
-        .strip_suffix(b"$y")?
-        .iter()
-        .try_fold(0u32, |acc, &b| {
-            b.is_ascii_digit()
-                .then(|| acc.saturating_mul(10) + u32::from(b - b'0'))
-        })?;
-    Some(n == 1 || n == 2)
+/// Parse an OSC 11 background-color reply and classify its luminance.
+/// Components may contain one to four hex digits, as allowed by xterm.
+fn osc11_light_theme(bytes: &[u8]) -> Option<bool> {
+    let body = bytes.strip_prefix(b"\x1b]11;rgb:")?;
+    let body = body
+        .strip_suffix(b"\x07")
+        .or_else(|| body.strip_suffix(b"\x1b\\"))?;
+    let text = std::str::from_utf8(body).ok()?;
+    let mut parts = text.split('/');
+    let scale = |component: &str| -> Option<u64> {
+        if component.is_empty() || component.len() > 4 {
+            return None;
+        }
+        let value = u64::from_str_radix(component, 16).ok()?;
+        let max = (1_u64 << (component.len() * 4)) - 1;
+        Some(value.saturating_mul(65_535) / max)
+    };
+    let r = scale(parts.next()?)?;
+    let g = scale(parts.next()?)?;
+    let b = scale(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let luminance = 2_126 * r + 7_152 * g + 722 * b;
+    Some(luminance >= 5_000 * 65_535)
 }
 
 /// Sleep until `deadline`, or never (when `None`) — so the ESC-flush arm is a
@@ -233,11 +239,9 @@ pub struct OwnedInput {
     /// Whether the reader channel has closed (thread ended). Disables the recv
     /// arm so the source parks instead of busy-looping on `None`.
     closed: bool,
-    /// P2 — the captured verdict of the startup DEC-2026 DECRQM probe, parked
-    /// here when the DECRPM reply flows through the decoder (see
-    /// [`decrpm_2026_verdict`]). `None` until (unless) the terminal answers;
-    /// drained one-shot by [`OwnedInput::take_sync_output_reply`].
-    sync_output_reply: Option<bool>,
+    /// Captured OSC 11 background classification. Terminal replies flow through
+    /// the same reader as keys, so the probe cannot race or corrupt stdin.
+    background_reply: Option<bool>,
 }
 
 impl OwnedInput {
@@ -254,19 +258,16 @@ impl OwnedInput {
             paste_interval: paste_flush_interval(),
             winch: register_winch_signal(),
             closed: false,
-            sync_output_reply: None,
+            background_reply: None,
         }
     }
 
-    /// Decode-side event sink shared by [`Self::ingest`] and
-    /// [`Self::flush_escape`]: captures the DEC-2026 DECRPM probe reply (P2 —
-    /// consumed here, never surfaced as input) and enqueues everything that maps
-    /// to a real terminal event. Every other [`InputEvent::Response`] stays
-    /// dropped exactly as before.
+    /// Decode-side event sink shared by ingest and flush. OSC 11 is captured;
+    /// every terminal response is kept out of the user-input queue.
     fn enqueue(&mut self, ev: InputEvent) {
         if let InputEvent::Response(bytes) = &ev {
-            if let Some(verdict) = decrpm_2026_verdict(bytes) {
-                self.sync_output_reply = Some(verdict);
+            if let Some(is_light) = osc11_light_theme(bytes) {
+                self.background_reply = Some(is_light);
             }
         }
         if let Some(event) = ev.into_event() {
@@ -274,13 +275,10 @@ impl OwnedInput {
         }
     }
 
-    /// P2 — take the captured DECRPM verdict for the startup synchronized-output
-    /// probe, if the terminal has answered. One-shot (`None` after the first
-    /// take); the event loop polls this until its probe deadline, then falls
-    /// back to the env allowlist.
+    /// Take the captured OSC 11 background classification, if one arrived.
     #[must_use]
-    pub fn take_sync_output_reply(&mut self) -> Option<bool> {
-        self.sync_output_reply.take()
+    pub fn take_background_reply(&mut self) -> Option<bool> {
+        self.background_reply.take()
     }
 
     /// Feed a byte chunk through the tokenizer + decoder, enqueueing events, then
@@ -455,15 +453,12 @@ impl InputSource {
         ev.map(|r| r.map(super::keymap::normalize_event))
     }
 
-    /// P2 — take the terminal's DECRPM answer to the startup synchronized-output
-    /// probe, if it has arrived (one-shot). Always `None` on the legacy path:
-    /// crossterm's parser owns stdin there and has no lane for the reply, which
-    /// is exactly why the event loop only SENDS the probe on the owned path and
-    /// falls back to the env allowlist at the deadline otherwise.
+    /// Take an OSC 11 background reply. The legacy crossterm path has no response
+    /// lane, so capability queries are only sent for the owned reader.
     #[must_use]
-    pub fn take_sync_output_reply(&mut self) -> Option<bool> {
+    pub fn take_background_reply(&mut self) -> Option<bool> {
         match self {
-            InputSource::Owned(o) => o.take_sync_output_reply(),
+            InputSource::Owned(o) => o.take_background_reply(),
             InputSource::Legacy(_) => None,
         }
     }
@@ -581,7 +576,7 @@ mod tests {
                 paste_interval: Duration::from_millis(DEFAULT_PASTE_FLUSH_MS),
                 winch: None,
                 closed: false,
-                sync_output_reply: None,
+                background_reply: None,
             },
             tx,
         )
@@ -800,44 +795,39 @@ mod tests {
     }
 
     #[test]
-    fn decrpm_2026_verdict_parses_supported_and_unsupported() {
-        // n=1 (set) and n=2 (reset) both mean the mode is implemented.
-        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;1$y"), Some(true));
-        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;2$y"), Some(true));
-        // n=0 = not recognized → unsupported.
-        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;0$y"), Some(false));
-        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;4$y"), Some(false));
-        // A DECRPM for a DIFFERENT mode, a DA1 reply, or ordinary keys are not
-        // ours — `None`, never a false verdict.
-        assert_eq!(decrpm_2026_verdict(b"\x1b[?2004;1$y"), None);
-        assert_eq!(decrpm_2026_verdict(b"\x1b[?62;1c"), None);
-        assert_eq!(decrpm_2026_verdict(b"hello"), None);
-        // Garbage where the digit should be → not a verdict.
-        assert_eq!(decrpm_2026_verdict(b"\x1b[?2026;x$y"), None);
+    fn osc11_reply_classifies_light_dark_and_component_widths() {
+        assert_eq!(
+            osc11_light_theme(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\"),
+            Some(true)
+        );
+        assert_eq!(osc11_light_theme(b"\x1b]11;rgb:00/00/00\x07"), Some(false));
+        assert_eq!(osc11_light_theme(b"\x1b]11;rgb:f/f/f\x07"), Some(true));
+        assert_eq!(osc11_light_theme(b"\x1b]10;rgb:ffff/ffff/ffff\x07"), None);
+        assert_eq!(osc11_light_theme(b"not a reply"), None);
     }
 
     #[test]
-    fn sync_probe_reply_is_captured_and_never_leaks_as_input() {
+    fn background_reply_is_captured_and_never_leaks_as_input() {
         let (mut oi, _tx) = owned_for_test();
-        oi.ingest(b"\x1b[?2026;1$y");
+        oi.ingest(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
         assert!(
             oi.queue.is_empty(),
-            "the DECRPM reply must be consumed, never surfaced as keystrokes"
+            "the OSC reply must be consumed, never surfaced as keystrokes"
         );
-        assert_eq!(oi.take_sync_output_reply(), Some(true), "verdict captured");
-        assert_eq!(oi.take_sync_output_reply(), None, "the take is one-shot");
+        assert_eq!(oi.take_background_reply(), Some(true));
+        assert_eq!(oi.take_background_reply(), None, "the take is one-shot");
     }
 
     #[test]
-    fn sync_probe_reply_split_across_reads_and_mixed_with_typing_still_resolves() {
+    fn background_reply_split_across_reads_does_not_consume_typing() {
         // The reply can straddle a read boundary and be followed by real input
         // in the same chunk — the tokenizer reassembles the sequence, the
         // verdict is captured, and ONLY the real keys surface.
         let (mut oi, _tx) = owned_for_test();
-        oi.ingest(b"\x1b[?2026;");
+        oi.ingest(b"\x1b]11;rgb:0000/");
         assert!(oi.queue.is_empty(), "an incomplete reply emits nothing");
-        oi.ingest(b"0$yhi");
-        assert_eq!(oi.take_sync_output_reply(), Some(false));
+        oi.ingest(b"0000/0000\x1b\\hi");
+        assert_eq!(oi.take_background_reply(), Some(false));
         let keys: Vec<Event> = std::mem::take(&mut oi.queue).into();
         assert_eq!(
             keys.len(),

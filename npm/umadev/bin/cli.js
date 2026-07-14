@@ -38,7 +38,7 @@ function binaryName() {
   return process.platform === 'win32' ? 'umadev.exe' : 'umadev';
 }
 
-function findBinary() {
+function platformPackage() {
   const key = platformKey();
   const pkg = PLATFORM_PACKAGES[key];
   if (!pkg) {
@@ -51,25 +51,36 @@ function findBinary() {
     );
     process.exit(1);
   }
+  return pkg;
+}
+
+// Resolve the binary belonging to this exact main-package install. Avoid a
+// process-wide lookup here: a second global manager can put another UmaDev on
+// PATH, which is precisely the split-install state the updater must diagnose.
+function resolveInstalledBinary(pkgRoot = PACKAGE_ROOT) {
+  const pkg = platformPackage();
   const bin = binaryName();
+  const installed = path.join(path.dirname(pkgRoot), ...pkg.split('/'), 'bin', bin);
+  if (fs.existsSync(installed)) return installed;
 
-  // 1) Published case — npm installed the sibling platform package.
-  try {
-    return require.resolve(`${pkg}/bin/${bin}`);
-  } catch (_) {
-    /* fall through */
-  }
-
-  // 2) Local dev — both packages live as siblings under npm/.
+  // Local dev — both packages live as siblings under npm/. Use the mapped
+  // package name so win32-arm64 correctly reuses cli-win32-x64.
+  const packageLeaf = pkg.slice(pkg.lastIndexOf('/') + 1);
   const sibling = path.resolve(
-    __dirname,
+    pkgRoot,
     '..',
-    '..',
-    `cli-${process.platform}-${process.arch}`,
+    packageLeaf,
     'bin',
     bin,
   );
   if (fs.existsSync(sibling)) return sibling;
+  return null;
+}
+
+function findBinary() {
+  const pkg = platformPackage();
+  const resolved = resolveInstalledBinary(PACKAGE_ROOT);
+  if (resolved) return resolved;
 
   console.error(
     `umadev: ${pkg} not installed.\n` +
@@ -77,6 +88,59 @@ function findBinary() {
       "(npm 'optionalDependencies' should normally pick the right one.)",
   );
   process.exit(1);
+}
+
+function readPackageVersion(pkgDir) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
+    return typeof parsed.version === 'string' ? parsed.version : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function binaryVersion(binary) {
+  if (!binary) return null;
+  try {
+    const r = spawnSync(binary, ['--version'], {
+      encoding: 'utf8',
+      timeout: 10000,
+      windowsHide: true,
+    });
+    if (r.error || r.status !== 0) return null;
+    const match = /\bv?(\d+\.\d+\.\d+(?:[-+][^\s]+)?)/.exec(`${r.stdout || ''} ${r.stderr || ''}`);
+    return match ? match[1] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Main package, optional platform package, and executable are three separate
+// artifacts in npm's tree. A successful manager exit is not enough: npm allows
+// optional dependency installation to fail, and Windows file locks can leave
+// the old platform package beside a new main package.
+function installedVersionState(pkgRoot = PACKAGE_ROOT) {
+  const binary = resolveInstalledBinary(pkgRoot);
+  const platformRoot = binary ? path.dirname(path.dirname(binary)) : null;
+  return {
+    main: readPackageVersion(pkgRoot),
+    platform: platformRoot ? readPackageVersion(platformRoot) : null,
+    binary: binaryVersion(binary),
+    binaryPath: binary,
+  };
+}
+
+function versionStateMatches(state, expected) {
+  return Boolean(
+    expected &&
+      state.main === expected &&
+      state.platform === expected &&
+      state.binary === expected,
+  );
+}
+
+function describeVersionState(state) {
+  return `main=${state.main || 'missing'}, platform=${state.platform || 'missing'}, binary=${state.binary || 'unreadable'}`;
 }
 
 // Resolve the platform-independent bundled embedding model (a regular
@@ -792,18 +856,19 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
     return true;
   }
 
-  let current = 'unknown';
-  try {
-    current = require(path.join(pkgRoot, 'package.json')).version;
-  } catch (_) {
-    /* keep "unknown" — the upgrade itself doesn't depend on knowing it */
-  }
+  const before = installedVersionState(pkgRoot);
+  const current = before.main || 'unknown';
   console.log(`UmaDev ${current} is installed (via ${mgr}).`);
+  if (before.main && !versionStateMatches(before, before.main)) {
+    console.warn(`Version split detected: ${describeVersionState(before)}.`);
+    console.warn('The platform package or executable will be repaired even if the main package is current.');
+  }
 
   const force = args.includes('--force');
+  let latest = null;
   if (!force) {
-    const latest = await latestPublishedVersion();
-    if (latest && versionAtLeast(current, latest)) {
+    latest = await latestPublishedVersion();
+    if (latest && versionAtLeast(current, latest) && versionStateMatches(before, current)) {
       console.log(`Already on the latest version (${latest}). Nothing to do.`);
       return true;
     }
@@ -856,7 +921,21 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
   // The manager's own cleanup normally succeeds now that the binary was never
   // launched; sweep once more in case an unrelated process held something open.
   sweepAbandonedStagingDirs(pkgRoot);
-  console.log('[ok] UmaDev upgraded. Run `umadev --version` to confirm.');
+  const after = installedVersionState(pkgRoot);
+  const expected = latest || after.main;
+  if (!versionStateMatches(after, expected)) {
+    console.error(`\numadev: upgrade verification failed (${describeVersionState(after)}).`);
+    if (expected) console.error(`        Expected all three artifacts to be ${expected}.`);
+    console.error(
+      '        On Windows, close VS Code/Zcode/Codex and any terminal still running UmaDev,\n' +
+        '        then repair the optional platform package with:\n' +
+        '          npm install -g umadev@latest --force\n' +
+        '        If `where umadev` prints multiple paths, remove the stale install.',
+    );
+    process.exitCode = 1;
+    return true;
+  }
+  console.log(`[ok] UmaDev ${expected} upgraded and verified (${path.basename(after.binaryPath)}).`);
   return true;
 }
 
@@ -938,6 +1017,9 @@ module.exports = {
   isRootOwned,
   rootOwnedRefusal,
   runSelfUpdate,
+  installedVersionState,
+  versionStateMatches,
+  resolveInstalledBinary,
   versionAtLeast,
   UPGRADE_COMMANDS,
 };

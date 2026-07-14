@@ -15,8 +15,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 // The brand color is cyan (#06b6d4 / #0891b2), chosen because it reads as
 // modern + developer-tool (Vercel/Linear/Deno family) and doesn't collide
 // with Claude Code's orange. Colors resolve at runtime to a dark or light
-// palette by probing the COLORFGBG env var (set by most modern terminals),
-// so the TUI adapts to light backgrounds instead of washing out.
+// palette from UMADEV_THEME, COLORFGBG, or the terminal's OSC 11 reply.
 #[allow(dead_code, non_snake_case)] // palette complete; UPPER_CASE mirrors CSS color tokens.
 mod theme {
     use ratatui::style::Color;
@@ -33,12 +32,11 @@ mod theme {
         Color::Rgb(r, g, b)
     }
 
-    // Light/dark is probed ONCE in lib::setup_terminal() (OSC 11 + COLORFGBG,
-    // before raw mode) and stored here. Default dark until probed.
+    // Default dark until startup hints or an asynchronous OSC 11 reply updates it.
     use std::sync::atomic::{AtomicBool, Ordering};
     static IS_LIGHT: AtomicBool = AtomicBool::new(false);
 
-    /// Called once at launch (before raw mode) with the OSC 11 probe result.
+    /// Apply the startup hint or a later OSC 11 result.
     pub fn set_light_theme(is_light: bool) {
         IS_LIGHT.store(is_light, Ordering::Relaxed);
     }
@@ -378,7 +376,7 @@ use crate::app::{
 };
 
 /// Set the terminal's light/dark classification, probed once at launch
-/// (OSC 11 + COLORFGBG) before raw mode. Re-exported from [`theme`].
+/// Re-exported from [`theme`] for startup and asynchronous terminal detection.
 pub fn set_light_theme(is_light: bool) {
     theme::set_light_theme(is_light);
 }
@@ -6678,6 +6676,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("↑ / ↓", umadev_i18n::t(lang, "tui.help.edit.recall")),
                     ("Tab", umadev_i18n::t(lang, "tui.help.edit.autocomplete")),
                     ("@", umadev_i18n::t(lang, "tui.help.key.mention")),
+                    ("Ctrl+V", umadev_i18n::t(lang, "tui.help.key.paste_image")),
                     ("!", umadev_i18n::t(lang, "tui.help.key.shell")),
                     ("Shift+Tab", umadev_i18n::t(lang, "tui.help.key.trust")),
                     ("Ctrl+O", umadev_i18n::t(lang, "tui.help.key.expand_all")),
@@ -8410,6 +8409,7 @@ mod tests {
         assert!(out.contains(umadev_i18n::t(app.lang, "tui.help.group.editing").trim()));
         for label in [
             "Shift+Tab",
+            "Ctrl+V",
             "Ctrl+O",
             "Ctrl+R",
             "Ctrl+F",

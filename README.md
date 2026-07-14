@@ -76,7 +76,7 @@ npm i umadev && npx umadev # or as a project-local dependency
 
 Already hit the sudo trap? `umadev doctor` detects a root-owned install or npm cache and prints the exact repair (`sudo chown -R $(whoami) ~/.npm`, then reinstall under a user-owned prefix).
 
-The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64, glibc ≥ 2.18 — musl/Alpine needs a source build), and Windows (x86_64).
+The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64, glibc ≥ 2.31 — musl/Alpine needs a source build), and Windows (x86_64).
 
 The binary and the curated knowledge corpus install from npm and work fully offline. The optional local embedding model (`multilingual-e5-small`, f16, ~224 MB) is **not** bundled in the npm package — it is fetched on first run to `~/.umadev/embed-model` (a one-time download), then powers offline vector search locally with no API key and no runtime network. If that first-run download is unavailable (offline install, restricted network), umadev still works: retrieval falls back to BM25-only until the model is present, and it self-heals — a later run re-downloads it (a corrupt cache is re-fetched, not trusted).
 
@@ -727,6 +727,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `UMADEV_NO_GOAL_MODE` | Disable `/goal` mode if set to `1` | — |
 | `UMADEV_SHOW_PROCESS_LOGS` | Seed the base's live process-log visibility (also toggled in-app with `/logs`) | off |
 | `UMADEV_CONTINUOUS` | Set to `0` (or `UMADEV_LEGACY_RUN=1`) to opt out of the continuous single-session path | on |
+| `UMADEV_THEME` | Force terminal palette to `dark` or `light` when automatic detection is unavailable | automatic |
 | `OPENAI_EMBED_KEY` | Enable remote vector embeddings (else bundled local model + BM25) | — |
 | `XDG_CONFIG_HOME` | Base directory for `config.toml` | `$HOME` |
 
@@ -832,6 +833,7 @@ Other authoritative references:
 
 - [`docs/PRODUCT_VISION_AND_ROADMAP.md`](docs/PRODUCT_VISION_AND_ROADMAP.md) — the product model
 - [`CHANGELOG.md`](CHANGELOG.md) — release history
+- [`docs/TERMINAL_COMPATIBILITY.md`](docs/TERMINAL_COMPATIBILITY.md) — cross-platform terminal release contract and validation matrix
 
 ---
 

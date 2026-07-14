@@ -144,12 +144,48 @@ fn git_dir(project_root: &Path) -> PathBuf {
 
 /// Run a shadow-git command (work-tree = project root). `None` if `git` can't be
 /// spawned at all.
+///
+/// The shadow repo is a BYTE-EXACT snapshot store, not a repository the user
+/// collaborates in — so it must be hermetic, and never inherit the user's global
+/// git configuration. Each setting pinned here is one that silently breaks the
+/// safety net otherwise:
+///
+/// - **identity** — a user who has never run `git config --global user.email` (very
+///   common on Windows) cannot commit at all. `create_checkpoint` would return
+///   `None`, and since a rescue snapshot that FAILS means we decline to heal, the
+///   entire workspace-protection net would never start, silently, for exactly the
+///   users least likely to notice.
+/// - **`core.autocrlf`** — `true` is the DEFAULT of Git for Windows. It would
+///   normalise CRLF to LF on the way into a snapshot and write CRLF back out on
+///   restore, so a heal would rewrite the line ending of every line of every LF file
+///   it restores. A snapshot store that does not return the bytes it was given is
+///   not a snapshot store.
+/// - **`commit.gpgsign`** — a user who signs by default would have every internal
+///   snapshot try to sign, which can prompt, stall, or simply fail.
+/// - **hooks** — committing a snapshot must never fire the user's pre-commit hooks
+///   (`--no-verify` is passed at the commit site).
 fn git(project_root: &Path, args: &[&str]) -> Option<std::process::Output> {
     Command::new("git")
         .arg("--git-dir")
         .arg(git_dir(project_root))
         .arg("--work-tree")
         .arg(project_root)
+        .args([
+            "-c",
+            "user.name=UmaDev",
+            "-c",
+            "user.email=umadev@local",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.safecrlf=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "gc.auto=0",
+        ])
         .args(args)
         .output()
         .ok()
@@ -211,6 +247,8 @@ pub fn create_checkpoint(project_root: &Path, label: &str) -> Option<String> {
             "commit",
             "-q",
             "--allow-empty",
+            // A snapshot of the user's tree must never fire the user's own git hooks.
+            "--no-verify",
             "-m",
             label,
         ],
@@ -267,6 +305,8 @@ pub fn create_phase_checkpoint(project_root: &Path, label: &str) -> Option<Strin
             "commit",
             "-q",
             "--allow-empty",
+            // A snapshot of the user's tree must never fire the user's own git hooks.
+            "--no-verify",
             "-m",
             label,
         ],
@@ -2724,15 +2764,20 @@ mod tests {
         std::fs::write(root.join("a.txt"), "v0").unwrap();
         create_checkpoint(root, "run-baseline").expect("the user's own checkpoint");
 
-        // Bury it under more internal machinery commits than the first scan window holds.
+        // Bare empty commits preserve the deep-history shape this test needs without
+        // multiplying git subprocesses through checkpoint staging and HEAD re-reads.
         for i in 0..(CHECKPOINT_SCAN_WINDOWS[0] + 20) {
-            std::fs::write(root.join("a.txt"), format!("v{i}")).unwrap();
             let label = if i % 2 == 0 {
                 TEMP_REWIND_HEAD_LABEL.to_string()
             } else {
                 format!("{RED_GREEN_PRE_PREFIX}step {i}")
             };
-            create_checkpoint(root, &label).expect("internal snapshot");
+            let out = git(
+                root,
+                &["commit", "-q", "--allow-empty", "--no-verify", "-m", &label],
+            )
+            .expect("git runs");
+            assert!(out.status.success(), "internal snapshot {i}");
         }
 
         let list = list_checkpoints(root);

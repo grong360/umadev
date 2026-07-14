@@ -8,7 +8,7 @@
 //! the same block into three places, and every prior deterministic check
 //! (build/test, coverage, contract, test-integrity) still reads green. This
 //! module makes UmaDev's own deterministic floor *verify* architecture
-//! fitness, with three rules:
+//! fitness, with four rules:
 //!
 //! 1. **God-file gate** (`UD-CODE-006a`, blocking) — a NEW source file over
 //!    500 lines, or a touched file that GREW PAST 800 lines this step, blocks
@@ -33,6 +33,10 @@
 //!    block ≥ 5 lines yields an advisory naming the sibling location ("reuse
 //!    X:line instead"). Advisory, not blocking — deduplication judgment needs
 //!    a human/critic; the floor only surfaces the evidence.
+//! 4. **Comment hygiene** (`UD-CODE-006d`, ADVISORY) — a touched source file
+//!    that newly gains an 8-line ordinary-comment run, or at least 12 ordinary
+//!    comment-only lines exceeding its code lines, gets a concise advisory.
+//!    Documentation, licenses, generated files, and tests are exempt.
 //!
 //! # The architecture-doc layering convention
 //!
@@ -103,6 +107,8 @@ pub const RULE_GOD_FILE: &str = "UD-CODE-006a";
 pub const RULE_LAYER: &str = "UD-CODE-006b";
 /// Clause id of the clone gate (rule 3, advisory, spec §3.6).
 pub const RULE_CLONE: &str = "UD-CODE-006c";
+/// Clause id of the comment-hygiene gate (rule 4, advisory, spec §3.6).
+pub const RULE_COMMENT_HYGIENE: &str = "UD-CODE-006d";
 
 /// Default line ceiling for a NEW source file (`UD-CODE-006a`).
 const NEW_FILE_MAX_LINES: usize = 500;
@@ -140,6 +146,11 @@ const MAX_CLONE_TOUCHED: usize = 20;
 /// Max clone advisories per touched file / in total.
 const MAX_CLONES_PER_FILE: usize = 3;
 const MAX_CLONE_FINDINGS: usize = 12;
+/// Comment-hygiene thresholds. These are deliberately high enough to catch
+/// narration blocks without imposing a comment quota on ordinary code.
+const LONG_COMMENT_RUN: usize = 8;
+const COMMENT_RATIO_MIN: usize = 12;
+const MAX_COMMENT_FINDINGS: usize = 12;
 /// Max layer-violation findings reported per pass.
 const MAX_LAYER_FINDINGS: usize = 10;
 
@@ -210,14 +221,22 @@ pub struct Finding {
 // Baseline + scan (the changed-file-set source, mirroring test_integrity)
 // ---------------------------------------------------------------------------
 
-/// Per-file scan record: raw line count, content hash, and the normalized
-/// 5-line clone windows (window hash → 1-based start line of its first
-/// occurrence).
+/// Per-file scan record used by the diff-aware fitness rules.
 #[derive(Debug, Clone)]
 struct FileScan {
     lines: usize,
     hash: u64,
     windows: HashMap<u64, u32>,
+    comments: CommentStats,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CommentStats {
+    ordinary: usize,
+    code: usize,
+    max_run: usize,
+    max_run_start: u32,
+    long_runs: HashMap<u64, (u32, usize)>,
 }
 
 /// A point-in-time snapshot of the project's fitness-relevant source surface,
@@ -332,6 +351,7 @@ fn scan(root: &Path) -> Option<ArchScan> {
                 lines: content.lines().count(),
                 hash: fnv(content.as_bytes()),
                 windows,
+                comments: comment_stats(&content),
             },
         );
     }
@@ -477,6 +497,7 @@ pub fn arch_fitness_findings(root: &Path, slug: &str, touched: &[PathBuf]) -> Ve
         }
     }
     out.extend(clone_findings(&now, &rels, None));
+    out.extend(comment_hygiene_findings(&now, &rels, None));
     out
 }
 
@@ -514,6 +535,7 @@ pub fn arch_fitness_findings_since(root: &Path, slug: &str, before: &ArchBaselin
     if before.clone_ok {
         out.extend(clone_findings(&now, &touched, Some(before)));
     }
+    out.extend(comment_hygiene_findings(&now, &touched, Some(before)));
     out
 }
 
@@ -929,6 +951,141 @@ fn windows_of(content: &str) -> HashMap<u64, u32> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Rule 4 — comment hygiene (advisory)
+// ---------------------------------------------------------------------------
+
+/// Count ordinary explanatory comments without treating API docs, licenses, or
+/// block documentation as implementation narration. The classifier is
+/// intentionally conservative: a miss costs one advisory, never a block.
+fn comment_stats(content: &str) -> CommentStats {
+    let mut stats = CommentStats::default();
+    let mut run = 0usize;
+    let mut run_start = 0u32;
+    let mut run_text = String::new();
+    let mut block_end: Option<&'static str> = None;
+    let mut block_is_ordinary = false;
+    let finish_run = |stats: &mut CommentStats, run: usize, start: u32, text: &mut String| {
+        if run >= LONG_COMMENT_RUN {
+            stats.long_runs.insert(fnv(text.as_bytes()), (start, run));
+        }
+        text.clear();
+    };
+    for (index, raw) in content.lines().enumerate() {
+        let line_no = u32::try_from(index + 1).unwrap_or(u32::MAX);
+        let trimmed = raw.trim();
+        let license = index < 10
+            && (trimmed.contains("SPDX-License-Identifier")
+                || trimmed.to_ascii_lowercase().contains("copyright"));
+        let ordinary;
+        if let Some(end) = block_end {
+            ordinary = block_is_ordinary;
+            if trimmed.contains(end) {
+                block_end = None;
+            }
+        } else if let Some((end, is_doc)) = if trimmed.starts_with("/*") {
+            Some((
+                "*/",
+                trimmed.starts_with("/**") || trimmed.starts_with("/*!"),
+            ))
+        } else if trimmed.starts_with("<!--") {
+            Some(("-->", false))
+        } else if trimmed.starts_with("--[[") {
+            Some(("]]", false))
+        } else {
+            None
+        } {
+            ordinary = !license && !is_doc;
+            if !trimmed[2..].contains(end) {
+                block_end = Some(end);
+                block_is_ordinary = ordinary;
+            }
+        } else {
+            ordinary = !license
+                && ((trimmed.starts_with("//")
+                    && !trimmed.starts_with("///")
+                    && !trimmed.starts_with("//!"))
+                    || (trimmed.starts_with('#')
+                        && !trimmed.starts_with("#!")
+                        && !trimmed.starts_with("#["))
+                    || trimmed.starts_with("-- "));
+        }
+        if ordinary {
+            stats.ordinary += 1;
+            if run == 0 {
+                run_start = line_no;
+            }
+            run += 1;
+            run_text.push_str(trimmed);
+            run_text.push('\n');
+            if run > stats.max_run {
+                stats.max_run = run;
+                stats.max_run_start = run_start;
+            }
+            continue;
+        }
+        finish_run(&mut stats, run, run_start, &mut run_text);
+        run = 0;
+        if trimmed.is_empty()
+            || license
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('*')
+            || trimmed.starts_with("*/")
+        {
+            continue;
+        }
+        stats.code += 1;
+    }
+    finish_run(&mut stats, run, run_start, &mut run_text);
+    stats
+}
+
+fn comment_hygiene_findings(
+    now: &ArchScan,
+    touched: &[String],
+    before: Option<&ArchBaseline>,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for rel in touched {
+        if out.len() >= MAX_COMMENT_FINDINGS {
+            break;
+        }
+        let Some(after) = now.files.get(rel).map(|f| &f.comments) else {
+            continue;
+        };
+        let prior = before.and_then(|b| b.files.get(rel)).map(|f| &f.comments);
+        let new_long_run = after
+            .long_runs
+            .iter()
+            .filter(|(hash, _)| prior.is_none_or(|p| !p.long_runs.contains_key(hash)))
+            .min_by_key(|(_, (line, _))| *line)
+            .map(|(_, &(line, len))| (line, len));
+        let ratio = after.ordinary >= COMMENT_RATIO_MIN && after.ordinary > after.code;
+        let prior_ratio =
+            prior.is_some_and(|p| p.ordinary >= COMMENT_RATIO_MIN && p.ordinary > p.code);
+        let newly_worse_ratio = ratio
+            && (!prior_ratio
+                || prior.is_some_and(|p| after.ordinary >= p.ordinary.saturating_add(4)));
+        if new_long_run.is_none() && !newly_worse_ratio {
+            continue;
+        }
+        let (line, reported_run) =
+            new_long_run.unwrap_or((after.max_run_start.max(1), after.max_run));
+        out.push(Finding {
+            blocking: false,
+            message: format!(
+                "arch-fitness: {rel}:{line} has comment narration heavier than the code \
+                 ({} ordinary comment lines, {} code lines, longest run {}) — keep comments \
+                 for why/invariants and move history or repair narration to the change report",
+                after.ordinary, after.code, reported_run
+            ),
+            file: rel.clone(),
+            rule_id: RULE_COMMENT_HYGIENE,
+        });
+    }
+    out
+}
+
 /// FNV-1a content hash (equality-only, non-cryptographic).
 fn fnv(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1316,6 +1473,117 @@ mod tests {
         assert_eq!(a[1].1, b[1].1, "whitespace + block comments are ignored");
         let c = normalized_lines("// only a comment\n# hash comment\n}\n);\n");
         assert!(c.is_empty(), "comments and brace runs are dropped: {c:?}");
+    }
+
+    // ---------------- comment hygiene (UD-CODE-006d, advisory) ----------------
+
+    #[test]
+    fn a_new_narration_block_is_advisory() {
+        let tmp = TempDir::new().unwrap();
+        let before = baseline(tmp.path());
+        let narration = (1..=10)
+            .map(|n| format!("// repair history line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            tmp.path(),
+            "src/repair.rs",
+            &format!("{narration}\npub fn repair() {{}}\npub fn verify() {{}}\n"),
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        let comments: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == RULE_COMMENT_HYGIENE)
+            .collect();
+        assert_eq!(comments.len(), 1, "{findings:?}");
+        assert!(!comments[0].blocking);
+        assert!(comments[0].message.contains("why/invariants"));
+    }
+
+    #[test]
+    fn comment_hygiene_never_requires_comments() {
+        let tmp = TempDir::new().unwrap();
+        let before = baseline(tmp.path());
+        write(
+            tmp.path(),
+            "src/clear.rs",
+            "pub fn clear() {}\npub fn concise() {}\n",
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE),
+            "comment-free code is valid: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn docs_and_license_headers_are_exempt_from_comment_hygiene() {
+        let tmp = TempDir::new().unwrap();
+        let before = baseline(tmp.path());
+        let docs = (1..=14)
+            .map(|n| format!("/// Public API detail {n}."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            tmp.path(),
+            "src/api.rs",
+            &format!(
+                "// SPDX-License-Identifier: MIT\n// Copyright 2026 Example\n{docs}\npub fn api() {{}}\n"
+            ),
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE),
+            "API docs and license headers are not narration: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_block_comments_are_governed_but_doc_blocks_are_exempt() {
+        let tmp = TempDir::new().unwrap();
+        let before = baseline(tmp.path());
+        write(
+            tmp.path(),
+            "src/repair.js",
+            "/*\n * repair one\n * repair two\n * repair three\n * repair four\n * repair five\n * repair six\n * repair seven\n */\nfunction repair() {}\n",
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE));
+
+        let clean = TempDir::new().unwrap();
+        let clean_before = baseline(clean.path());
+        write(
+            clean.path(),
+            "src/api.js",
+            "/**\n * Public API documentation.\n * Parameters and return value.\n * More public contract details.\n * More public contract details.\n * More public contract details.\n * More public contract details.\n * More public contract details.\n */\nexport function api() {}\n",
+        );
+        let findings = arch_fitness_findings_since(clean.path(), "demo", &clean_before);
+        assert!(!findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE));
+    }
+
+    #[test]
+    fn pre_existing_comment_debt_is_not_reflagged() {
+        let tmp = TempDir::new().unwrap();
+        let narration = (1..=10)
+            .map(|n| format!("// legacy explanation {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write(
+            tmp.path(),
+            "src/legacy.rs",
+            &format!("{narration}\npub fn before() {{}}\n"),
+        );
+        let before = baseline(tmp.path());
+        write(
+            tmp.path(),
+            "src/legacy.rs",
+            &format!("{narration}\npub fn before() {{}}\npub fn after() {{}}\n"),
+        );
+        let findings = arch_fitness_findings_since(tmp.path(), "demo", &before);
+        assert!(
+            !findings.iter().any(|f| f.rule_id == RULE_COMMENT_HYGIENE),
+            "unchanged legacy comment debt is not this step's regression: {findings:?}"
+        );
     }
 
     // ---------------- fail-open ----------------

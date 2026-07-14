@@ -1263,7 +1263,8 @@ fn confirm(prompt: &str) -> bool {
 /// - **package-managed** (under `node_modules`): the JS shim (`npm/umadev/bin/cli.js`)
 ///   normally intercepts `update` and never launches this binary — it upgrades with
 ///   the manager that OWNS the install (npm / pnpm / yarn / bun). Reaching here means
-///   someone ran the raw binary directly, so re-install via npm as before.
+///   someone ran the raw binary directly. It must stop and hand control back to
+///   the shim; otherwise Windows locks the very executable the manager replaces.
 /// - **dev build** (inside a cargo `target/` dir): print guidance; never overwrite a
 ///   build output.
 /// - **standalone** (`cargo install`, a downloaded release asset, a manual copy):
@@ -1288,24 +1289,11 @@ async fn cmd_update(yes: bool, force: bool) -> Result<()> {
             Ok(())
         }
         self_update::InstallKind::PackageManaged => {
-            if !yes && !confirm("Upgrade now via `npm install -g umadev@latest`?") {
-                println!("Aborted.");
-                return Ok(());
-            }
-            match umadev_host::std_command("npm")
-                .args(["install", "-g", "umadev@latest"])
-                .status()
-            {
-                Ok(s) if s.success() => {
-                    println!("[ok] UmaDev upgraded. Run `umadev --version` to confirm.");
-                    warn_if_umadev_shadowed_on_path();
-                    Ok(())
-                }
-                Ok(s) => anyhow::bail!("npm exited with status {s}"),
-                Err(e) => anyhow::bail!(
-                    "could not run npm ({e}); run `npm install -g umadev@latest` yourself"
-                ),
-            }
+            anyhow::bail!(
+                "this is the package's raw platform binary; it cannot update while it is \
+                 running. Invoke `umadev update` through the npm/pnpm/yarn/bun launcher \
+                 instead, or exit this process and run `npm install -g umadev@latest --force`"
+            )
         }
         self_update::InstallKind::Standalone => {
             self_update::run(&exe, yes, force, confirm).await?;

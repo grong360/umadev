@@ -54,10 +54,24 @@ jobs:
       - name: cargo test (doctests)
         run: cargo test --workspace --doc --no-fail-fast
 
+  npm-shim:
+    name: npm distribution smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Verify launcher, updater, and split-version repair
+        run: ./npm/scripts/smoke.sh
+
   build-release:
     name: build release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: [fmt, clippy, test]
+    needs: [fmt, clippy, test, npm-shim]
     strategy:
       fail-fast: false
       matrix:

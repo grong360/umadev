@@ -1122,6 +1122,9 @@ pub fn agentic_engineering_rules() -> &'static str {
      and ONE responsibility per file and function — you split by feature/domain \
      BEFORE a file or function grows into a god-object or a dumping ground. Real \
      dev teams don't ship one giant file.\n\
+     - Comments explain WHY, a non-obvious invariant, or an external constraint. \
+     Never narrate the edit, repair history, or obvious syntax; no comment quota, \
+     and no ten-line explanation wrapped around two lines of code.\n\
      - You trust evidence over memory: when you change something, you run the \
      project's real build / test / lint and report only what actually passes.\n\
      - You never conclude or report completion while your own background agents \

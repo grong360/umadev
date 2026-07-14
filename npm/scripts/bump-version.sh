@@ -10,8 +10,23 @@ set -euo pipefail
 NEW="$1"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 perl -i -pe "s/^version = \"\d+\.\d+\.\d+\"/version = \"$NEW\"/" "$ROOT/Cargo.toml"
-find "$ROOT/npm" -name package.json -not -path '*/node_modules/*' \
-  -exec perl -i -pe "s/\"\d+\.\d+\.\d+\"/\"$NEW\"/g" {} +
-( cd "$ROOT" && cargo check -p umadev-spec >/dev/null 2>&1 || true )
+node - "$ROOT/npm" "$NEW" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const [root, next] = process.argv.slice(2);
+for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+  const file = path.join(root, entry.name, 'package.json');
+  if (!entry.isDirectory() || !fs.existsSync(file)) continue;
+  const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+  pkg.version = next;
+  if (pkg.name === 'umadev') {
+    for (const name of Object.keys(pkg.optionalDependencies || {})) {
+      if (name.startsWith('@umacloud/')) pkg.optionalDependencies[name] = next;
+    }
+  }
+  fs.writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`);
+}
+NODE
+( cd "$ROOT" && cargo check -p umadev-spec >/dev/null )
 echo "version -> $NEW  (Cargo.toml + npm/*/package.json + Cargo.lock)"
 echo "then: git commit -am \"release: $NEW\" && git tag \"v$NEW\" && git push origin HEAD:main && git push origin \"v$NEW\""

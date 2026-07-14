@@ -233,7 +233,7 @@ genuinely-passing, un-gamed suite is unaffected.
 
 ### 3.6 Architecture-fitness floor (`UD-CODE-006`)
 
-> Level: **MUST** (sub-rule `UD-CODE-006c` is advisory)
+> Level: **MUST** (sub-rules `UD-CODE-006c/d` are advisory)
 
 The injected firmware *preaches* layering, small focused modules, and no
 copy-paste — but a prompt is not a floor. A borrowed brain under pressure
@@ -241,7 +241,7 @@ ships one giant file, imports the database from the UI, and pastes the same
 block into three places while every other deterministic check (build/test,
 coverage, contract, test-integrity) still reads green. A conformant host
 **MUST** verify architecture fitness on its own deterministic floor, with
-three sub-rules:
+four sub-rules:
 
 1. **God-file gate** (`UD-CODE-006a`, blocking) — a **NEW** source file over
    500 lines, or a touched file that **grew past** 800 lines during the
@@ -266,6 +266,15 @@ three sub-rules:
    the sibling location ("reuse it instead"). Deduplication judgment stays
    with the critics and the user; the host **MUST NOT** block on this
    sub-rule alone — the floor only surfaces the evidence.
+4. **Comment hygiene** (`UD-CODE-006d`, advisory) — the host **SHOULD** flag
+   a touched source file when it newly gains an ordinary comment-only block
+   of at least 8 consecutive lines, or at least 12 ordinary comment-only
+   lines that outnumber its code lines. This rule **MUST NOT** require a
+   comment quota and **MUST NOT** count API/documentation comments, license
+   headers, generated files, vendored files, or tests. The finding should ask
+   for comments that explain *why* or an invariant; change history, repair
+   narration, and review discussion belong in the change report. This
+   sub-rule is advisory and **MUST NOT** block delivery by itself.
 
 Blocking findings are part of the **deterministic floor** (not an advisory
 critic): each is folded into the step's acceptance as a typed, file-naming
@@ -275,7 +284,7 @@ existing fix-round / stall counters — never an open-ended loop. The gate is
 with no layering declaration, an empty or unresolvable import-edge set, an
 unreadable tree, and an oversized repository (a blown scan budget) all
 degrade to a silent skip — the gate never fabricates a block and never
-errors. The sub-rule identifiers `UD-CODE-006a/b/c` label individual
+errors. The sub-rule identifiers `UD-CODE-006a/b/c/d` label individual
 findings; the clause carried in the machine-readable `CLAUSES` data is the
 parent `UD-CODE-006`. (The `-005` slot in this family remains reserved for
 the §10 accessibility candidate.)

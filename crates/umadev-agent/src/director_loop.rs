@@ -2547,8 +2547,8 @@ async fn drive_build_step(
         // import edge violating the architecture doc's declared layering
         // (UD-CODE-006b) are BLOCKING — folded into the verdict so the SAME
         // bounded re-drive that handles any failing acceptance fixes the cause
-        // (split the file / invert the dependency). A duplicated added block
-        // (UD-CODE-006c) is ADVISORY only — the floor has no advisory channel,
+        // (split the file / invert the dependency). Duplicated added code
+        // (UD-CODE-006c) and comment narration (UD-CODE-006d) are ADVISORY — the floor has no advisory channel,
         // so it surfaces as a Note and never touches the verdict. Deterministic
         // + fail-open (no arch doc / huge repo / unreadable tree → no findings);
         // bounded by the same `max_fix_rounds` as every other step finding.

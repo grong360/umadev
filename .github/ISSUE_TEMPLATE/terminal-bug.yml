@@ -1,0 +1,80 @@
+name: Terminal rendering or interaction bug
+description: Report rendering, IME, keyboard, paste, resize, mouse, or teardown problems
+title: "[terminal] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not include tokens, private prompts, or proprietary source. A short recording with a throwaway conversation is ideal.
+  - type: input
+    id: version
+    attributes:
+      label: UmaDev version
+      description: Paste the complete output of `umadev --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux
+        - WSL
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal and version
+      description: For example Windows Terminal 1.x, Terminal.app, iTerm2, VS Code integrated terminal, kitty, Ghostty, or Konsole.
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell, locale, and multiplexer
+      description: For example PowerShell 7 + zh-CN, zsh + zh_CN.UTF-8, Git Bash, tmux, or SSH.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - npm global
+        - pnpm global
+        - yarn global
+        - bun global
+        - cargo install
+        - GitHub release binary
+        - Source build
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Include the exact keys/actions, window resize or focus steps, and whether Chinese/Japanese/Korean IME was active.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: paths
+    attributes:
+      label: Launcher paths (update/version problems only)
+      description: On Windows paste `where umadev`; on macOS/Linux paste `which -a umadev`. Remove usernames from paths if desired.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshot, recording, or terminal output
+      description: Use a throwaway conversation and redact private paths or content.

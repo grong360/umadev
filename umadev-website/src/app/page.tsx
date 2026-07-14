@@ -1276,10 +1276,11 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
           <section className={styles.logPage}>
             <PageHero title={t.logPage.title} sub={t.logPage.sub} />
             <ol className={styles.releaseTimeline}>
-              {releases[lang].map((release) => (
+              {releases[lang].map((release, index) => (
                 <ReleaseEntry
                   key={release.ver}
                   release={release}
+                  isCurrent={index === 0}
                   latestLabel={t.logPage.current}
                   moreLabel={t.logPage.more}
                   lessLabel={t.logPage.less}
@@ -1454,7 +1455,7 @@ function tagClass(tag: string) {
   return `${styles.releaseTag} ${map[tag] ?? styles.tagImproved}`;
 }
 
-/** One changelog release. `current` marks the latest, highlighted entry. */
+/** One changelog release. Array order determines the latest highlighted entry. */
 type Release = {
   ver: string;
   date: string;
@@ -1473,17 +1474,18 @@ const RELEASE_COLLAPSE_AT = 6;
  *  entries collapse behind a "show more" toggle so the page stays scannable. */
 function ReleaseEntry({
   release,
+  isCurrent,
   latestLabel,
   moreLabel,
   lessLabel,
 }: {
   release: Release;
+  isCurrent: boolean;
   latestLabel: string;
   moreLabel: string;
   lessLabel: string;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const isCurrent = release.current === true;
   const collapsible = release.changes.length > RELEASE_COLLAPSE_AT;
   const shown = !collapsible || expanded ? release.changes : release.changes.slice(0, RELEASE_PEEK);
   const hiddenCount = release.changes.length - shown.length;

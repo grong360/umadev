@@ -237,6 +237,11 @@ pub(crate) struct CompactionJob {
 pub enum Action {
     /// Nothing — keep looping.
     None,
+    /// `Ctrl+V` — ask the event loop to read an image directly from the local
+    /// OS clipboard. The blocking platform command never runs in `App` or on
+    /// the render thread; its result comes back through the existing image-chip
+    /// attachment path.
+    PasteImage,
     /// Tear down and exit.
     Quit,
     /// Approve the named gate and drive the next block.
@@ -3346,6 +3351,13 @@ impl App {
     /// alternate screen — this is the surface the user actually reads.
     pub fn push_workspace_notice(&mut self, note: impl Into<String>) {
         self.push(ChatRole::System, note);
+    }
+
+    /// Surface one localized clipboard-image result in the transcript. Kept as
+    /// a narrow crate-visible door so the event loop does not need access to the
+    /// general private `push` primitive.
+    pub(crate) fn push_clipboard_image_notice(&mut self, key: &str, args: &[&str]) {
+        self.push(ChatRole::System, umadev_i18n::tf(self.lang, key, args));
     }
 
     fn push(&mut self, role: ChatRole, body: impl Into<String>) {
@@ -8026,6 +8038,13 @@ impl App {
                 self.insert_at_cursor('\n');
                 Action::None
             }
+
+            // Ctrl+V is the explicit image-clipboard action. A PTY cannot emit
+            // an image as bracketed paste, so the event loop asks the LOCAL OS
+            // clipboard on the blocking pool. Ordinary text paste remains an
+            // `Event::Paste` handled by `handle_paste` and never touches this
+            // arm — zero new work on the overwhelmingly common path.
+            KeyCode::Char('v') if ctrl && !alt => Action::PasteImage,
 
             // ---- enter: accept the highlighted @-mention (popover open) ----
             // Wins over submit so Enter on the file typeahead inserts the path
@@ -16269,7 +16288,7 @@ mod tests {
         // an escape, the quotes eaten, or a byte-sliced CJK segment. It arrives as one
         // bracketed-paste burst (see EnableBracketedPaste), so it lands here whole.
         let mut a = fresh_app(Some("offline"));
-        let dropped = "\"D:\\00agent项目\\绩效智能体\\FLX绩效智能体\\CLAUDE.md\"";
+        let dropped = "\"D:\\我的 项目\\需求文档\\说明.md\"";
         a.handle_paste(dropped);
         assert_eq!(
             a.input, dropped,
@@ -21514,6 +21533,27 @@ mod tests {
             "Ctrl+J inserts a literal newline"
         );
         assert!(a.input_cursor >= 6, "cursor advances past the newline");
+    }
+
+    #[test]
+    fn ctrl_v_requests_image_capture_without_touching_the_text_paste_path() {
+        let mut app = fresh_app(Some("claude-code"));
+        app.input = "draft ".into();
+        app.input_cursor = app.input_len();
+        let before = app.input.clone();
+
+        let action =
+            app.apply_key_with_mods(KeyCode::Char('v'), crossterm::event::KeyModifiers::CONTROL);
+
+        assert_eq!(action, Action::PasteImage);
+        assert_eq!(app.input, before, "the blocking worker owns image capture");
+        assert!(app.attachments.is_empty());
+
+        // Ordinary terminal text paste remains the direct, synchronous old path:
+        // no image Action and no platform probe is involved.
+        app.handle_paste("plain clipboard text");
+        assert_eq!(app.input, "draft plain clipboard text");
+        assert!(app.attachments.is_empty());
     }
 
     #[test]

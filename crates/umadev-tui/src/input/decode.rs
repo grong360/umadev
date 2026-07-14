@@ -181,6 +181,10 @@ fn decode_sequence(bytes: &[u8]) -> Vec<InputEvent> {
     match bytes[1] {
         b'[' => decode_csi(bytes),
         b'O' => decode_ss3(bytes),
+        // String-protocol replies are terminal metadata, never Alt-key input.
+        // Keeping them as Response lets the single owned reader consume a
+        // capability query without racing stdin or leaking bytes into the app.
+        b']' | b'P' | b'_' => vec![InputEvent::Response(bytes.to_vec())],
         ESC => vec![InputEvent::Key(key(KeyCode::Esc, KeyModifiers::NONE))],
         _ => decode_meta(&bytes[1..]),
     }
@@ -603,6 +607,20 @@ mod tests {
         match seq(b"\x1b[?62;1c").as_slice() {
             [InputEvent::Response(_)] => {}
             other => panic!("expected a response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_protocol_replies_are_never_alt_keys() {
+        for bytes in [
+            b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\".as_slice(),
+            b"\x1bP1+r544e=787465726d\x1b\\".as_slice(),
+            b"\x1b_Gi=1;OK\x1b\\".as_slice(),
+        ] {
+            assert!(
+                matches!(seq(bytes).as_slice(), [InputEvent::Response(_)]),
+                "terminal metadata must stay out of the key stream: {bytes:?}"
+            );
         }
     }
 
