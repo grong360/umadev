@@ -6159,6 +6159,18 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         ("·".into(), theme::BORDER()),
         (mode_chip.into(), mode_color),
     ];
+    // The state hint sits HERE, ahead of the decorative chips, because chips drop
+    // from the RIGHT ([`meta_row_fit`]) and this is the one part the user cannot
+    // reconstruct from anything else on screen: it is what the app is doing right
+    // now ([wait] running / [gate] waiting / [aborted]). Appended last it was the
+    // FIRST casualty of a tight row — and since the row is budgeted by worst-case
+    // display width, a longer (e.g. English) hint string overflowed 120 columns
+    // and vanished, while a shorter (CJK) one fit. The model name and the gauges
+    // are the ones that can afford to go.
+    if let Some(hint) = hint {
+        parts.push(("·".into(), theme::BORDER()));
+        parts.push((hint, theme::TEXT_MUTED()));
+    }
     if let Some(model) = model_meta_text(app) {
         parts.push(("·".into(), theme::BORDER()));
         parts.push((model, theme::TEXT_MUTED()));
@@ -6191,9 +6203,9 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         parts.push(("·".into(), theme::BORDER()));
         parts.push((format!("[queued {queued}]"), theme::WARNING()));
     }
-    // Persistent token/cost gauge — the live consumption meter. Dropped FIRST on
-    // a narrow terminal (so the hint/status keep their room), and absent until
-    // there's real usage to show.
+    // Persistent token/cost gauge — the live consumption meter. Rightmost, so it
+    // is dropped FIRST on a narrow row (the hint above keeps its room), and absent
+    // until there's real usage to show.
     if area.width >= GAUGE_MIN_COLS {
         if let Some(gauge) = token_gauge_text(app) {
             parts.push(("·".into(), theme::BORDER()));
@@ -6215,10 +6227,6 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
             parts.push(("·".into(), theme::BORDER()));
             parts.push((gauge, color));
         }
-    }
-    if let Some(hint) = hint {
-        parts.push(("·".into(), theme::BORDER()));
-        parts.push((hint, theme::TEXT_MUTED()));
     }
     meta_row(frame, prompt_chunks[1], border_color, &parts, status);
 }
@@ -7935,18 +7943,33 @@ mod tests {
 
     #[test]
     fn input_title_shows_running_hint_when_pipeline_active() {
-        let mut app = app_with(Some("offline"));
-        app.apply_engine(umadev_agent::EngineEvent::PipelineStarted {
-            slug: "demo".into(),
-            requirement: "x".into(),
-        });
-        let out = render_to_string(&app);
-        // The running-state meta hint is localized; assert against its resolved
-        // value (which carries the language-neutral [wait] tag) so the check
-        // holds in any UI locale.
-        let running_hint = umadev_i18n::t(app.lang, "tui.hint.running");
-        assert!(out.contains("[wait]"), "running hint tag missing: {out}");
-        assert!(running_hint.contains("[wait]"));
+        // EVERY language, explicitly — never the ambient system locale. This test
+        // used to render in whatever language the developer's machine happened to
+        // be set to, so on a Chinese desktop it passed while the English row (whose
+        // hint string is far longer, and whose row is budgeted by WORST-CASE display
+        // width) silently overflowed 120 columns and dropped the hint entirely. It
+        // stayed green locally and red on CI for two days. A localized surface must
+        // be asserted in each locale it ships in.
+        for lang in umadev_i18n::Lang::ALL {
+            let mut app = app_with(Some("offline"));
+            app.lang = lang;
+            app.apply_engine(umadev_agent::EngineEvent::PipelineStarted {
+                slug: "demo".into(),
+                requirement: "x".into(),
+            });
+            let out = render_to_string(&app);
+            // The hint is localized; assert on the language-neutral [wait] tag it
+            // carries, so the check is about the chip SURVIVING the row budget.
+            let running_hint = umadev_i18n::t(lang, "tui.hint.running");
+            assert!(
+                running_hint.contains("[wait]"),
+                "{lang:?}: catalog lost the [wait] tag"
+            );
+            assert!(
+                out.contains("[wait]"),
+                "{lang:?}: the running hint was dropped from the meta row: {out}"
+            );
+        }
     }
 
     #[test]
