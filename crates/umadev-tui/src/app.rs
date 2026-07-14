@@ -16262,6 +16262,37 @@ mod tests {
     }
 
     #[test]
+    fn dragging_a_file_into_the_input_pastes_its_path_verbatim() {
+        // Dropping a file onto the terminal is a PASTE of its path — and on Windows
+        // that path is backslashed, quoted when it contains spaces, and very often
+        // full of CJK. Every one of those is a way to mangle it: a backslash read as
+        // an escape, the quotes eaten, or a byte-sliced CJK segment. It arrives as one
+        // bracketed-paste burst (see EnableBracketedPaste), so it lands here whole.
+        let mut a = fresh_app(Some("offline"));
+        let dropped = "\"D:\\00agent项目\\绩效智能体\\FLX绩效智能体\\CLAUDE.md\"";
+        a.handle_paste(dropped);
+        assert_eq!(
+            a.input, dropped,
+            "a dropped path must reach the input exactly as the terminal sent it"
+        );
+        // And it is ONE line, so it must stay in the input box rather than being
+        // stashed away behind a [pasted N lines] chip the user then cannot edit.
+        assert!(
+            a.text_stash.is_empty(),
+            "a single dropped path is not a bulk paste"
+        );
+
+        // The same path unquoted (no spaces to quote), dropped at the cursor inside
+        // text the user had already typed — the splice must stay on char boundaries.
+        let mut b = fresh_app(Some("offline"));
+        for c in "看看 ".chars() {
+            let _ = b.apply_key(KeyCode::Char(c));
+        }
+        b.handle_paste("D:\\项目\\readme.md");
+        assert_eq!(b.input, "看看 D:\\项目\\readme.md");
+    }
+
+    #[test]
     fn paste_preserves_tab_indentation() {
         // Low finding — the insert filter keeps `\n` but used to drop ALL other
         // control chars, silently stripping every `\t` out of pasted tab-indented
