@@ -1,8 +1,7 @@
 "use client";
 
 import Image from "next/image";
-import { useEffect, useRef, useState } from "react";
-import { TerminalDemo } from "./TerminalDemo";
+import React, { useEffect, useRef, useState } from "react";
 import { asset, docs, gallery, i18n, releases, type DocBlock, type Lang, type View } from "./content";
 import styles from "./page.module.css";
 
@@ -26,7 +25,7 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
   const handleMouseEnter = () => {
     let iteration = 0;
     if (intervalRef.current) clearInterval(intervalRef.current);
-    
+
     intervalRef.current = setInterval(() => {
       setDisplayText(
         text
@@ -38,7 +37,7 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
           })
           .join("")
       );
-      
+
       iteration += 1 / 2;
       if (iteration >= text.length) {
         setDisplayText(text);
@@ -46,12 +45,12 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
       }
     }, 25);
   };
-  
+
   const handleMouseLeave = () => {
     if (intervalRef.current) clearInterval(intervalRef.current);
     setDisplayText(text);
   };
-  
+
   useEffect(() => {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
@@ -59,9 +58,9 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
   }, []);
 
   return (
-    <span 
-      onMouseEnter={handleMouseEnter} 
-      onMouseLeave={handleMouseLeave} 
+    <span
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
       className={className}
       style={{ position: "relative", display: "inline-block" }}
     >
@@ -106,12 +105,12 @@ export function FloatingDiagnosticTerminal({
   const handleCommand = (cmdStr: string) => {
     const raw = cmdStr.trim();
     if (!raw) return;
-    
+
     setLogs((prev) => [...prev, `umadev_hud > ${raw}`]);
     const tokens = raw.split(/\s+/);
     const cmd = tokens[0].toLowerCase();
     const arg = tokens[1]?.toLowerCase();
-    
+
     setTimeout(() => {
       if (cmd === "/help" || cmd === "help") {
         setLogs((prev) => [
@@ -200,7 +199,7 @@ export function FloatingDiagnosticTerminal({
       } else if (cmd === "/governance" || cmd === "governance") {
         setLogs((prev) => [
           ...prev,
-          "Checking 112 governance rules...",
+          "Checking 113 governance rules...",
           "  [RULE_01] No raw unwraps - PASS",
           "  [RULE_02] Secure MCP transport - PASS",
           "  [RULE_03] No hardcoded styles - PASS",
@@ -229,7 +228,7 @@ export function FloatingDiagnosticTerminal({
         ]);
       }
     }, 100);
-    
+
     setInputValue("");
   };
 
@@ -280,21 +279,56 @@ export function FloatingDiagnosticTerminal({
     </>
   );
 }
-
-const partnerColors: Record<string, { glow: string; border: string }> = {
-  yoma: { glow: "rgba(1, 203, 241, 0.22)", border: "#01cbf1" },
-  yinghepai: { glow: "rgba(242, 234, 83, 0.18)", border: "#f2ea53" },
-  paopai: { glow: "rgba(189, 91, 255, 0.18)", border: "#bd5bff" },
-  clawtime: { glow: "rgba(255, 75, 75, 0.18)", border: "#ff4b4b" },
-  seeai: { glow: "rgba(50, 205, 50, 0.18)", border: "#32cd32" },
-  gopc: { glow: "rgba(0, 191, 255, 0.18)", border: "#00bfff" },
-  xinze: { glow: "rgba(255, 105, 180, 0.18)", border: "#ff69b4" },
-};
-
 export default function Home({ initialView }: { initialView?: View } = {}) {
   const [lang, setLang] = useState<Lang>("zh");
   const [view, setView] = useState<View>(initialView ?? "home");
   const [wechatOpen, setWechatOpen] = useState(false);
+  const [activeStageIdx, setActiveStageIdx] = useState(0);
+  const [autoplay, setAutoplay] = useState(true);
+
+  useEffect(() => {
+    if (!autoplay) return;
+    const interval = setInterval(() => {
+      setActiveStageIdx((prev) => (prev + 1) % 10);
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [autoplay]);
+
+  const handleTiltMove = (e: React.MouseEvent<HTMLElement>) => {
+    const c = e.currentTarget;
+    const r = c.getBoundingClientRect();
+    const px = (e.clientX - r.left) / r.width - 0.5;
+    const py = (e.clientY - r.top) / r.height - 0.5;
+    c.style.setProperty("--tilt-x", `${-py * 5}deg`);
+    c.style.setProperty("--tilt-y", `${px * 6}deg`);
+    c.style.setProperty("--spot-x", `${(px + 0.5) * 100}%`);
+    c.style.setProperty("--spot-y", `${(py + 0.5) * 100}%`);
+    c.style.transform = `perspective(700px) rotateX(${-py * 8}deg) rotateY(${px * 8}deg) translateZ(10px) translateY(-5px)`;
+    c.style.transition = "transform 0.1s cubic-bezier(0.25, 0.8, 0.25, 1)";
+  };
+  const handleTiltLeave = (e: React.MouseEvent<HTMLElement>) => {
+    const c = e.currentTarget;
+    c.style.setProperty("--tilt-x", "0deg");
+    c.style.setProperty("--tilt-y", "0deg");
+    c.style.setProperty("--spot-x", "50%");
+    c.style.setProperty("--spot-y", "50%");
+    c.style.transform = "perspective(700px) rotateX(0) rotateY(0) translateZ(0) translateY(0)";
+    c.style.transition = "transform 0.4s cubic-bezier(0.25, 0.8, 0.25, 1)";
+  };
+
+  const handleMagnetMove = (e: React.MouseEvent<HTMLElement>) => {
+    const btn = e.currentTarget;
+    const r = btn.getBoundingClientRect();
+    const mx = e.clientX - r.left - r.width / 2;
+    const my = e.clientY - r.top - r.height / 2;
+    btn.style.transform = `translate(${mx * 0.35}px, ${my * 0.4}px) scale(1.04)`;
+    btn.style.transition = "transform 0.1s cubic-bezier(.16,1,.3,1)";
+  };
+  const handleMagnetLeave = (e: React.MouseEvent<HTMLElement>) => {
+    const btn = e.currentTarget;
+    btn.style.transform = "translate(0,0) scale(1)";
+    btn.style.transition = "transform 0.4s cubic-bezier(.16,1,.3,1)";
+  };
 
   // Auto language detection based on browser locale
   useEffect(() => {
@@ -335,7 +369,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
       if (!initialView && currentView !== view) {
         setView(currentView);
       }
-      
+
       const handlePopState = () => {
         setView(pathToView(window.location.pathname));
       };
@@ -345,21 +379,129 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     /* eslint-enable react-hooks/set-state-in-effect */
   }, [initialView, view]);
 
-  const [stageIndex, setStageIndex] = useState(0);
-  const [mode, setMode] = useState("claude-code");
+  const scrollProgressRef = useRef<HTMLDivElement | null>(null);
   const [docId, setDocId] = useState("quickstart");
   const [lightbox, setLightbox] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
-  const [copiedMode, setCopiedMode] = useState<string | null>(null);
-  const [showcaseIndex, setShowcaseIndex] = useState(0);
-  const [heroSlideIndex, setHeroSlideIndex] = useState(0);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const modeCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const stageButtonRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  // Spotlight, tilt, magnetic, and scroll reveal animations from Umadevweb
+  useEffect(() => {
+    // 1. Magnetic Buttons
+    const magnets = document.querySelectorAll(`.${styles.umaMagnet}`);
+    const magnetCleanups: (() => void)[] = [];
+    magnets.forEach((node) => {
+      const btn = node as HTMLElement;
+      const handleMove = (e: MouseEvent) => {
+        const r = btn.getBoundingClientRect();
+        const mx = e.clientX - r.left - r.width / 2;
+        const my = e.clientY - r.top - r.height / 2;
+        btn.style.transform = `translate(${mx * 0.28}px, ${my * 0.32}px)`;
+      };
+      const handleLeave = () => {
+        btn.style.transform = "translate(0,0)";
+      };
+      btn.addEventListener("mousemove", handleMove);
+      btn.addEventListener("mouseleave", handleLeave);
+      btn.style.transition = "transform .18s cubic-bezier(.16,1,.3,1)";
+      magnetCleanups.push(() => {
+        btn.removeEventListener("mousemove", handleMove);
+        btn.removeEventListener("mouseleave", handleLeave);
+      });
+    });
+
+    // 2. Tilt Cards
+    const tilts = document.querySelectorAll(`.${styles.tilt}`);
+    const tiltCleanups: (() => void)[] = [];
+    tilts.forEach((node) => {
+      const c = node as HTMLElement;
+      const handleMove = (e: MouseEvent) => {
+        const r = c.getBoundingClientRect();
+        const px = (e.clientX - r.left) / r.width - 0.5;
+        const py = (e.clientY - r.top) / r.height - 0.5;
+        c.style.transform = `perspective(700px) rotateX(${-py * 7}deg) rotateY(${px * 7}deg) translateZ(6px)`;
+      };
+      const handleLeave = () => {
+        c.style.transform = "perspective(700px) rotateX(0) rotateY(0)";
+      };
+      c.addEventListener("mousemove", handleMove);
+      c.addEventListener("mouseleave", handleLeave);
+      c.style.transition = "transform .18s ease";
+      tiltCleanups.push(() => {
+        c.removeEventListener("mousemove", handleMove);
+        c.removeEventListener("mouseleave", handleLeave);
+      });
+    });
+
+    // 3. Scroll Reveal
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add(styles.in);
+            observer.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.12 }
+    );
+    const reveals = document.querySelectorAll(`.${styles.reveal}`);
+    reveals.forEach((r) => observer.observe(r));
+
+    // 4. Count up animation
+    const countObserver = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          const el = entry.target as HTMLElement;
+          const target = +(el.getAttribute("data-count") || "0");
+          let t0: number | null = null;
+          const step = (ts: number) => {
+            if (!t0) t0 = ts;
+            const progress = Math.min((ts - t0) / 1400, 1);
+            const eased = 1 - Math.pow(1 - progress, 3);
+            el.textContent = String(Math.round(target * eased));
+            if (progress < 1) requestAnimationFrame(step);
+          };
+          requestAnimationFrame(step);
+          countObserver.unobserve(el);
+        });
+      },
+      { threshold: 0.5 }
+    );
+    const counters = document.querySelectorAll(`[data-count]`);
+    counters.forEach((el) => countObserver.observe(el));
+
+    return () => {
+      magnetCleanups.forEach((c) => c());
+      tiltCleanups.forEach((c) => c());
+      observer.disconnect();
+      countObserver.disconnect();
+    };
+  }, [view]);
+
+  useEffect(() => {
+    let raf = 0;
+    const updateScrollProgress = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        const max = document.documentElement.scrollHeight - window.innerHeight;
+        const progress = max > 0 ? Math.min(window.scrollY / max, 1) : 0;
+        scrollProgressRef.current?.style.setProperty("--scroll-progress", String(progress));
+        raf = 0;
+      });
+    };
+    updateScrollProgress();
+    window.addEventListener("scroll", updateScrollProgress, { passive: true });
+    window.addEventListener("resize", updateScrollProgress);
+    return () => {
+      window.removeEventListener("scroll", updateScrollProgress);
+      window.removeEventListener("resize", updateScrollProgress);
+      cancelAnimationFrame(raf);
+    };
+  }, [view]);
 
   const t = i18n[lang];
-  const activeStage = t.stages[stageIndex] ?? t.stages[0];
-  const activeTab = t.modes.tabs.find((tab) => tab.id === mode) ?? t.modes.tabs[0];
   const docCats = docs[lang] as readonly DocCategory[];
   const activeDoc =
     docCats.flatMap((cat) => cat.items).find((item) => item.id === docId) ??
@@ -442,184 +584,6 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     };
   }, [lightbox]);
 
-  const heroSlides =
-    lang === "zh"
-      ? [
-          {
-            key: "team",
-            overline: "一句需求，交给一支团队",
-            lines: [
-              { text: "一句需求", accent: false },
-              { text: "一支开发团队", accent: true },
-              { text: "交付商业级应用", accent: false },
-            ],
-            sub: t.hero.sub,
-            visual: "/assets/1_v2.png",
-            hud: ["专家角色 / 8", "质量门槛 / 90+", "共用底座 / 1"],
-            ticker: ["seat: architect → openapi.json", "seat: frontend → src/", "release/proof-pack.zip"],
-          },
-          {
-            key: "workflow",
-            overline: "团队跑完整条交付",
-            lines: [
-              { text: "从需求到上线", accent: false },
-              { text: "一条交付闭环", accent: true },
-              { text: "每步留证据", accent: false },
-            ],
-            sub: "需求拆清、契约对齐、设计立稳、真建真测、安全审查、打包交付——每个角色交付真实产物，每一步都有状态和可追溯证据。",
-            visual: "/assets/2_v2.png",
-            hud: ["交付闭环 / 10步", "确认门 / 2", "交付证据 / 开启"],
-            ticker: ["phase: docs_confirm", "output/prd.md + architecture.md", ".umadev/audit/session.jsonl"],
-          },
-          {
-            key: "runtime",
-            overline: "团队共用你已登录的大脑",
-            lines: [
-              { text: "全队共用一个", accent: false },
-              { text: "已登录的底座", accent: true },
-              { text: "无需多买 API", accent: false },
-            ],
-            sub: "八个角色共用同一个已登录的底座大脑做思考与写码——无需多买一份 API。UmaDev 负责分工、治理、质量门和证据链。",
-            visual: "/assets/3_v2.png",
-            hud: ["CLAUDE CODE", "CODEX CLI", "OPENCODE"],
-            ticker: ["driver: codex exec", "sandbox: workspace-write", "secrets: local only"],
-          },
-        ]
-      : [
-          {
-            key: "team",
-            overline: "One idea, handed to a team",
-            lines: [
-              { text: "One coding agent", accent: false },
-              { text: "a whole dev team", accent: true },
-              { text: "ships products", accent: false },
-            ],
-            sub: t.hero.sub,
-            visual: "/assets/1_v2.png",
-            hud: ["SPECIALISTS / 8", "QUALITY_GATE / 90+", "SHARED BASE / 1"],
-            ticker: ["seat: architect → openapi.json", "seat: frontend → src/", "release/proof-pack.zip"],
-          },
-          {
-            key: "workflow",
-            overline: "The team runs the whole delivery",
-            lines: [
-              { text: "Idea to launch", accent: false },
-              { text: "one delivery loop", accent: true },
-              { text: "proof every step", accent: false },
-            ],
-            sub: "Clarify the need, align the contract, lock the design system, build it, test it, audit it, package it — each role ships a real artifact, every step leaves status and traceable proof.",
-            visual: "/assets/2_v2.png",
-            hud: ["DELIVERY / 10 STEPS", "GATES / 2", "PROOF / ON"],
-            ticker: ["phase: docs_confirm", "output/prd.md + architecture.md", ".umadev/audit/session.jsonl"],
-          },
-          {
-            key: "runtime",
-            overline: "The team shares your logged-in brain",
-            lines: [
-              { text: "No extra API", accent: false },
-              { text: "one shared base", accent: true },
-              { text: "you already use", accent: false },
-            ],
-            sub: "All eight roles share the one base brain you already logged into to think and write code — no extra API to buy. UmaDev owns the division of labor, governance, gates and proof.",
-            visual: "/assets/3_v2.png",
-            hud: ["CLAUDE CODE", "CODEX CLI", "OPENCODE"],
-            ticker: ["driver: codex exec", "sandbox: workspace-write", "secrets: local only"],
-          },
-        ];
-  const activeHeroSlide = heroSlides[heroSlideIndex] ?? heroSlides[0];
-  const heroTitle = activeHeroSlide.lines.map((line) => line.text).join(" ");
-  const titleLines = activeHeroSlide.lines;
-  const heroSlideLabels =
-    lang === "zh" ? ["团队", "交付", "底座"] : ["Team", "Delivery", "Runtime"];
-  const showcaseItems =
-    lang === "zh"
-      ? [
-          {
-            key: "clarify",
-            tab: "需求澄清",
-            kicker: "01 / CLARIFY",
-            title: "先问清楚，再让 AI 动手",
-            body: "把一句模糊需求拆成目标、边界、角色、验收标准和风险点。需要确认的地方停下来，不需要确认的地方自动推进。",
-            image: "/assets/umadev/ip/uma-ip-41.png",
-            command: "umadev new booking --mode auto",
-            status: "waiting_for_requirements",
-            bullets: ["目标 / 范围 / 验收标准", "缺失信息追问", "确认门或自动跳过"],
-            files: ["output/<slug>-clarify.md", "output/<slug>-clarify-answers.md"],
-          },
-          {
-            key: "docs",
-            tab: "文档生成",
-            kicker: "02 / SPEC",
-            title: "PRD、架构、UI/UX 一次成套",
-            body: "把调研结论转成真实项目文件：产品说明、技术架构、界面方案、任务拆解和契约草案，后续编码全部回链这些产物。",
-            image: "/assets/umadev/ip/uma-ip-34.png",
-            command: "umadev continue --phase docs",
-            status: "writing_prd_architecture_uiux",
-            bullets: ["PRD 与验收标准", "架构与接口边界", "UI/UX 页面与组件逻辑"],
-            files: ["output/<slug>-prd.md", "output/<slug>-architecture.md", "output/<slug>-uiux.md"],
-          },
-          {
-            key: "quality",
-            tab: "质量门",
-            kicker: "03 / QUALITY",
-            title: "不是写完就交，是过门后交付",
-            body: "构建、lint、契约、安全、设计规范、证据链一起检查。默认 90 分通过，失败时回到对应阶段修复。",
-            image: "/assets/umadev/ip/uma-ip-36.png",
-            command: "umadev gate --threshold 90",
-            status: "quality_gate: 94 / 100",
-            bullets: ["构建 / 测试 / lint", "契约和安全规则", "proof pack 与成绩单"],
-            files: ["output/<slug>-quality-gate.md", "release/proof-pack-*.zip", "release/scorecard-*.html"],
-          },
-        ]
-      : [
-          {
-            key: "clarify",
-            tab: "Clarify",
-            kicker: "01 / CLARIFY",
-            title: "Clarify first, then let AI act",
-            body: "Turn a vague request into goals, boundaries, roles, acceptance criteria and risks. Pause where confirmation is needed, continue where it is not.",
-            image: "/assets/umadev/ip/uma-ip-41.png",
-            command: "umadev new booking --mode auto",
-            status: "waiting_for_requirements",
-            bullets: ["Goals / scope / acceptance", "Missing-info questions", "Gate or auto-continue"],
-            files: ["output/<slug>-clarify.md", "output/<slug>-clarify-answers.md"],
-          },
-          {
-            key: "docs",
-            tab: "Docs",
-            kicker: "02 / SPEC",
-            title: "PRD, architecture and UI/UX as real files",
-            body: "Research becomes project artifacts: product spec, technical architecture, interface plan, task breakdown and contract drafts.",
-            image: "/assets/umadev/ip/uma-ip-34.png",
-            command: "umadev continue --phase docs",
-            status: "writing_prd_architecture_uiux",
-            bullets: ["PRD and acceptance", "Architecture and contracts", "UI/UX page logic"],
-            files: ["output/<slug>-prd.md", "output/<slug>-architecture.md", "output/<slug>-uiux.md"],
-          },
-          {
-            key: "quality",
-            tab: "Quality",
-            kicker: "03 / QUALITY",
-            title: "Ship after the gate, not after the chat",
-            body: "Build, lint, contracts, security, design rules and proof chain are checked together. Default pass line is 90.",
-            image: "/assets/umadev/ip/uma-ip-36.png",
-            command: "umadev gate --threshold 90",
-            status: "quality_gate: 94 / 100",
-            bullets: ["Build / test / lint", "Contracts and security", "Proof pack and scorecard"],
-            files: ["output/<slug>-quality-gate.md", "release/proof-pack-*.zip", "release/scorecard-*.html"],
-          },
-        ];
-  const showcase = showcaseItems[showcaseIndex] ?? showcaseItems[0];
-  const stageProgress = `${Math.round(((stageIndex + 1) / t.stages.length) * 100)}%`;
-
-  useEffect(() => {
-    if (view !== "home") return;
-    const timer = window.setInterval(() => {
-      setHeroSlideIndex((index) => (index + 1) % heroSlides.length);
-    }, 6500);
-    return () => window.clearInterval(timer);
-  }, [heroSlides.length, view]);
-
   function go(nextView: View) {
     setView(nextView);
     if (typeof window !== "undefined") {
@@ -639,67 +603,43 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
   }
 
-  function copyModeCommand(command: string, key: string) {
-    navigator.clipboard?.writeText(command).catch(() => undefined);
-    setCopiedMode(key);
-    if (modeCopyTimerRef.current) clearTimeout(modeCopyTimerRef.current);
-    modeCopyTimerRef.current = setTimeout(() => setCopiedMode(null), 1500);
-  }
-
-  function pickStage(index: number) {
-    setStageIndex(index);
-    stageButtonRefs.current[index]?.scrollIntoView({
-      behavior: "smooth",
-      block: "nearest",
-      inline: "center",
-    });
-  }
-
   return (
     <div className={styles.shell}>
-
+      <div className={styles.scrollProgress} ref={scrollProgressRef} aria-hidden="true"><i /></div>
       <div className={styles.gridBg} aria-hidden="true" />
       <div className={styles.topGlow} aria-hidden="true" />
       <div className={styles.pointerGlow} aria-hidden="true" />
       <div className={styles.scanlines} aria-hidden="true" />
       <div className={styles.noise} aria-hidden="true" />
 
-      <nav className={styles.nav}>
-        <button className={styles.brand} type="button" onClick={() => go("home")}>
+      <nav className={styles.spaceNav}>
+        <button className={styles.spaceNavBrand} type="button" onClick={() => go("home")}>
           <Image
-            className={styles.logo}
-            src={asset("/assets/umadev-icon.png")}
-            alt={lang === "zh" ? "UmaDev 图标" : "UmaDev logo"}
-            width={42}
-            height={42}
+            alt="UmaDev"
+            className={styles.spaceNavBrandLogo}
+            height={36}
             priority
+            src={asset("/assets/umadev-icon.png")}
+            width={36}
           />
-          <span>UmaDev</span>
+          <span className={styles.spaceNavBrandText}>UmaDev</span>
         </button>
 
-        <div className={styles.navLinks}>
-          <button className={navClass(view === "home")} type="button" onClick={() => go("home")}>
-            <ScrambledHoverText text={t.nav.product} />
+        <div className={styles.spaceNavLinks}>
+          <button className={view === "home" ? styles.spaceNavLinkActive : styles.spaceNavLink} type="button" onClick={() => go("home")}>
+            {t.nav.product}
           </button>
-          <button className={navClass(view === "docs")} type="button" onClick={() => go("docs")}>
-            <ScrambledHoverText text={t.nav.docs} />
+          <button className={view === "docs" ? styles.spaceNavLinkActive : styles.spaceNavLink} type="button" onClick={() => go("docs")}>
+            {t.nav.docs}
           </button>
-          <button className={navClass(view === "gallery")} type="button" onClick={() => go("gallery")}>
-            <ScrambledHoverText text={t.nav.gallery} />
+          <button className={view === "gallery" ? styles.spaceNavLinkActive : styles.spaceNavLink} type="button" onClick={() => go("gallery")}>
+            {t.nav.gallery}
           </button>
-          <button
-            className={navClass(view === "contributors")}
-            type="button"
-            onClick={() => go("contributors")}
-          >
-            <ScrambledHoverText text={t.nav.contributors} />
+          <button className={view === "contributors" ? styles.spaceNavLinkActive : styles.spaceNavLink} type="button" onClick={() => go("contributors")}>
+            {t.nav.contributors}
           </button>
-          <button
-            className={navClass(view === "changelog")}
-            type="button"
-            onClick={() => go("changelog")}
-          >
-            <ScrambledHoverText text={t.nav.changelog} />
+          <button className={view === "changelog" ? styles.spaceNavLinkActive : styles.spaceNavLink} type="button" onClick={() => go("changelog")}>
+            {t.nav.changelog}
           </button>
         </div>
 
@@ -720,16 +660,23 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
               EN
             </button>
           </div>
-          <a className={styles.githubButton} href={githubUrl} target="_blank" rel="noreferrer">
-            <GitHubIcon />
-            GitHub
+          <a className={`${styles.spaceNavCta} ${styles.spaceNavGithub} ${styles.umaMagnet}`} href={githubUrl} target="_blank" rel="noreferrer">
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M12 2.4a9.8 9.8 0 0 0-3.1 19.1c.5.1.7-.2.7-.5v-1.9c-2.8.6-3.4-1.2-3.4-1.2-.5-1.2-1.1-1.5-1.1-1.5-.9-.6.1-.6.1-.6 1 0 1.6 1.1 1.6 1.1.9 1.6 2.4 1.1 2.9.8.1-.7.4-1.1.7-1.3-2.2-.3-4.6-1.1-4.6-4.9 0-1.1.4-2 1-2.7-.1-.3-.4-1.3.1-2.7 0 0 .8-.3 2.7 1a9.4 9.4 0 0 1 4.9 0c1.9-1.3 2.7-1 2.7-1 .5 1.4.2 2.4.1 2.7.6.7 1 1.6 1 2.7 0 3.8-2.3 4.6-4.6 4.9.4.3.7.9.7 1.8V21c0 .3.2.6.7.5A9.8 9.8 0 0 0 12 2.4Z" />
+            </svg>
+            <span>GitHub</span>
+            <i aria-hidden="true">↗</i>
           </a>
           <button
-            className={`${styles.githubButton} ${styles.wechatButton}`}
+            className={`${styles.spaceNavCta} ${styles.spaceNavWechat} ${styles.umaMagnet}`}
             type="button"
             onClick={() => setWechatOpen(true)}
           >
-            {lang === "zh" ? "微信群" : "WeChat"}
+            <svg aria-hidden="true" viewBox="0 0 24 24">
+              <path d="M9.3 4.2c-4 0-7.2 2.6-7.2 5.8 0 1.8 1 3.4 2.7 4.5l-.7 2.4 2.7-1.3c.8.2 1.6.3 2.5.3h.5a5.4 5.4 0 0 1-.2-1.5c0-3.5 3.3-6.3 7.4-6.3h.3c-1-2.3-4.1-3.9-8-3.9Zm-2.4 3a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8Zm4.8 0a.9.9 0 1 1 0 1.8.9.9 0 0 1 0-1.8Z" />
+              <path d="M17 9.5c-3.4 0-6.2 2.2-6.2 4.9s2.8 4.9 6.2 4.9c.7 0 1.4-.1 2.1-.3l2.3 1.1-.6-2a4.6 4.6 0 0 0 2.2-3.7c0-2.7-2.7-4.9-6-4.9Zm-2.1 2.6a.8.8 0 1 1 0 1.6.8.8 0 0 1 0-1.6Zm4.1 0a.8.8 0 1 1 0 1.6.8.8 0 0 1 0-1.6Z" />
+            </svg>
+            <span>{lang === "zh" ? "微信群" : "WeChat"}</span>
           </button>
         </div>
       </nav>
@@ -767,467 +714,493 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
       <main className={styles.main}>
         {view === "home" && (
           <>
-            <section className={styles.hero}>
-              <div className={styles.heroBackdrop} aria-hidden="true">
-                <Image
-                  src={asset("/assets/umadev/hero-agent-backdrop.png")}
-                  alt=""
-                  fill
-                  priority
-                  sizes="100vw"
-                />
-              </div>
-              <div className={styles.heroCopy}>
-                <span className={styles.heroOverline}>{activeHeroSlide.overline}</span>
-                <div className={styles.badge}>
-                  <span className={styles.pulseDot} />
-                  {t.hero.badge}
-                </div>
-                <div className={styles.heroHud}>
-                  {activeHeroSlide.hud.map((item) => (
-                    <span key={item}>{item}</span>
-                  ))}
-                </div>
-                <h1 className={styles.heroTitle} data-text={heroTitle}>
-                  {titleLines.map((line) => (
-                    <span
-                      className={line.accent ? styles.titleAccentLine : styles.titleLine}
-                      key={line.text}
-                    >
-                      {line.text}
+            {/* HERO SECTION */}
+            <section className={styles.spaceHero}>
+              <div className={styles.heroAtmosphere} aria-hidden="true" />
+              <div className={styles.heroStage}>
+                <div className={styles.heroCopy}>
+                  <div className={styles.heroMeta}>
+                    <span className={styles.heroMetaDot} />
+                    <span className={styles.heroMetaText}>
+                      {lang === "zh" ? "AI 开发团队协调器 · 本地运行" : "AI DEV TEAM ORCHESTRATOR · RUNS LOCAL"}
                     </span>
-                  ))}
-                </h1>
-                <p>{activeHeroSlide.sub}</p>
+                  </div>
 
-                <button className={styles.installCommand} type="button" onClick={copyInstall}>
-                  <span className={styles.promptMark}>$</span>
-                  <code>npm install -g umadev</code>
-                  <span className={styles.copyPill}>{copied ? t.hero.copied : t.hero.copy}</span>
-                </button>
+                  <h1 className={styles.heroWordmark}>
+                    Uma<span>Dev</span>
+                  </h1>
 
-                <div className={styles.heroActions}>
-                  <a href={githubUrl} target="_blank" rel="noreferrer">
-                    <ScrambledHoverText text={t.hero.cta1} />
-                    <span aria-hidden="true">→</span>
-                  </a>
-                  <button type="button" onClick={() => go("docs")}>
-                    <ScrambledHoverText text={t.hero.cta2} />
-                  </button>
-                </div>
-
-                <dl className={styles.stats}>
-                  {t.hero.stats.map(([value, label]) => (
-                    <div key={label}>
-                      <dt>{value}</dt>
-                      <dd>{label}</dd>
-                    </div>
-                  ))}
-                </dl>
-
-              </div>
-
-              <div className={styles.heroVisual}>
-                <div className={styles.productFrame}>
-                  <Image
-                    className={styles.productShot}
-                    src={asset(activeHeroSlide.visual)}
-                    alt=""
-                    width={832}
-                    height={520}
-                    priority
-                    aria-hidden="true"
-                  />
-                </div>
-                <Image
-                  className={styles.heroMark}
-                  src={asset("/assets/umadev/neon-logo-cut.png")}
-                  alt=""
-                  width={760}
-                  height={760}
-                  priority
-                  aria-hidden="true"
-                />
-                <div className={styles.codeTicker} aria-hidden="true">
-                  {activeHeroSlide.ticker.map((item) => (
-                    <span key={item}>{item}</span>
-                  ))}
-                </div>
-              </div>
-
-              <div className={styles.heroCarouselControls} aria-label="Hero carousel">
-                {heroSlides.map((slide, index) => (
-                  <button
-                    key={slide.key}
-                    type="button"
-                    aria-label={`Show ${slide.overline}`}
-                    data-state={index < heroSlideIndex ? "past" : index === heroSlideIndex ? "active" : "future"}
-                    onClick={() => setHeroSlideIndex(index)}
-                  >
-                    {index === heroSlideIndex && (
-                      <svg className={styles.carouselBtnBorder} aria-hidden="true">
-                        <rect
-                          x="1"
-                          y="1"
-                          rx="18"
-                          ry="18"
-                          style={{ width: "calc(100% - 2px)", height: "calc(100% - 2px)" }}
-                          pathLength="100"
-                        />
-                      </svg>
+                  <h2 className={styles.heroStatement}>
+                    {lang === "zh" ? (
+                      <>一句需求，<br /><span>交付一个真项目。</span></>
+                    ) : (
+                      <>One requirement.<br /><span>A real product shipped.</span></>
                     )}
-                    <span>{String(index + 1).padStart(2, "0")}</span>
-                    {heroSlideLabels[index]}
-                  </button>
-                ))}
-              </div>
-            </section>
+                  </h2>
 
-            {/* Cooperative Communities Section */}
-            <section className={styles.partnersSection}>
-              <div className={styles.partnersContainer}>
-                <span className={styles.partnersEyebrow}>{t.partners.eyebrow}</span>
-                <h2 className={styles.partnersTitle}>{t.partners.title}</h2>
-                <div className={styles.partnersGrid}>
-                  {t.partners.list.map((partner, idx) => {
-                    const colors = partnerColors[partner.logoName] || { glow: "rgba(255,255,255,0.08)", border: "rgba(255,255,255,0.2)" };
-                    return (
-                      <a
-                        key={idx}
-                        href={partner.url}
-                        target={partner.url === "#" ? undefined : "_blank"}
-                        rel={partner.url === "#" ? undefined : "noopener noreferrer"}
-                        className={styles.partnerCard}
-                        onClick={(e) => {
-                          if (partner.url === "#") {
-                            e.preventDefault();
-                          }
-                        }}
-                        style={{
-                          "--partner-glow": colors.glow,
-                          "--partner-border": colors.border,
-                        } as React.CSSProperties}
-                      >
-                        <div className={styles.partnerGlow} />
-                        <div className={styles.partnerLogoContainer}>
-                          <Image
-                            src={asset(`/assets/partners/${partner.logoName}.png?v=4`)}
-                            alt={partner.name}
-                            width={180}
-                            height={80}
-                            style={{ objectFit: "contain", width: "auto", height: "auto", maxWidth: "100%", maxHeight: "100%" }}
-                          />
-                        </div>
-                        <div className={styles.partnerTextContainer}>
-                          <span className={styles.partnerCardName}>{partner.name}</span>
-                          <span className={styles.partnerCardRole}>{partner.role}</span>
-                        </div>
-                      </a>
-                    );
-                  })}
-                </div>
-              </div>
-            </section>
+                  <p className={styles.heroDescription}>
+                    {lang === "zh"
+                      ? "像真实开发团队一样，依次完成调研、PRD、架构、UI/UX、前后端、质量门和交付证明；实际编码由你已经登录的本机底座完成。"
+                      : "Work like a real development team across research, PRD, architecture, UI/UX, frontend, backend, quality gates, and delivery proof — using the local CLI you are already signed into."}
+                  </p>
 
-            <section className={styles.premiumShowcase}>
-              <div className={styles.showcaseBrand}>
-                <Image
-                  src={asset("/assets/umadev-icon.png")}
-                  alt=""
-                  width={34}
-                  height={34}
-                  aria-hidden="true"
-                />
-                <span>UMADEV</span>
-              </div>
-              <div className={styles.showcaseMascot} aria-hidden="true">
-                <Image
-                  src={asset("/assets/mascot-thumb.png")}
-                  alt=""
-                  width={520}
-                  height={520}
-                />
-              </div>
-              <div className={styles.showcaseCopy}>
-                <div className={styles.showcaseTabs}>
-                  {showcaseItems.map((item, index) => (
-                    <button
-                      key={item.key}
-                      type="button"
-                      data-active={index === showcaseIndex ? "true" : undefined}
-                      onClick={() => setShowcaseIndex(index)}
-                    >
-                      <span>{String(index + 1).padStart(2, "0")}</span>
-                      <ScrambledHoverText text={item.tab} />
+                  <div className={styles.heroActionRow}>
+                    <button className={styles.heroInstall} type="button" onClick={copyInstall}>
+                      <span>$</span>
+                      <code>npm install -g umadev</code>
+                      <strong>{copied ? (lang === "zh" ? "已复制" : "COPIED") : (lang === "zh" ? "复制" : "COPY")}</strong>
                     </button>
-                  ))}
-                </div>
-                <p className={styles.showcaseKicker}>{showcase.kicker}</p>
-                <h2>{showcase.title}</h2>
-                <p>{showcase.body}</p>
-                <ul>
-                  {showcase.bullets.map((bullet) => (
-                    <li key={bullet}>{bullet}</li>
-                  ))}
-                </ul>
-                <div className={styles.showcaseTerminal}>
-                  <code>$ {showcase.command}</code>
-                  <span>{showcase.status}</span>
-                </div>
-              </div>
-              <div className={styles.showcaseScreen}>
-                <TerminalDemo key={showcaseIndex} slideIndex={showcaseIndex} lang={lang} />
-                <div className={styles.showcaseNote}>{lang === "zh" ? "团队协作模式" : "TEAM AT WORK"}</div>
-                <div className={styles.showcaseFiles}>
-                  {showcase.files.map((file) => (
-                    <code key={file}>{file}</code>
-                  ))}
-                </div>
-              </div>
-            </section>
-
-            <section className={styles.trust}>
-              <p>{t.trust}</p>
-              <div>
-                {t.backends.map((backend) => (
-                  <span key={backend}>{backend}</span>
-                ))}
-              </div>
-            </section>
-
-            <section className={styles.mascotRoster}>
-              <div className={styles.mascotIntro}>
-                <span>{`// ${t.mascots.eyebrow}`}</span>
-                <h2>{t.mascots.title}</h2>
-                <p>{t.mascots.desc}</p>
-                <div className={styles.mascotLead}>
-                  <Image
-                    src={asset(t.mascots.lead.img)}
-                    alt=""
-                    width={56}
-                    height={56}
-                    aria-hidden="true"
-                  />
-                  <div>
-                    <small>{t.mascots.lead.role}</small>
-                    <p>{t.mascots.lead.desc}</p>
                   </div>
-                </div>
-              </div>
-              <div className={styles.mascotRail}>
-                {t.mascots.cards.map((card, index) => (
-                  <article className={styles.mascotCard} key={card.title}>
-                    <div className={styles.mascotImageWrapper}>
-                      <Image src={asset(card.img)} alt={card.title} width={360} height={360} />
-                      {card.type === "doer" && (
-                        <span className={styles.mascotTypeTagDoer}>Doer · Serial Write</span>
-                      )}
-                      {card.type === "critic" && (
-                        <span className={styles.mascotTypeTagCritic}>Critic · Parallel Review</span>
-                      )}
-                    </div>
-                    <div>
-                      <small>
-                        {String(index + 1).padStart(2, "0")} / {card.role}
-                      </small>
-                      <h3>{card.title}</h3>
-                      <div className={styles.mascotProduces}>
-                        <span>{t.mascots.deliversLabel}</span>
-                        <code>{card.produces}</code>
-                      </div>
-                      <p>{card.desc}</p>
-                      {card.details && (
-                        <ul className={styles.mascotDetails}>
-                          {card.details.map((detail) => (
-                            <li key={detail}>{detail}</li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-                  </article>
-                ))}
-              </div>
-            </section>
 
-            <SectionIntro eyebrow={t.flow.eyebrow} title={t.flow.title} desc={t.flow.desc} />
-            <section className={styles.layers}>
-              {t.flow.layers.map((layer, index) => (
-                <article key={layer.k}>
-                  <span>0{index + 1}</span>
-                  <h3>{layer.k}</h3>
-                  <p>{layer.d}</p>
-                </article>
-              ))}
-            </section>
-
-            <SectionIntro eyebrow={t.pipe.eyebrow} title={t.pipe.title} desc={t.pipe.desc} />
-            <section className={styles.pipeline}>
-              <div className={styles.stageList}>
-                {t.stages.map((stage, index) => (
-                  <button
-                    className={index === stageIndex ? styles.stageActive : styles.stageButton}
-                    key={stage.key}
-                    ref={(node) => {
-                      stageButtonRefs.current[index] = node;
-                    }}
-                    type="button"
-                    onClick={() => pickStage(index)}
-                  >
-                    <span>{stage.n}</span>
-                    <strong>{stage.label}</strong>
-                    {stage.gate && <em>{t.pipe.gate}</em>}
-                  </button>
-                ))}
-              </div>
-              <article className={styles.stageDetail}>
-                <div className={styles.stageProgress} aria-hidden="true">
-                  <span style={{ width: stageProgress }} />
+                  <dl className={styles.heroFacts}>
+                    <div><dt>3</dt><dd>{lang === "zh" ? "本机底座" : "LOCAL BASES"}</dd></div>
+                    <div><dt>9</dt><dd>{lang === "zh" ? "交付阶段" : "DELIVERY PHASES"}</dd></div>
+                    <div><dt>113</dt><dd>{lang === "zh" ? "治理检查" : "GOVERNANCE CHECKS"}</dd></div>
+                  </dl>
                 </div>
-                <div className={styles.stageHeader}>
-                  <span>{activeStage.n}</span>
-                  <div>
-                    <small>{activeStage.key}</small>
-                    <h3>{activeStage.label}</h3>
+
+                <div className={styles.heroSystem} aria-label={lang === "zh" ? "UmaDev 交付流水线动态预览" : "UmaDev delivery pipeline preview"}>
+                  <div className={styles.heroSystemBar}>
+                    <div className={styles.heroSystemLights}><i /><i /><i /></div>
+                    <span>UMADEV / LIVE RUN</span>
+                    <strong><i /> ONLINE</strong>
                   </div>
-                </div>
-                <p>{activeStage.role}</p>
-                <h4>{t.pipe.filesLabel}</h4>
-                <div className={styles.fileList}>
-                  {activeStage.files.map((file) => (
-                    <code key={file}>› {file}</code>
-                  ))}
-                </div>
-              </article>
-            </section>
 
-            <SectionIntro eyebrow={t.modes.eyebrow} title={t.modes.title} desc={t.modes.desc} />
-            <section className={styles.modes}>
-              <article className={styles.modePanel}>
-                <div className={styles.tabs}>
-                  {t.modes.tabs.map((tab) => (
-                    <button
-                      className={tab.id === mode ? styles.tabActive : styles.tab}
-                      key={tab.id}
-                      type="button"
-                      onClick={() => setMode(tab.id)}
-                    >
-                      {tab.name}
-                    </button>
-                  ))}
-                </div>
-                <small>{t.modes.callLabel}</small>
-                <button
-                  className={styles.modeCommand}
-                  type="button"
-                  onClick={() => copyModeCommand(activeTab.cmd, activeTab.id)}
-                >
-                  <code>
-                    <span>$ </span>
-                    <b>{activeTab.bin}</b> {activeTab.cmd.replace(activeTab.bin, "").trim()}
-                  </code>
-                  <em>{copiedMode === activeTab.id ? t.hero.copied : t.hero.copy}</em>
-                </button>
-                <small>{t.modes.whoLabel}</small>
-                <p>{activeTab.who}</p>
-              </article>
-              <div className={styles.modeCards}>
-                {t.modes.cards.map((card) => (
-                  <article key={card.title}>
-                    <header>
-                      <h3>{card.title}</h3>
-                      <button
-                        className={styles.modeCardCommand}
-                        type="button"
-                        onClick={() => copyModeCommand(card.cmd, card.cmd)}
-                      >
-                        <code>{card.cmd}</code>
-                        <span>{copiedMode === card.cmd ? t.hero.copied : t.hero.copy}</span>
-                      </button>
-                    </header>
-                    <p>{card.desc}</p>
-                  </article>
-                ))}
-              </div>
-              <div className={styles.modeNotes}>
-                {t.modes.notes.map((note) => (
-                  <span key={note}>✓ {note}</span>
-                ))}
-              </div>
-            </section>
-
-            <SectionIntro eyebrow={t.gov.eyebrow} title={t.gov.title} desc={t.gov.desc} />
-            <section className={styles.govGrid}>
-              {t.gov.blocks.map((block) => (
-                <article key={block.title}>
-                  <div>
-                    <strong>{block.stat}</strong>
-                    <span>{block.unit}</span>
+                  <div className={styles.heroPrompt}>
+                    <span>{lang === "zh" ? "你的需求" : "YOUR BRIEF"}</span>
+                    <p>{lang === "zh" ? "做一个能上线的产品，而不只是一段代码。" : "Build a product that can ship, not just a piece of code."}</p>
                   </div>
-                  <h3>{block.title}</h3>
-                  <p>{block.desc}</p>
-                  <ul>
-                    {block.bullets.map((bullet) => (
-                      <li key={bullet}>{bullet}</li>
+
+                  <div className={styles.heroPhaseTrack} aria-hidden="true">
+                    {t.stages.map((stage, index) => (
+                      <i
+                        key={stage.key}
+                        className={index === activeStageIdx ? styles.heroPhaseActive : index < activeStageIdx ? styles.heroPhaseDone : undefined}
+                      />
                     ))}
-                  </ul>
-                </article>
-              ))}
-            </section>
-            <div className={styles.compliance}>
-              <span>{t.gov.compliance}</span>
-              {t.gov.standards.map((standard) => (
-                <code key={standard}>{standard}</code>
-              ))}
-            </div>
+                  </div>
 
-            <section className={styles.brandIp}>
-              <div>
-                <span>{t.ip.eyebrow}</span>
-                <h2>{t.ip.title}</h2>
-                <p>{t.ip.desc}</p>
+                  {(() => {
+                    const stage = t.stages[activeStageIdx];
+                    return (
+                      <div className={styles.heroLiveStage} key={stage.key}>
+                        <div className={styles.heroStageIndex}>{String(activeStageIdx + 1).padStart(2, "0")}</div>
+                        <div className={styles.heroStageCopy}>
+                          <span>{lang === "zh" ? "当前角色正在工作" : "ACTIVE TEAM ROLE"}</span>
+                          <h3>{stage.label}</h3>
+                          <p>{stage.role}</p>
+                        </div>
+                        <span className={styles.heroStagePulse} />
+                      </div>
+                    );
+                  })()}
+
+                  <div className={styles.heroOutputs}>
+                    <div className={styles.heroOutputsHead}>
+                      <span>{lang === "zh" ? "实时产物" : "LIVE ARTIFACTS"}</span>
+                      <small>{lang === "zh" ? "写入项目" : "WRITING TO PROJECT"}</small>
+                    </div>
+                    {t.stages[activeStageIdx].files.slice(0, 3).map((file, index) => (
+                      <div className={styles.heroOutputFile} key={file}>
+                        <i>{index + 1}</i>
+                        <code>{file}</code>
+                        <span>{index === 0 ? "SYNC" : "READY"}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className={styles.heroSystemFoot}>
+                    <div><span>BASE</span><strong>CLAUDE CODE / CODEX / OPENCODE</strong></div>
+                    <div><span>GATE</span><strong>QUALITY 90+</strong></div>
+                    <div><span>PROOF</span><strong>JSONL + SCORECARD</strong></div>
+                  </div>
+                </div>
               </div>
-              <div className={styles.ipCards}>
-                {t.ip.cards.map((card, index) => (
-                  <figure key={card.cap}>
-                    <Image
-                      src={asset(card.img)}
-                      alt={card.cap}
-                      width={390}
-                      height={390}
-                      loading={index === 0 ? undefined : "eager"}
-                      priority={index === 0}
-                      sizes="(max-width: 720px) 100vw, (max-width: 1080px) 50vw, 32vw"
-                    />
-                    <figcaption>{card.cap}</figcaption>
-                  </figure>
+              <a className={styles.heroScrollCue} href="#pipeline" aria-label={lang === "zh" ? "滚动查看交付流水线" : "Scroll to the delivery pipeline"}>
+                <span>{lang === "zh" ? "查看完整交付系统" : "EXPLORE THE DELIVERY SYSTEM"}</span>
+                <i />
+              </a>
+            </section>
+
+            {/* MARQUEE */}
+            <section className={styles.marqueeSection}>
+              <div className={styles.marqueeContainer}>
+                <div className={styles.marqueeTrack}>
+                  {Array.from({ length: 4 }).flatMap((_, outerIdx) => (
+                    <React.Fragment key={outerIdx}>
+                      <span className={styles.marqueeText}>{lang === "zh" ? "驱动你已登录的底座 —" : "DRIVES YOUR LOGGED-IN BASE —"}</span>
+                      <span className={styles.marqueeItem}>Claude Code</span><span className={styles.marqueeSep}>◆</span>
+                      <span className={styles.marqueeItem}>Codex</span><span className={styles.marqueeSepPurple}>◆</span>
+                      <span className={styles.marqueeItem}>OpenCode</span><span className={styles.marqueeSep}>◆</span>
+                      <span className={styles.marqueeText}>{lang === "zh" ? "不接外部 API · 不保存登录 · 底座用它自己的模型" : "NO EXTERNAL API KEY · NO LOGIN SAVED · BASE USES ITS OWN MODEL"}</span><span className={styles.marqueeSepPurple}>◆</span>
+                    </React.Fragment>
+                  ))}
+                </div>
+              </div>
+            </section>
+
+            {/* COOPERATIVE COMMUNITIES */}
+            <section className={styles.partnersSection} id="community">
+              <div className={styles.partnersContainer}>
+                <div className={styles.communityHalo} aria-hidden="true" />
+                <h2 className={styles.partnersTitle} data-title={t.partners.title}>{t.partners.title}</h2>
+                {["top", "bottom"].map((position) => {
+                  const items = position === "top" ? t.partners.list : [...t.partners.list].reverse();
+                  return (
+                    <div key={position} className={`${styles.communityBelt} ${position === "top" ? styles.communityBeltTop : styles.communityBeltBottom}`}>
+                      <div className={styles.communityBeltTrack}>
+                        {[...items, ...items].map((partner, idx) => (
+                          <a
+                            key={`${position}-${partner.logoName}-${idx}`}
+                            aria-label={partner.name}
+                            href={partner.url}
+                            target={partner.url === "#" ? undefined : "_blank"}
+                            rel={partner.url === "#" ? undefined : "noopener noreferrer"}
+                            className={styles.communityLogo}
+                            data-partner={partner.logoName}
+                            onClick={(event) => {
+                              if (partner.url === "#") event.preventDefault();
+                            }}
+                          >
+                            <Image
+                              src={asset(`/assets/partners/${partner.logoName === "paopai" ? "paopai-transparent" : partner.logoName}.png?v=5`)}
+                              alt={partner.name}
+                              width={220}
+                              height={92}
+                              loading="eager"
+                            />
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+
+            {/* ROLE / PROBLEM */}
+            <section className={styles.painSection}>
+              <h2 className={styles.painTitle}>
+                {lang === "zh" ? "解决问题" : "What it solves"}
+              </h2>
+
+              <div className={styles.painGrid}>
+                <div className={`${styles.painCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <span className={styles.painCardTagCross}>✕ {lang === "zh" ? "常见" : "COMMON"}</span>
+                  <p className={styles.painCardText}>
+                    {lang === "zh" ? "AI 一上来就写代码，没有 PRD、没有架构、没有验收标准。" : "LLMs start coding immediately without any PRD, architecture specifications, or acceptance criteria."}
+                  </p>
+                </div>
+                <div className={`${styles.painCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <span className={styles.painCardTagCross}>✕ {lang === "zh" ? "常见" : "COMMON"}</span>
+                  <p className={styles.painCardText}>
+                    {lang === "zh" ? "前端做完了，后端接口路径对不上。UI 像模板，颜色字体很随意。" : "Frontend gets built, but backend API paths mismatch. UI looks generic with template-like aesthetics."}
+                  </p>
+                </div>
+                <div className={`${styles.painCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <span className={styles.painCardTagCross}>✕ {lang === "zh" ? "常见" : "COMMON"}</span>
+                  <p className={styles.painCardText}>
+                    {lang === "zh" ? "写了占位代码、假数据、TODO，却说「完成了」。改一次需求上下文就乱。" : "AI writes placeholder code, fake mocks, and TODOs, yet claims done. A single change causes context drift."}
+                  </p>
+                </div>
+                <div className={`${styles.painCardActive} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "角色阵容" : "ROLES"}</span>
+                  <p className={styles.painCardActiveText}>
+                    {lang === "zh" ? "产品经理 + 架构师 + UI/UX 审稿人 + 技术负责人 + QA + 交付经理。" : "Product Manager + Architect + UI/UX Designer + Tech Lead + QA + DevOps."}
+                  </p>
+                </div>
+                <div className={`${styles.painCardActive} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "交付闭环" : "CLOSED-LOOP"}</span>
+                  <p className={styles.painCardActiveText}>
+                    {lang === "zh" ? "你只输入一句需求，它负责把「AI 写代码」变成一个完整、可上线、可审计的项目交付过程。" : "You enter a single prompt, and it orchestrates the process into a complete, shippable, auditable delivery."}
+                  </p>
+                </div>
+                <div className={`${styles.painCardActive} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "质量红线" : "QUALITY GATES"}</span>
+                  <p className={styles.painCardActiveText}>
+                    {lang === "zh" ? "113 条覆盖安全、接口对账与 UI 规范的治理规则，编译测试全绿、审计证据链齐全才放行交付。" : "113 rules check safety, contracts, and UI code. Only releases when tests pass and audit log is verified."}
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            {/* VERTICAL PIPELINE SECTION */}
+            <section id="pipeline" className={styles.pipelineSection}>
+              <div className={styles.pipelineHeader}>
+                <h2 className={styles.pipelineTitle}>
+                  {lang === "zh" ? "交付流水线" : "Delivery pipeline"}
+                </h2>
+              </div>
+
+              <div
+                className={styles.pipelineContainer}
+                onMouseEnter={() => setAutoplay(false)}
+                onMouseLeave={() => setAutoplay(true)}
+              >
+                {/* Horizontal Progress Bar */}
+                <div className={styles.pipelineProgressBarWrapper}>
+                  <div
+                    className={styles.pipelineProgressBarLine}
+                    style={{
+                      "--progress-width": `${(activeStageIdx / Math.max(t.stages.length - 1, 1)) * 100}%`
+                    } as React.CSSProperties}
+                  />
+                  <div className={styles.pipelineProgressNodes}>
+                    {t.stages.map((stage, index) => {
+                      const isGate = stage.gate;
+                      const color = isGate ? "#ff2a85" : "#00d2ff";
+                      const stepNum = String(index + 1).padStart(2, "0");
+                      const isActive = index === activeStageIdx;
+                      const isCompleted = index <= activeStageIdx;
+
+                      return (
+                        <button
+                          key={stage.key}
+                          type="button"
+                          className={`${styles.pipelineNodeButton} ${isActive ? styles.pipelineNodeActive : ""} ${isCompleted ? styles.pipelineNodeCompleted : ""}`}
+                          onClick={() => setActiveStageIdx(index)}
+                          style={{
+                            "--node-color": color,
+                            "--node-color-rgba": `${color}2a`
+                          } as React.CSSProperties}
+                        >
+                          <span className={styles.pipelineNodeDot}>{stepNum}</span>
+                          <span className={styles.pipelineNodeLabel}>{stage.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Dashboard Detail Panel */}
+                <div className={styles.pipelineDetailPanel}>
+                  {(() => {
+                    const stage = t.stages[activeStageIdx];
+                    const isGate = stage.gate;
+                    const isMicro = stage.key === "clarify";
+                    const color = isGate ? "#ff2a85" : "#00d2ff";
+
+                    return (
+                      <div className={styles.pipelinePanelContent} key={stage.key}>
+                        <div className={styles.pipelinePanelLeft}>
+                          <div className={styles.pipelineMetaRow}>
+                            <span className={styles.pipelineName}>{stage.label}</span>
+                            <span
+                              className={`${styles.pipelineBadge} ${styles.mono}`}
+                              style={{ background: `${color}14`, color: color }}
+                            >
+                              {stage.key}
+                            </span>
+                            {isGate && <span className={styles.pipelineGateLabel}>{lang === "zh" ? "确认门禁" : "CONFIRM GATE"}</span>}
+                            {isMicro && <span className={styles.pipelineMicroLabel}>{lang === "zh" ? "微阶段" : "MICRO PHASE"}</span>}
+                          </div>
+                          <div className={styles.pipelineDetailText} style={{ marginTop: "14px", fontSize: "16px", minHeight: "60px" }}>
+                            {stage.role}
+                          </div>
+                        </div>
+
+                        <div className={styles.pipelinePanelRight}>
+                          <div className={styles.pipelineExplorer}>
+                            <div className={styles.pipelineExplorerHeader}>
+                              <span style={{ fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.08em", color: "#8a8f9c" }}>
+                                {lang === "zh" ? "OUTPUT / 生成交付产物" : "OUTPUT / DELIVERABLES"}
+                              </span>
+                            </div>
+                            <div className={styles.pipelineExplorerList}>
+                              {stage.files.map((file) => (
+                                <div key={file} className={styles.pipelineExplorerItem}>
+                                  <span style={{ color: color, fontSize: "10px", fontFamily: "var(--font-mono), monospace" }}>FILE</span>
+                                  <span className={`${styles.pipelineExplorerName} ${styles.mono}`}>{file}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            </section>
+
+            {/* GOVERNANCE STATS */}
+            <section id="governance" className={styles.statsSection}>
+              <div className={styles.statsSectionHeader}>
+                <div style={{ maxWidth: "640px" }}>
+                  <h2 className={styles.statsSectionTitle}>
+                    {lang === "zh" ? "治理与质量" : "Governance & quality"}
+                  </h2>
+                </div>
+              </div>
+
+              <div className={styles.statsGrid}>
+                {[
+                  { count: 113, label: lang === "zh" ? "条治理规则 + 审计" : "Governance Rules + Audit", color: "#00d2ff", active: false },
+                  { count: 416, label: lang === "zh" ? "份内置知识文件" : "Embedded Knowledge Files", color: "#ff2a85", active: false },
+                  { count: 9, label: lang === "zh" ? "个可治理交付阶段" : "Verifiable Delivery Phases", color: "#00d2ff", active: false },
+                  { count: 90, label: lang === "zh" ? "默认质量门通过线" : "Default Quality Gate Bar", color: "#00d2ff", active: true, suffix: lang === "zh" ? "分" : " pts" },
+                ].map((item, idx) => (
+                  <div
+                    key={idx}
+                    className={`${item.active ? styles.statCardActive : styles.statCard} ${styles.reveal} ${styles.tilt}`}
+                    onMouseMove={handleTiltMove}
+                    onMouseLeave={handleTiltLeave}
+                    style={{ transitionDelay: `${idx * 40}ms` }}
+                  >
+                    <div style={{ display: "flex", alignItems: "baseline", gap: "6px" }}>
+                      <div
+                        className={`${styles.statNumber} ${styles.mono}`}
+                        style={{ color: item.color }}
+                        data-count={item.count}
+                      >
+                        {item.count}
+                      </div>
+                      {item.suffix && <span style={{ fontSize: "24px", color: item.color }}>{item.suffix}</span>}
+                    </div>
+                    <div style={{ marginTop: "12px", fontSize: "15px", color: item.active ? "#e2ff8a" : "#b4b9c4" }}>{item.label}</div>
+                  </div>
                 ))}
               </div>
             </section>
 
-            <section className={styles.cta}>
-              <div>
-                <h2>{t.cta.title}</h2>
-                <p>{t.cta.sub}</p>
-                <div>
-                  <a href={githubUrl} target="_blank" rel="noreferrer">
-                    {t.cta.btn1} →
+            {/* CRATES SECTION */}
+            <section className={styles.cratesSection}>
+              <div className={styles.cratesHeader}>
+                <h2 className={styles.cratesTitle}>
+                  {lang === "zh" ? "Rust 工作区" : "Rust workspace"}
+                </h2>
+              </div>
+
+              <div className={styles.cratesGrid}>
+                {[
+                  ["umadev", lang === "zh" ? "主程序" : "CLI Core", lang === "zh" ? "CLI · TUI · doctor · hook · CI · MCP" : "CLI · TUI · doctor · hook · CI · MCP"],
+                  ["umadev-spec", lang === "zh" ? "规则说明书" : "Spec Definition", lang === "zh" ? "UMADEV_HOST_SPEC_V1 数据" : "UMADEV_HOST_SPEC_V1 static spec representation"],
+                  ["umadev-governance", lang === "zh" ? "质检和红线" : "Governance Compliance", lang === "zh" ? "113 条规则 · 审计 · 合规映射" : "113 rules check · audit trails · SOC 2 compliance mapper"],
+                  ["umadev-agent", lang === "zh" ? "项目总监" : "Orchestrator Agent", lang === "zh" ? "9 阶段 runner · gate · 质量门" : "9-phase workflow runner · gate triggers · quality checkpoint"],
+                  ["umadev-runtime", lang === "zh" ? "统一大脑接口" : "Runtime Interface", lang === "zh" ? "Offline · HTTP runtime · trait" : "Offline templates · HTTP channel drivers · base trait"],
+                  ["umadev-host", lang === "zh" ? "驱动外部 CLI" : "Base CLI Drivers", lang === "zh" ? "Claude Code · Codex · OpenCode" : "Claude Code · Codex · OpenCode subprocess hooks"],
+                  ["umadev-contract", lang === "zh" ? "API 对账员" : "Contract Alignment", lang === "zh" ? "OpenAPI 契约 · 路径校验" : "OpenAPI verification · frontend Axios / fetch path check"],
+                  ["umadev-knowledge", lang === "zh" ? "知识检索" : "RAG Hybrid Search", lang === "zh" ? "BM25 · chunk · 可选 vector" : "BM25 lexical channel · Candle vector embeddings RRF fuser"],
+                  ["umadev-tui", lang === "zh" ? "终端界面" : "Terminal TUI Layout", lang === "zh" ? "ratatui 聊天 UI · 预览部署" : "Ratatui interactive chat · local preview logs · action diffs"],
+                  ["umadev-i18n", lang === "zh" ? "多语言" : "Internationalization", lang === "zh" ? "简中 · 繁中 · English" : "zh-CN · zh-TW · English translation dicts"],
+                ].map(([name, role, desc], i) => (
+                  <div
+                    key={name}
+                    className={`${styles.crateCard} ${styles.reveal} ${styles.tilt}`}
+                    onMouseMove={handleTiltMove}
+                    onMouseLeave={handleTiltLeave}
+                    style={{ transitionDelay: `${i * 40}ms` }}
+                  >
+                    <div className={styles.crateName}>{name}</div>
+                    <div className={styles.crateRole}>{role}</div>
+                    <div className={styles.crateDesc}>{desc}</div>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* KNOWLEDGE RETRIEVAL SECTION */}
+            <section id="knowledge" className={styles.retrieveSection}>
+              <div className={styles.retrieveGrid}>
+                <div className={styles.reveal}>
+                  <h2 className={styles.retrieveTitle}>
+                    {lang === "zh" ? "工程知识库" : "Knowledge base"}
+                  </h2>
+                  <div className={`${styles.mono} ${styles.reveal}`} style={{ display: "flex", flexDirection: "column", gap: "8px", fontSize: "13.5px", color: "#8a8f9c", marginTop: "24px" }}>
+                    <span><span style={{ color: "#00d2ff" }}>$</span> umadev knowledge-manage add ./team-docs</span>
+                    <span><span style={{ color: "#00d2ff" }}>$</span> umadev knowledge-manage search {lang === "zh" ? '"支付 webhook 幂等"' : '"payment webhook idempotency"'}</span>
+                  </div>
+                </div>
+
+                <div className={`${styles.reveal}`} style={{ position: "relative", padding: "30px", borderRadius: "20px", background: "#0c0e14", border: "1px solid rgba(255, 255, 255, 0.08)", overflow: "hidden" }}>
+                  <div className={styles.mono} style={{ display: "flex", flexDirection: "column", gap: "11px", fontSize: "13px" }}>
+                    {[
+                      { num: "01", name: lang === "zh" ? "分词" : "Tokenization", desc: lang === "zh" ? "中文 + 英文" : "CJK bigram + English", color: "#ff2a85" },
+                      { num: "02", name: lang === "zh" ? "BM25 检索" : "BM25 Retrieval", desc: lang === "zh" ? "top-k 命中工程标准" : "top-k lexical matches", color: "#00d2ff" },
+                      { num: "03", name: lang === "zh" ? "向量检索" : "Vector Search", desc: lang === "zh" ? "OPENAI_EMBED_KEY 可选" : "local candles / optional OpenAI API", color: "#ff2a85" },
+                      { num: "04", name: lang === "zh" ? "RRF 融合排序" : "RRF Fusion Re-ranking", desc: lang === "zh" ? "合并两路结果" : "reciprocal rank fusion blending", color: "#00d2ff" },
+                      { num: "05", name: lang === "zh" ? "注入当前阶段 prompt" : "Prompt Context Injection", desc: lang === "zh" ? "→ 底座" : "→ base CLI input stream", color: "#00d2ff" },
+                    ].map((step) => (
+                      <div key={step.num} style={{ display: "flex", alignItems: "center", gap: "12px", padding: "12px 14px", borderRadius: "10px", background: "#0a0b10", borderLeft: `2px solid ${step.color}` }}>
+                        <span style={{ color: step.color, fontSize: "12px" }}>{step.num}</span>
+                        <span style={{ color: "#f4f6f2", fontSize: "13.5px", flex: 1 }}>{step.name}</span>
+                        <span style={{ color: "#8a8f9c", fontSize: "12px" }}>{step.desc}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* PROOF OF DELIVERY */}
+            <section id="deliver" className={styles.deliverSection}>
+              <div className={styles.deliverHeader}>
+                <h2 className={styles.deliverTitle}>
+                  {lang === "zh" ? "交付证据" : "Delivery proof"}
+                </h2>
+              </div>
+
+              <div className={styles.deliverGrid}>
+                <div className={`${styles.deliverCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <div className={styles.deliverCardPath}>output/</div>
+                  <h3 className={styles.deliverCardTitle}>{lang === "zh" ? "过程文档" : "Process Documents"}</h3>
+                  <p className={styles.deliverCardDesc}>clarify · research · prd · architecture · uiux · execution-plan · quality-gate</p>
+                </div>
+                <div className={`${styles.deliverCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <div className={styles.deliverCardPath}>.umadev/audit/</div>
+                  <h3 className={styles.deliverCardTitle}>{lang === "zh" ? "证据链" : "Evidence Logs"}</h3>
+                  <p className={styles.deliverCardDesc}>tool-calls.jsonl · frontend-api-calls.jsonl · verify.jsonl · 状态与合规映射</p>
+                </div>
+                <div className={`${styles.deliverCardActive} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
+                  <div className={styles.deliverCardPathActive}>release/</div>
+                  <h3 className={styles.deliverCardTitleActive}>{lang === "zh" ? "最终交付包" : "Release Package"}</h3>
+                  <p className={styles.deliverCardDescActive}>
+                    {lang === "zh" ? "proof-pack-*.zip 与 scorecard-*.html —— 给团队、客户、审计方看的交付证明。" : "proof-pack-*.zip and scorecard-*.html —— evidence verification package for clients and auditors."}
+                  </p>
+                </div>
+              </div>
+            </section>
+
+            {/* SPACE CTA */}
+            <section className={styles.spaceCta}>
+              <div className={styles.spaceCtaOverlay} />
+              <div className={styles.spaceCtaContent}>
+                <h2 className={styles.spaceCtaTitle}>
+                  {lang === "zh" ? "开始交付" : "Start shipping"}
+                </h2>
+                <div className={styles.spaceCtaConsole}>
+                  <span className={styles.spaceCtaConsolePrompt}>$</span> npm install -g umadev
+                  <button className={`${styles.umaCopy} ${styles.umaMagnet}`} style={{ marginLeft: "12px", padding: "6px 12px", borderRadius: "8px", border: "none", background: "#00d2ff", color: "#07080c", fontFamily: "var(--font-mono), monospace", fontSize: "12px", fontWeight: 600, cursor: "pointer" }} onClick={copyInstall} onMouseMove={handleMagnetMove} onMouseLeave={handleMagnetLeave}>
+                    {copied ? (lang === "zh" ? "已复制 ✓" : "Copied ✓") : (lang === "zh" ? "复制" : "Copy")}
+                  </button>
+                </div>
+                <div className={styles.spaceCtaActions}>
+                  <a className={`${styles.spaceCtaBtn1} ${styles.umaMagnet}`} href="https://github.com/umacloud/umadev" target="_blank" rel="noreferrer" onMouseMove={handleMagnetMove} onMouseLeave={handleMagnetLeave}>
+                    {lang === "zh" ? "在 GitHub 查看" : "View on GitHub"}
                   </a>
-                  <button type="button" onClick={() => go("docs")}>
-                    {t.cta.btn2}
+                  <button className={`${styles.spaceCtaBtn2} ${styles.umaMagnet}`} type="button" onClick={() => go("docs")} onMouseMove={handleMagnetMove} onMouseLeave={handleMagnetLeave}>
+                    {lang === "zh" ? "阅读文档" : "Read Docs"}
                   </button>
                 </div>
               </div>
-              <button className={styles.ctaCommand} type="button" onClick={copyInstall}>
-                <code>{t.cta.note}</code>
-                <span>{copied ? t.hero.copied : t.hero.copy}</span>
-              </button>
+              <div className={styles.spaceCtaArt} aria-hidden="true">
+                <div className={styles.spaceCtaOrbit} />
+                <Image
+                  alt=""
+                  className={styles.spaceCtaIp}
+                  height={530}
+                  src={asset("/assets/umadev/generated/changelog-ip.png")}
+                  unoptimized
+                  width={428}
+                />
+              </div>
             </section>
           </>
         )}
 
         {view === "docs" && (
           <section className={styles.docsPage}>
-            <PageHero title={t.docsPage.title} sub={t.docsPage.sub} />
+            <PageHero title={t.docsPage.title} sub={t.docsPage.sub} variant="docs" />
             <div className={styles.docsLayout}>
               <aside className={styles.docsNav}>
                 {docCats.map((cat) => (
@@ -1274,7 +1247,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
         {view === "changelog" && (
           <section className={styles.logPage}>
-            <PageHero title={t.logPage.title} sub={t.logPage.sub} />
+            <PageHero title={t.logPage.title} sub={t.logPage.sub} variant="changelog" />
             <ol className={styles.releaseTimeline}>
               {releases[lang].map((release, index) => (
                 <ReleaseEntry
@@ -1291,12 +1264,19 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
         )}
 
         {view === "gallery" && (
-          <section className={styles.docsPage}>
-            <PageHero title={t.galleryPage.title} sub={t.galleryPage.sub} />
+          <section className={`${styles.docsPage} ${styles.galleryPage}`}>
+            <PageHero title={t.galleryPage.title} sub={t.galleryPage.sub} variant="gallery" />
             <div className={styles.galleryGrid}>
               {gallery.map((src, i) => (
-                <button className={styles.galleryItem} key={src} onClick={() => setLightbox(i)} type="button">
-                  <Image alt={`UmaDev IP ${i + 1}`} className={styles.galleryImg} height={420} src={src} unoptimized width={420} />
+                <button
+                  className={`${styles.galleryItem} ${styles.tilt}`}
+                  key={src}
+                  onClick={() => setLightbox(i)}
+                  type="button"
+                  onMouseMove={handleTiltMove}
+                  onMouseLeave={handleTiltLeave}
+                >
+                  <Image alt={`UmaDev IP ${i + 1}`} className={styles.galleryImg} height={420} priority={i === 0} src={src} unoptimized width={420} />
                 </button>
               ))}
             </div>
@@ -1305,23 +1285,35 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
         {view === "contributors" && (
           <section className={styles.contributorsPage}>
-            <PageHero title={t.contributorsPage.title} sub={t.contributorsPage.sub} />
-            
+            <PageHero title={t.contributorsPage.title} sub={t.contributorsPage.sub} variant="contributors" />
+
             <div className={styles.contributorsMatrix}>
               {[
-                { ...t.contributors.featured, isVip: true, vipText: "#1 核心贡献" },
-                ...t.contributors.list.map((item) => ({
+                { ...t.contributors.featured, isVip: true, vipText: lang === "zh" ? "创始荣誉席" : "Founding Honor", rank: "01" },
+                ...t.contributors.list.filter((item) => (item as { isVip?: boolean }).isVip).map((item) => ({
                   ...item,
-                  isVip: (item as { isVip?: boolean }).isVip || false,
-                  vipText: (item as { isVip?: boolean }).isVip ? "核心贡献" : undefined
+                  isVip: true,
+                  vipText: lang === "zh" ? "核心荣誉席" : "Core Honor",
+                  rank: "02"
+                })),
+                ...t.contributors.list.filter((item) => !(item as { isVip?: boolean }).isVip).map((item) => ({
+                  ...item,
+                  isVip: false,
+                  vipText: undefined,
+                  rank: undefined
                 }))
               ].map((member) => (
                 <div
                   key={member.avatarKey}
-                  className={styles.matrixCard}
+                  className={`${styles.matrixCard} ${styles.tilt}`}
+                  data-rank={member.rank}
                   data-vip={member.isVip ? "true" : undefined}
+                  onMouseMove={handleTiltMove}
+                  onMouseLeave={handleTiltLeave}
                 >
                   <div className={styles.matrixCardGlow} />
+                  {member.isVip && <div className={styles.matrixVipOrbit} />}
+                  {member.isVip && <span className={styles.matrixVipIndex}>{member.rank}</span>}
                   {member.isVip && <div className={styles.matrixVipBadge}>{member.vipText}</div>}
                   <div className={styles.matrixAvatarWrapper}>
                     <Image
@@ -1329,6 +1321,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                       alt={member.name}
                       width={88}
                       height={88}
+                      priority={member.isVip}
                       className={styles.matrixAvatarImg}
                     />
                   </div>
@@ -1346,94 +1339,67 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
       {lightbox !== null && (
         <div aria-modal="true" className={styles.lightbox} onClick={() => setLightbox(null)} role="dialog">
           <button aria-label="Close" className={styles.lightboxClose} onClick={() => setLightbox(null)} type="button">
-            ×
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></svg>
           </button>
-          <button
-            aria-label="Previous"
-            className={styles.lightboxNav}
-            data-side="prev"
-            onClick={(e) => {
-              e.stopPropagation();
-              setLightbox((p) => (p === null ? null : (p - 1 + gallery.length) % gallery.length));
-            }}
-            type="button"
-          >
-            ‹
-          </button>
-          <Image
-            alt={`UmaDev IP ${lightbox + 1}`}
-            className={styles.lightboxImg}
-            height={1100}
-            onClick={(e) => e.stopPropagation()}
-            src={gallery[lightbox]}
-            unoptimized
-            width={1100}
-          />
-          <button
-            aria-label="Next"
-            className={styles.lightboxNav}
-            data-side="next"
-            onClick={(e) => {
-              e.stopPropagation();
-              setLightbox((p) => (p === null ? null : (p + 1) % gallery.length));
-            }}
-            type="button"
-          >
-            ›
-          </button>
-          <span className={styles.lightboxCount}>
-            {lightbox + 1} / {gallery.length}
-          </span>
+          <div className={styles.lightboxStage} onClick={(event) => event.stopPropagation()}>
+            <Image
+              alt={`UmaDev IP ${lightbox + 1}`}
+              className={styles.lightboxImg}
+              height={1100}
+              src={gallery[lightbox]}
+              unoptimized
+              width={1100}
+            />
+          </div>
+          <div className={styles.lightboxControls} onClick={(event) => event.stopPropagation()}>
+            <button
+              aria-label="Previous"
+              className={styles.lightboxNav}
+              data-side="prev"
+              onClick={() => setLightbox((p) => (p === null ? null : (p - 1 + gallery.length) % gallery.length))}
+              type="button"
+            >
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7" /></svg>
+              <span>{lang === "zh" ? "上一张" : "Previous"}</span>
+            </button>
+            <span className={styles.lightboxCount}>
+              <b>{String(lightbox + 1).padStart(2, "0")}</b>
+              <i>/</i>
+              <span>{String(gallery.length).padStart(2, "0")}</span>
+            </span>
+            <button
+              aria-label="Next"
+              className={styles.lightboxNav}
+              data-side="next"
+              onClick={() => setLightbox((p) => (p === null ? null : (p + 1) % gallery.length))}
+              type="button"
+            >
+              <span>{lang === "zh" ? "下一张" : "Next"}</span>
+              <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7" /></svg>
+            </button>
+          </div>
         </div>
       )}
 
-      <footer className={styles.footer}>
-        <div>
-          <div className={styles.footerBrand}>
-            <Image
-              className={styles.logo}
-              src={asset("/assets/umadev-icon.png")}
-              alt={lang === "zh" ? "UmaDev 图标" : "UmaDev logo"}
-              width={42}
-              height={42}
-            />
-            <strong>UmaDev</strong>
-          </div>
-          <p>{t.footer.blurb}</p>
+      <footer className={styles.spaceFooter}>
+        <div className={styles.spaceFooterBrand}>
+          <Image
+            alt=""
+            aria-hidden="true"
+            className={styles.spaceFooterBrandLogo}
+            height={30}
+            src={asset("/assets/umadev-icon.png")}
+            width={30}
+          />
+          <span className={styles.spaceFooterBrandText}>
+            {lang === "zh" ? "UmaDev · 脱胎于 super-dev · MIT License" : "UmaDev · derived from super-dev · MIT License"}
+          </span>
         </div>
-        {t.footer.cols.map((col) => (
-          <nav key={col.h}>
-            <h3>{col.h}</h3>
-            {col.links.map((link) =>
-              "u" in link ? (
-                <a key={link.t} href={link.u} target="_blank" rel="noreferrer">
-                  {link.t}
-                </a>
-              ) : (
-                <button key={link.t} type="button" onClick={() => go(col.h === "文档" || col.h === "Docs" ? "docs" : "home")}>
-                  {link.t}
-                </button>
-              ),
-            )}
-          </nav>
-        ))}
-        <small>{t.footer.rights}</small>
+        <div className={`${styles.spaceFooterLink} ${styles.mono}`}>umadev.umayun.com</div>
       </footer>
-
-      {/* Floating System Diagnostic Console */}
-      <FloatingDiagnosticTerminal
-        setLang={setLang}
-        setView={setView}
-        setHeroSlideIndex={setHeroSlideIndex}
-        setMode={setMode}
-        setStageIndex={setStageIndex}
-      />
     </div>
   );
 
-  function navClass(active: boolean) {
-    return active ? styles.navActive : styles.navButton;
-  }
 }
 
 /** Map a localized change tag (zh / en) to its colored chip class. */
@@ -1539,17 +1505,74 @@ function Chevron({ up }: { up: boolean }) {
   );
 }
 
-function SectionIntro({ eyebrow, title, desc }: { eyebrow: string; title: string; desc: string }) {
-  return (
-    <section className={styles.sectionIntro}>
-      <span>{`// ${eyebrow}`}</span>
-      <h2>{title}</h2>
-      <p>{desc}</p>
-    </section>
-  );
-}
 
-function PageHero({ title, sub }: { title: string; sub: string }) {
+
+type PageHeroVariant = "docs" | "gallery" | "contributors" | "changelog";
+
+const pageHeroVisuals: Record<PageHeroVariant, { art: string; ip: string; label: string; metrics: readonly string[] }> = {
+  docs: {
+    art: "/assets/umadev/vectors/docs-orbit.svg",
+    ip: "/assets/umadev/generated/docs-ip.png",
+    label: "UmaDev / Documentation",
+    metrics: ["113 GOVERNANCE", "09 PHASES", "03 LOCAL BASES"],
+  },
+  gallery: {
+    art: "/assets/umadev/vectors/gallery-aperture.svg",
+    ip: "/assets/umadev/generated/gallery-ip.png",
+    label: "UmaDev / Visual Archive",
+    metrics: ["45 IP SCENES", "ORIGINAL SERIES", "VISUAL ARCHIVE"],
+  },
+  contributors: {
+    art: "/assets/umadev/vectors/contributor-constellation.svg",
+    ip: "/assets/umadev/generated/honor-ip.png",
+    label: "UmaDev / Open Source",
+    metrics: ["MIT LICENSE", "COMMUNITY BUILT", "SPECIAL THANKS"],
+  },
+  changelog: {
+    art: "/assets/umadev/vectors/changelog-flow.svg",
+    ip: "/assets/umadev/generated/changelog-ip.png",
+    label: "UmaDev / Release Stream",
+    metrics: ["CURRENT v1.0.55", "RUST BINARY", "VERIFIED RELEASES"],
+  },
+};
+
+function PageHero({ title, sub, variant }: { title: string; sub: string; variant?: PageHeroVariant }) {
+  if (variant) {
+    const visual = pageHeroVisuals[variant];
+    return (
+      <header className={`${styles.pageHero} ${styles.routeHero}`} data-hero={variant}>
+        <div className={styles.routeHeroCopy}>
+          <span>{visual.label}</span>
+          <h1>{title}</h1>
+          <p>{sub}</p>
+        </div>
+        <div aria-hidden="true" className={styles.routeHeroArt}>
+          <Image
+            alt=""
+            className={styles.routeHeroVector}
+            height={800}
+            priority
+            src={asset(visual.art)}
+            unoptimized
+            width={800}
+          />
+          <Image
+            alt=""
+            className={styles.routeHeroIp}
+            height={1254}
+            priority
+            src={asset(visual.ip)}
+            unoptimized
+            width={1254}
+          />
+          <div className={styles.routeHeroMetrics}>
+            {visual.metrics.map((metric) => <span key={metric}>{metric}</span>)}
+          </div>
+        </div>
+      </header>
+    );
+  }
+
   return (
     <header className={styles.pageHero}>
       <span>UmaDev</span>
@@ -1559,10 +1582,35 @@ function PageHero({ title, sub }: { title: string; sub: string }) {
   );
 }
 
+function DocCode({ code }: { code: string }) {
+  const [copied, setCopied] = useState(false);
+  const handleCopy = () => {
+    navigator.clipboard.writeText(code);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+  return (
+    <div className={styles.docCodeWrapper}>
+      <div className={styles.docCodeHeader}>
+        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+          <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: "#ff5f56" }} />
+          <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: "#ffbd2e" }} />
+          <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: "#27c93f" }} />
+        </div>
+        <span style={{ fontFamily: "var(--font-mono), monospace", fontSize: "11px", color: "#6b7080" }}>Terminal / Config</span>
+        <button className={styles.docCodeCopy} onClick={handleCopy} type="button">
+          {copied ? "Copied ✓" : "Copy"}
+        </button>
+      </div>
+      <pre className={styles.docCode}><code>{code}</code></pre>
+    </div>
+  );
+}
+
 function DocBlockView({ block }: { block: DocBlock }) {
   if ("h" in block) return <h3 className={styles.docHeading}>{block.h}</h3>;
   if ("p" in block) return <p className={styles.docPara}>{block.p}</p>;
-  if ("c" in block) return <pre className={styles.docCode}>{block.c}</pre>;
+  if ("c" in block) return <DocCode code={block.c} />;
   if ("l" in block) {
     return (
       <ul className={styles.docList}>
@@ -1581,13 +1629,5 @@ function DocBlockView({ block }: { block: DocBlock }) {
         </div>
       ))}
     </div>
-  );
-}
-
-function GitHubIcon() {
-  return (
-    <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z" />
-    </svg>
   );
 }
