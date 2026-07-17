@@ -11,14 +11,34 @@ type DocCategory = { cat: string; items: readonly DocItem[] };
 
 const CHARS = "010101010101ABCDEF0123456789X%#$@";
 
-export function ScrambledHoverText({ text, className }: { text: string; className?: string }) {
-  const [displayText, setDisplayText] = useState(text);
-  const [prevText, setPrevText] = useState(text);
+const pipelineProgressClasses = [
+  styles.pipelineProgress0,
+  styles.pipelineProgress1,
+  styles.pipelineProgress2,
+  styles.pipelineProgress3,
+  styles.pipelineProgress4,
+  styles.pipelineProgress5,
+  styles.pipelineProgress6,
+  styles.pipelineProgress7,
+  styles.pipelineProgress8,
+  styles.pipelineProgress9,
+] as const;
 
-  if (text !== prevText) {
-    setPrevText(text);
-    setDisplayText(text);
-  }
+const revealDelayClasses = [
+  styles.revealDelay0,
+  styles.revealDelay1,
+  styles.revealDelay2,
+  styles.revealDelay3,
+  styles.revealDelay4,
+  styles.revealDelay5,
+  styles.revealDelay6,
+  styles.revealDelay7,
+  styles.revealDelay8,
+  styles.revealDelay9,
+] as const;
+
+export function ScrambledHoverText({ text, className }: { text: string; className?: string }) {
+  const [scrambledText, setScrambledText] = useState<string | null>(null);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -27,7 +47,7 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
     if (intervalRef.current) clearInterval(intervalRef.current);
 
     intervalRef.current = setInterval(() => {
-      setDisplayText(
+      setScrambledText(
         text
           .split("")
           .map((char, index) => {
@@ -40,7 +60,7 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
 
       iteration += 1 / 2;
       if (iteration >= text.length) {
-        setDisplayText(text);
+        setScrambledText(null);
         if (intervalRef.current) clearInterval(intervalRef.current);
       }
     }, 25);
@@ -48,7 +68,7 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
 
   const handleMouseLeave = () => {
     if (intervalRef.current) clearInterval(intervalRef.current);
-    setDisplayText(text);
+    setScrambledText(null);
   };
 
   useEffect(() => {
@@ -61,12 +81,11 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
     <span
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
-      className={className}
-      style={{ position: "relative", display: "inline-block" }}
+      className={`${styles.scrambledText} ${className ?? ""}`}
     >
-      <span style={{ visibility: "hidden" }} aria-hidden="true">{text}</span>
-      <span style={{ position: "absolute", left: 0, top: 0, width: "100%", height: "100%", whiteSpace: "nowrap" }}>
-        {displayText}
+      <span className={styles.scrambledMeasure} aria-hidden="true">{text}</span>
+      <span className={styles.scrambledOverlay}>
+        {scrambledText ?? text}
       </span>
     </span>
   );
@@ -332,8 +351,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
       descMeta.setAttribute(
         "content",
         lang === "zh"
-          ? "UmaDev 驱动你已登录的 Claude Code、Codex 或 OpenCode，由八个专家角色完成任务路由、可视计划、独立评审、持续上下文、真实验证与交付证明。"
-          : "UmaDev drives your logged-in Claude Code, Codex, or OpenCode with task routing, a visible plan, eight specialist roles, independent review, persistent context, deterministic verification, and delivery evidence."
+          ? "UmaDev 深度适配五个一等本机编码底座：Claude Code、Codex、OpenCode、Grok Build 与 Kimi Code。"
+          : "UmaDev deeply integrates five first-class local coding bases: Claude Code, Codex, OpenCode, Grok Build, and Kimi Code."
       );
     }
   }, [lang, view]);
@@ -533,8 +552,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
                   <p className={styles.heroDescription}>
                     {lang === "zh"
-                      ? "UmaDev 不提供模型，也不替代 Claude Code、Codex 或 OpenCode。它让你已登录的底座进入一套真实团队工作系统：先判断任务，再由产品、架构、设计、前后端、QA、安全和 DevOps 计划、执行、独立评审、验收与交付。"
-                      : "UmaDev provides no model and does not replace Claude Code, Codex, or OpenCode. It puts your logged-in base inside a real team system that routes, plans, builds, independently reviews, verifies, and delivers."}
+                      ? "UmaDev 不提供模型，也不替代底座。它深度适配五个一等本机 CLI；Claude Code、Codex、OpenCode 走厂商专属协议，Grok Build 与 Kimi Code 走厂商官方 ACP v1 接口和隔离厂商配置。随后由真实团队系统完成路由、计划、执行、独立评审、验收与交付。"
+                      : "UmaDev provides no model and replaces no base. It deeply integrates five first-class local CLIs: Claude Code, Codex, and OpenCode use vendor-specific protocols, while Grok Build and Kimi Code use official ACP v1 interfaces with isolated vendor profiles. The real-team system then routes, plans, builds, reviews, verifies, and delivers."}
                   </p>
 
                   <div className={styles.heroActionRow}>
@@ -547,7 +566,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
                   <dl className={styles.heroFacts}>
                     <div><dt>8</dt><dd>{lang === "zh" ? "专家角色" : "SPECIALIST ROLES"}</dd></div>
-                    <div><dt>3</dt><dd>{lang === "zh" ? "本机底座" : "LOCAL BASES"}</dd></div>
+                    <div><dt>4</dt><dd>{lang === "zh" ? "本机底座" : "LOCAL BASES"}</dd></div>
                     <div><dt>113</dt><dd>{lang === "zh" ? "治理检查" : "GOVERNANCE CHECKS"}</dd></div>
                   </dl>
                 </div>
@@ -603,7 +622,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   </div>
 
                   <div className={styles.heroSystemFoot}>
-                    <div><span>BASE</span><strong>CLAUDE CODE / CODEX / OPENCODE</strong></div>
+                    <div><span>BASE</span><strong>4 FIRST-CLASS / DEEP</strong></div>
                     <div><span>PLAN</span><strong>OWNED DAG · LIVE STEERING</strong></div>
                     <div><span>PROOF</span><strong>VERIFY · SCORECARD</strong></div>
                   </div>
@@ -625,7 +644,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                       <span className={styles.marqueeItem}>Claude Code</span><span className={styles.marqueeSep}>◆</span>
                       <span className={styles.marqueeItem}>Codex</span><span className={styles.marqueeSepPurple}>◆</span>
                       <span className={styles.marqueeItem}>OpenCode</span><span className={styles.marqueeSep}>◆</span>
-                      <span className={styles.marqueeText}>{lang === "zh" ? "不接外部 API · 不保存登录 · 底座用它自己的模型" : "NO EXTERNAL API KEY · NO LOGIN SAVED · BASE USES ITS OWN MODEL"}</span><span className={styles.marqueeSepPurple}>◆</span>
+                      <span className={styles.marqueeItem}>Grok Build</span><span className={styles.marqueeSep}>◆</span>
+                      <span className={styles.marqueeText}>{lang === "zh" ? "UmaDev 不持有模型 API Key · 不保存登录 · 底座用它自己的模型" : "NO UMADEV-OWNED MODEL API KEY · NO LOGIN SAVED · BASE USES ITS OWN MODEL"}</span><span className={styles.marqueeSepPurple}>◆</span>
                     </React.Fragment>
                   ))}
                 </div>
@@ -733,15 +753,11 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                 {/* Horizontal Progress Bar */}
                 <div className={styles.pipelineProgressBarWrapper}>
                   <div
-                    className={styles.pipelineProgressBarLine}
-                    style={{
-                      "--progress-width": `${(activeStageIdx / Math.max(t.stages.length - 1, 1)) * 100}%`
-                    } as React.CSSProperties}
+                    className={`${styles.pipelineProgressBarLine} ${pipelineProgressClasses[Math.min(activeStageIdx, pipelineProgressClasses.length - 1)]}`}
                   />
                   <div className={styles.pipelineProgressNodes}>
                     {t.stages.map((stage, index) => {
                       const isGate = stage.gate;
-                      const color = isGate ? "#ff2a85" : "#00d2ff";
                       const stepNum = String(index + 1).padStart(2, "0");
                       const isActive = index === activeStageIdx;
                       const isCompleted = index <= activeStageIdx;
@@ -750,12 +766,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                         <button
                           key={stage.key}
                           type="button"
-                          className={`${styles.pipelineNodeButton} ${isActive ? styles.pipelineNodeActive : ""} ${isCompleted ? styles.pipelineNodeCompleted : ""}`}
+                          className={`${styles.pipelineNodeButton} ${isGate ? styles.toneMagenta : styles.toneCyan} ${isActive ? styles.pipelineNodeActive : ""} ${isCompleted ? styles.pipelineNodeCompleted : ""}`}
                           onClick={() => setActiveStageIdx(index)}
-                          style={{
-                            "--node-color": color,
-                            "--node-color-rgba": `${color}2a`
-                          } as React.CSSProperties}
                         >
                           <span className={styles.pipelineNodeDot}>{stepNum}</span>
                           <span className={styles.pipelineNodeLabel}>{stage.label}</span>
@@ -771,23 +783,19 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                     const stage = t.stages[activeStageIdx];
                     const isGate = stage.gate;
                     const isMicro = stage.key === "clarify";
-                    const color = isGate ? "#ff2a85" : "#00d2ff";
 
                     return (
-                      <div className={styles.pipelinePanelContent} key={stage.key}>
+                      <div className={`${styles.pipelinePanelContent} ${isGate ? styles.toneMagenta : styles.toneCyan}`} key={stage.key}>
                         <div className={styles.pipelinePanelLeft}>
                           <div className={styles.pipelineMetaRow}>
                             <span className={styles.pipelineName}>{stage.label}</span>
-                            <span
-                              className={`${styles.pipelineBadge} ${styles.mono}`}
-                              style={{ background: `${color}14`, color: color }}
-                            >
+                            <span className={`${styles.pipelineBadge} ${styles.mono}`}>
                               {stage.key}
                             </span>
                             {isGate && <span className={styles.pipelineGateLabel}>{lang === "zh" ? "确认门禁" : "CONFIRM GATE"}</span>}
                             {isMicro && <span className={styles.pipelineMicroLabel}>{lang === "zh" ? "微阶段" : "MICRO PHASE"}</span>}
                           </div>
-                          <div className={styles.pipelineDetailText} style={{ marginTop: "14px", fontSize: "16px", minHeight: "60px" }}>
+                          <div className={`${styles.pipelineDetailText} ${styles.pipelineDetailTextExpanded}`}>
                             {stage.role}
                           </div>
                         </div>
@@ -795,14 +803,14 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                         <div className={styles.pipelinePanelRight}>
                           <div className={styles.pipelineExplorer}>
                             <div className={styles.pipelineExplorerHeader}>
-                              <span style={{ fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.08em", color: "#8a8f9c" }}>
+                              <span className={styles.pipelineExplorerHeading}>
                                 {lang === "zh" ? "OUTPUT / 生成交付产物" : "OUTPUT / DELIVERABLES"}
                               </span>
                             </div>
                             <div className={styles.pipelineExplorerList}>
                               {stage.files.map((file) => (
                                 <div key={file} className={styles.pipelineExplorerItem}>
-                                  <span style={{ color: color, fontSize: "10px", fontFamily: "var(--font-mono), monospace" }}>FILE</span>
+                                  <span className={styles.pipelineExplorerFileType}>FILE</span>
                                   <span className={`${styles.pipelineExplorerName} ${styles.mono}`}>{file}</span>
                                 </div>
                               ))}
@@ -819,7 +827,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
             {/* GOVERNANCE STATS */}
             <section id="governance" className={styles.statsSection}>
               <div className={styles.statsSectionHeader}>
-                <div style={{ maxWidth: "640px" }}>
+                <div className={styles.statsHeadingContent}>
                   <h2 className={styles.statsSectionTitle}>
                     {lang === "zh" ? "治理与质量" : "Governance & quality"}
                   </h2>
@@ -828,29 +836,27 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
               <div className={styles.statsGrid}>
                 {[
-                  { count: 34, label: lang === "zh" ? "条正式规范 Clause" : "Normative Spec Clauses", color: "#00d2ff", active: false },
-                  { count: 113, label: lang === "zh" ? "条内容治理检查" : "Governance Content Checks", color: "#ff2a85", active: false },
-                  { count: 2, label: lang === "zh" ? "道真正暂停的人工确认门" : "Human Gates That Actually Pause", color: "#00d2ff", active: false },
-                  { count: 90, label: lang === "zh" ? "默认质量门通过线" : "Default Quality Gate Bar", color: "#00d2ff", active: true, suffix: lang === "zh" ? "分" : " pts" },
+                  { count: 34, label: lang === "zh" ? "条正式规范 Clause" : "Normative Spec Clauses", tone: "cyan", active: false },
+                  { count: 113, label: lang === "zh" ? "条内容治理检查" : "Governance Content Checks", tone: "magenta", active: false },
+                  { count: 2, label: lang === "zh" ? "道真正暂停的人工确认门" : "Human Gates That Actually Pause", tone: "cyan", active: false },
+                  { count: 90, label: lang === "zh" ? "默认质量门通过线" : "Default Quality Gate Bar", tone: "cyan", active: true, suffix: lang === "zh" ? "分" : " pts" },
                 ].map((item, idx) => (
                   <div
                     key={idx}
-                    className={`${item.active ? styles.statCardActive : styles.statCard} ${styles.reveal} ${styles.tilt}`}
+                    className={`${item.active ? styles.statCardActive : styles.statCard} ${item.tone === "magenta" ? styles.toneMagenta : styles.toneCyan} ${styles.reveal} ${styles.tilt} ${revealDelayClasses[idx]}`}
                     onMouseMove={handleTiltMove}
                     onMouseLeave={handleTiltLeave}
-                    style={{ transitionDelay: `${idx * 40}ms` }}
                   >
-                    <div style={{ display: "flex", alignItems: "baseline", gap: "6px" }}>
+                    <div className={styles.statValueRow}>
                       <div
                         className={`${styles.statNumber} ${styles.mono}`}
-                        style={{ color: item.color }}
                         data-count={item.count}
                       >
                         {item.count}
                       </div>
-                      {item.suffix && <span style={{ fontSize: "24px", color: item.color }}>{item.suffix}</span>}
+                      {item.suffix && <span className={styles.statSuffix}>{item.suffix}</span>}
                     </div>
-                    <div style={{ marginTop: "12px", fontSize: "15px", color: item.active ? "#e2ff8a" : "#b4b9c4" }}>{item.label}</div>
+                    <div className={item.active ? styles.statLabelActive : styles.statLabel}>{item.label}</div>
                   </div>
                 ))}
               </div>
@@ -874,15 +880,14 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   ["CONTEXT", lang === "zh" ? "长任务不断线" : "Long-running continuity", lang === "zh" ? "会话持久化、压缩、恢复和底座切换都会携带对话、计划与团队黑板。" : "Resume, compaction, and base switching carry transcript, plan, and blackboard context."],
                   ["CODEBASE", lang === "zh" ? "理解现有代码库" : "Understands the repository", lang === "zh" ? "repo-map 解析符号与 import 边，按任务把最相关文件和结构交给底座。" : "The repo map resolves symbols and import edges, then ranks files relevant to the task."],
                   ["MEMORY", lang === "zh" ? "项目越做越懂" : "Learns the project", lang === "zh" ? "项目事实、踩坑、验证过的经验和运行笔记跨任务保留，并在需要时召回。" : "Project facts, pitfalls, verified lessons, and run notes persist and are recalled when useful."],
-                  ["NATIVE", lang === "zh" ? "底座能力不打折" : "Native base tools preserved", lang === "zh" ? "搜索、研究、子 Agent 与后台任务继续可用；完成前会收齐后台结果。" : "Search, research, sub-agents, and background tasks stay available and are collected before completion."],
+                  ["CAPS", lang === "zh" ? "五底座一等适配，能力按事实启用" : "Five first-class integrations; capabilities are negotiated", lang === "zh" ? "Claude Code、Codex、OpenCode 的厂商专属协议驱动与 Grok Build、Kimi Code 的官方 ACP 驱动地位对等；权限、恢复与扩展能力只按各厂商真实契约启用。" : "Vendor-specific drivers for Claude Code, Codex, and OpenCode are peers with the isolated official ACP drivers for Grok Build and Kimi Code; permissions, resume, and extensions activate only from each vendor's real contract."],
                   ["TRUST", lang === "zh" ? "可控的自动化" : "Controlled autonomy", lang === "zh" ? "plan / guarded / auto 信任梯度；推送、部署等不可逆动作始终需要确认。" : "Plan / guarded / auto trust tiers; irreversible push and deploy actions always confirm."],
                 ].map(([name, role, desc], i) => (
                   <div
                     key={name}
-                    className={`${styles.crateCard} ${styles.reveal} ${styles.tilt}`}
+                    className={`${styles.crateCard} ${styles.reveal} ${styles.tilt} ${revealDelayClasses[i]}`}
                     onMouseMove={handleTiltMove}
                     onMouseLeave={handleTiltLeave}
-                    style={{ transitionDelay: `${i * 40}ms` }}
                   >
                     <div className={styles.crateName}>{name}</div>
                     <div className={styles.crateRole}>{role}</div>
@@ -899,30 +904,30 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   <h2 className={styles.retrieveTitle}>
                     {lang === "zh" ? "理解你的项目" : "Understands your project"}
                   </h2>
-                  <p style={{ maxWidth: "540px", marginTop: "18px", color: "#9aa1ad", lineHeight: 1.8, fontSize: "15px" }}>
+                  <p className={styles.retrieveDescription}>
                     {lang === "zh"
                       ? "不是把一大段通用 Prompt 塞给底座。UmaDev 会把代码结构、当前任务、项目事实、踩坑经验和相关工程标准压缩成这一轮真正需要的上下文。"
                       : "It does not dump a generic mega-prompt into the base. UmaDev composes the repository structure, current task, project facts, recalled pitfalls, and relevant standards into the context this turn needs."}
                   </p>
-                  <div className={`${styles.mono} ${styles.reveal}`} style={{ display: "flex", flexDirection: "column", gap: "8px", fontSize: "13.5px", color: "#8a8f9c", marginTop: "24px" }}>
-                    <span><span style={{ color: "#00d2ff" }}>$</span> umadev knowledge-manage add ./team-docs</span>
-                    <span><span style={{ color: "#00d2ff" }}>$</span> umadev knowledge-manage search {lang === "zh" ? '"支付 webhook 幂等"' : '"payment webhook idempotency"'}</span>
+                  <div className={`${styles.mono} ${styles.reveal} ${styles.retrieveCommands}`}>
+                    <span><span className={styles.retrievePrompt}>$</span> umadev knowledge-manage add ./team-docs</span>
+                    <span><span className={styles.retrievePrompt}>$</span> umadev knowledge-manage search {lang === "zh" ? '"支付 webhook 幂等"' : '"payment webhook idempotency"'}</span>
                   </div>
                 </div>
 
-                <div className={`${styles.reveal}`} style={{ position: "relative", padding: "30px", borderRadius: "20px", background: "#0c0e14", border: "1px solid rgba(255, 255, 255, 0.08)", overflow: "hidden" }}>
-                  <div className={styles.mono} style={{ display: "flex", flexDirection: "column", gap: "11px", fontSize: "13px" }}>
+                <div className={`${styles.reveal} ${styles.retrievePanel}`}>
+                  <div className={`${styles.mono} ${styles.retrieveSteps}`}>
                     {[
-                      { num: "01", name: lang === "zh" ? "任务路由" : "Task route", desc: lang === "zh" ? "只取当前路径需要的上下文" : "only the context this route needs", color: "#ff2a85" },
-                      { num: "02", name: lang === "zh" ? "repo-map" : "Repo map", desc: lang === "zh" ? "符号 · import 边 · 相关文件" : "symbols · import edges · ranked files", color: "#00d2ff" },
-                      { num: "03", name: lang === "zh" ? "本地混合检索" : "Local hybrid retrieval", desc: lang === "zh" ? "BM25 + 本地向量 + HyDE" : "BM25 + local vectors + HyDE", color: "#ff2a85" },
-                      { num: "04", name: lang === "zh" ? "项目记忆" : "Project memory", desc: lang === "zh" ? "事实 · 踩坑 · 经验 · 运行笔记" : "facts · pitfalls · lessons · run notes", color: "#00d2ff" },
-                      { num: "05", name: lang === "zh" ? "按需注入" : "Proportional firmware", desc: lang === "zh" ? "→ 你已登录的底座" : "→ your logged-in base", color: "#00d2ff" },
+                      { num: "01", name: lang === "zh" ? "任务路由" : "Task route", desc: lang === "zh" ? "只取当前路径需要的上下文" : "only the context this route needs", tone: "magenta" },
+                      { num: "02", name: lang === "zh" ? "repo-map" : "Repo map", desc: lang === "zh" ? "符号 · import 边 · 相关文件" : "symbols · import edges · ranked files", tone: "cyan" },
+                      { num: "03", name: lang === "zh" ? "本地混合检索" : "Local hybrid retrieval", desc: lang === "zh" ? "BM25 + 本地向量 + HyDE" : "BM25 + local vectors + HyDE", tone: "magenta" },
+                      { num: "04", name: lang === "zh" ? "项目记忆" : "Project memory", desc: lang === "zh" ? "事实 · 踩坑 · 经验 · 运行笔记" : "facts · pitfalls · lessons · run notes", tone: "cyan" },
+                      { num: "05", name: lang === "zh" ? "按需注入" : "Proportional firmware", desc: lang === "zh" ? "→ 你已登录的底座" : "→ your logged-in base", tone: "cyan" },
                     ].map((step) => (
-                      <div key={step.num} style={{ display: "flex", alignItems: "center", gap: "12px", padding: "12px 14px", borderRadius: "10px", background: "#0a0b10", borderLeft: `2px solid ${step.color}` }}>
-                        <span style={{ color: step.color, fontSize: "12px" }}>{step.num}</span>
-                        <span style={{ color: "#f4f6f2", fontSize: "13.5px", flex: 1 }}>{step.name}</span>
-                        <span style={{ color: "#8a8f9c", fontSize: "12px" }}>{step.desc}</span>
+                      <div key={step.num} className={`${styles.retrieveStep} ${step.tone === "magenta" ? styles.toneMagenta : styles.toneCyan}`}>
+                        <span className={styles.retrieveStepNumber}>{step.num}</span>
+                        <span className={styles.retrieveStepName}>{step.name}</span>
+                        <span className={styles.retrieveStepDescription}>{step.desc}</span>
                       </div>
                     ))}
                   </div>
@@ -968,7 +973,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                 </h2>
                 <div className={styles.spaceCtaConsole}>
                   <span className={styles.spaceCtaConsolePrompt}>$</span> npm install -g umadev
-                  <button className={`${styles.umaCopy} ${styles.umaMagnet}`} style={{ marginLeft: "12px", padding: "6px 12px", borderRadius: "8px", border: "none", background: "#00d2ff", color: "#07080c", fontFamily: "var(--font-mono), monospace", fontSize: "12px", fontWeight: 600, cursor: "pointer" }} onClick={copyInstall} onMouseMove={handleMagnetMove} onMouseLeave={handleMagnetLeave}>
+                  <button className={`${styles.umaCopy} ${styles.umaMagnet} ${styles.spaceCtaCopy}`} onClick={copyInstall} onMouseMove={handleMagnetMove} onMouseLeave={handleMagnetLeave}>
                     {copied ? (lang === "zh" ? "已复制 ✓" : "Copied ✓") : (lang === "zh" ? "复制" : "Copy")}
                   </button>
                 </div>
@@ -1312,7 +1317,7 @@ const pageHeroVisuals: Record<PageHeroVariant, { art: string; ip: string; label:
     art: "/assets/umadev/vectors/docs-orbit.svg",
     ip: "/assets/umadev/generated/docs-ip.png",
     label: "UmaDev / Documentation",
-    metrics: ["08 TEAM ROLES", "05 TASK ROUTES", "03 LOCAL BASES"],
+    metrics: ["08 TEAM ROLES", "05 TASK ROUTES", "04 LOCAL BASES"],
   },
   gallery: {
     art: "/assets/umadev/vectors/gallery-aperture.svg",
@@ -1390,12 +1395,12 @@ function DocCode({ code }: { code: string }) {
   return (
     <div className={styles.docCodeWrapper}>
       <div className={styles.docCodeHeader}>
-        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-          <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: "#ff5f56" }} />
-          <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: "#ffbd2e" }} />
-          <span style={{ width: "9px", height: "9px", borderRadius: "50%", background: "#27c93f" }} />
+        <div className={styles.docCodeTrafficLights} aria-hidden="true">
+          <span className={`${styles.docCodeTrafficLight} ${styles.docCodeTrafficLightClose}`} />
+          <span className={`${styles.docCodeTrafficLight} ${styles.docCodeTrafficLightMinimize}`} />
+          <span className={`${styles.docCodeTrafficLight} ${styles.docCodeTrafficLightExpand}`} />
         </div>
-        <span style={{ fontFamily: "var(--font-mono), monospace", fontSize: "11px", color: "#6b7080" }}>Terminal / Config</span>
+        <span className={styles.docCodeLabel}>Terminal / Config</span>
         <button className={styles.docCodeCopy} onClick={handleCopy} type="button">
           {copied ? "Copied ✓" : "Copy"}
         </button>

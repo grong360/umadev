@@ -16,7 +16,7 @@ export const i18n = {
       title1: "一个 Agent",
       titleHi: "一整支开发团队",
       title2: "驱动你的底座干活",
-      sub: "UmaDev 不提供模型，也不替代 Claude Code / Codex / OpenCode。它把你已经登录的底座装进一套真实团队工作系统：产品、架构、设计、前后端、QA、安全和 DevOps 分工协作，先判断任务，再计划、执行、交叉评审、验收和交付。",
+      sub: "UmaDev 不提供模型，也不替代任何底座。它深度适配五个一等本机 CLI；Claude Code、Codex、OpenCode 使用厂商专属协议，Grok Build 与 Kimi Code 使用官方 ACP v1 接口和隔离厂商配置。五者共享同一产品交互契约，再由真实团队系统完成路由、计划、执行、评审、验收与交付。",
       cta1: "快速开始",
       cta2: "阅读文档",
       copy: "复制",
@@ -25,15 +25,15 @@ export const i18n = {
         ["8", "专家角色"],
         ["113", "治理规则"],
         ["5", "任务路径"],
-        ["3", "本机底座"],
+        ["5", "本机底座"],
       ],
     },
     trust: "驱动你已登录的本机编码底座",
-    backends: ["Claude Code", "Codex CLI", "OpenCode"],
+    backends: ["Claude Code", "Codex CLI", "OpenCode", "Grok Build", "Kimi Code"],
     mascots: {
       eyebrow: "认识你的 AI 开发团队 (Your AI Dev Team)",
       title: "八个专家角色，各自交付真实产物",
-      desc: "不是一个黑盒，而是一支分工的团队：产品经理拆需求、架构师定契约、设计师立设计系统、前后端真建真测、QA 出运行时证明、安全审攻击面、DevOps 出部署证明。实干角色（Doer）串行写主干，评审角色（Critic）在只读分叉上并行把关，全员只通过黑板交接、绝不互聊——既拿到并行红利，又躲开多 Agent 的脆弱。八个角色共用你已登录的同一个底座大脑，无需多买一份 API Key。",
+      desc: "不是一个黑盒，而是一支分工的团队：产品经理拆需求、架构师定契约、设计师立设计系统、前后端真建真测、QA 出运行时证明、安全审攻击面、DevOps 出部署证明。实干角色（Doer）串行写主干，评审角色（Critic）在新的只读会话中并行把关；底座无法证明只读时，该评审路径会拒绝启动。全员只通过黑板交接、绝不互聊。八个角色共用你已登录的同一个底座大脑，无需多买一份 API Key。",
       deliversLabel: "产物",
       lead: {
         img: "/assets/umadev/mascot-thumb-lead.png",
@@ -122,7 +122,7 @@ export const i18n = {
       layers: [
         { k: "TUI / CLI", d: "你和 UmaDev 交流的地方：聊天界面 + 命令入口。" },
         { k: "团队调度（含协调者）", d: "由底座的模型判断这一步，协调者拥有并驱动可见计划，按步调度八个角色团队。" },
-        { k: "Runtime / 底座", d: "把任务交给 Claude Code / Codex CLI / OpenCode 写真实代码。" },
+        { k: "Runtime / 底座", d: "把任务交给五个一等深度适配底座之一：3 个厂商专属协议驱动 + 2 个隔离厂商配置的官方 ACP v1 驱动。" },
         { k: "治理 · 质量 · 证据", d: "L0 固件常驻注入设计系统 / 知识库 / 踩坑记忆，每次调用留下审计。" },
       ],
     },
@@ -147,20 +147,22 @@ export const i18n = {
     ],
     modes: {
       eyebrow: "运行模式",
-      title: "三种本机 CLI，驱动它写真实代码",
-      desc: "当前支持 Claude Code、Codex CLI、OpenCode。UmaDev 复用你已登录的本机工具，不接管账号、不保存登录信息。",
+      title: "五种本机 CLI，驱动它写真实代码",
+      desc: "严格 5 个：Claude Code、Codex、OpenCode 使用各自厂商会话；Grok Build 与 Kimi Code 使用官方 ACP v1 和隔离厂商配置。UmaDev 不接管账号、不保存登录信息。",
       whoLabel: "适合谁",
       callLabel: "UmaDev 如何调用",
       tabs: [
-        { id: "claude-code", name: "Claude Code", bin: "claude", cmd: "claude --print --output-format text", who: "已经在用 Claude Code 的用户" },
-        { id: "codex", name: "Codex CLI", bin: "codex", cmd: "codex exec --sandbox workspace-write", who: "已经在用 Codex CLI 的用户" },
-        { id: "opencode", name: "OpenCode", bin: "opencode", cmd: "opencode run", who: "已经在用 OpenCode 的用户" },
+        { id: "claude-code", name: "Claude Code", bin: "claude", cmd: "claude --print --input-format stream-json --output-format stream-json", who: "已经在用 Claude Code 的用户" },
+        { id: "codex", name: "Codex CLI", bin: "codex", cmd: "codex app-server", who: "已经在用 Codex CLI 的用户" },
+        { id: "opencode", name: "OpenCode", bin: "opencode", cmd: "opencode serve --hostname 127.0.0.1 --port 0", who: "已经在用 OpenCode 的用户" },
+        { id: "grok-build", name: "Grok Build", bin: "grok", cmd: "grok --no-auto-update --cwd <workspace> --permission-mode <mode> <profile flags> agent stdio", who: "已缓存登录或设置 XAI_API_KEY；UmaDev 不自动 OAuth、不拉起浏览器" },
+        { id: "kimi-code", name: "Kimi Code", bin: "kimi", cmd: "kimi acp", who: "先自行运行 kimi login；UmaDev 只复验登录且不打开浏览器" },
       ],
       cards: [
-        { title: "复用本机登录态", cmd: "/claude · /codex · /opencode", desc: "继续使用你已经登录的 Claude Code、Codex CLI 或 OpenCode，让它们负责真实读写文件与运行命令。" },
-        { title: "非交互命令驱动", cmd: "subprocess", desc: "UmaDev 作为团队协调者，只负责分工编排、阶段门、治理规则和证据链；代码执行交给本机 CLI。" },
+        { title: "复用底座自己的配置", cmd: "/claude · /codex · /opencode · /grok · /kimi", desc: "登录、订阅、API key 与模型都留在底座；UmaDev 只驱动本机子进程。" },
+        { title: "后台机器协议会话", cmd: "subprocess", desc: "五个底座都以常驻双向会话工作；后台子进程不渲染厂商 TUI，但追问、审批、工具事件和后续回合仍与 UmaDev 用户实时往返。" },
       ],
-      notes: ["仅支持三种本机 CLI", "继续用你原来的账号与订阅", "底座负责真实读写文件、运行命令", "UmaDev 负责流程、规则、质量门、证据链"],
+      notes: ["恰好 5 个一等深度适配底座，协议差异不是产品等级", "两个 ACP 底座的认证、权限与恢复相互隔离", "Kimi Code 固定官方源码审计版本且不会自动打开登录浏览器", "umadev install 安装治理集成，不安装底座"],
     },
     demo: { replay: "重新播放" },
     gov: {
@@ -187,7 +189,7 @@ export const i18n = {
     },
     cta: {
       title: "免费、开源，一句话召集你的团队",
-      sub: "MIT 许可 · Rust 单二进制 · 本地运行。八个角色共用你已登录的 Claude Code / Codex CLI / OpenCode，不保存你的登录信息。",
+      sub: "MIT 许可 · Rust 单二进制 · 本地运行。八个角色共用你已配置的五个一等底座之一，不保存底座登录信息。",
       btn1: "在 GitHub 上开始",
       btn2: "阅读文档",
       note: "npm install -g umadev",
@@ -196,7 +198,7 @@ export const i18n = {
     galleryPage: { title: "形象相册", sub: "UmaDev 的 IP 形象集 —— 点击任意一张放大查看。" },
     logPage: { title: "更新日志", sub: "UmaDev 各版本的新增、改进与安全更新。", current: "最新", more: "展开其余 {n} 项", less: "收起" },
     footer: {
-      blurb: "一个模拟真实开发团队工作的 Agent，驱动你已经在用的 Claude Code / Codex / OpenCode 干活，把需求变成能运行、可验证、可交付的真实项目。",
+      blurb: "一个模拟真实开发团队工作的 Agent，驱动五个一等本机编码底座之一，把需求变成能运行、可验证、可交付的真实项目。",
       cols: [
         { h: "产品", links: [{ t: "流水线设计" }, { t: "运行模式" }, { t: "治理规则" }, { t: "质量门" }, { t: "知识库" }] },
         { h: "文档", links: [{ t: "快速体验" }, { t: "命令大全" }, { t: "配置" }, { t: "Rust 架构" }, { t: "规范 SPEC" }] },
@@ -206,7 +208,7 @@ export const i18n = {
     },
     demoScript: [
       { type: "prompt", text: "做一个课程预约小程序，用户预约/取消，管理员管理课程。" },
-      { type: "sys", text: "✦ 已澄清需求 · 自动模式 · 底座 claude-code" },
+      { type: "sys", text: "[system] 已澄清需求 · 自动模式 · 底座 claude-code" },
       { type: "stage", text: "[1/9] research   调研竞品 / 领域规范 / 真实评价…" },
       { type: "file", text: "→ output/booking-research.md" },
       { type: "stage", text: "[2/9] docs       生成 PRD · 架构 · UI/UX…" },
@@ -273,7 +275,7 @@ export const i18n = {
       title1: "One coding agent",
       titleHi: "a whole dev team",
       title2: "ships products",
-      sub: "UmaDev provides no model and does not replace Claude Code, Codex, or OpenCode. It puts the backend you already logged into inside a real team system: product, architecture, design, frontend, backend, QA, security, and DevOps route, plan, build, cross-review, verify, and deliver together.",
+      sub: "UmaDev provides no model and replaces no base. It deeply integrates five first-class local CLIs: Claude Code, Codex, and OpenCode use vendor-specific protocols; Grok Build and Kimi Code use official ACP v1 interfaces with isolated vendor profiles. All five share one product interaction contract before the real-team system routes, plans, builds, cross-reviews, verifies, and delivers.",
       cta1: "Get started",
       cta2: "Read the docs",
       copy: "Copy",
@@ -282,15 +284,15 @@ export const i18n = {
         ["8", "Specialist roles"],
         ["113", "Governance rules"],
         ["5", "Task routes"],
-        ["3", "Local backends"],
+        ["5", "Local backends"],
       ],
     },
     trust: "Drives the local coding CLI you already logged into",
-    backends: ["Claude Code", "Codex CLI", "OpenCode"],
+    backends: ["Claude Code", "Codex CLI", "OpenCode", "Grok Build", "Kimi Code"],
     mascots: {
       eyebrow: "Meet Your AI Dev Team",
       title: "Eight specialists, each shipping a real artifact",
-      desc: "Not a black box — a team with a division of labor: the PM scopes the need, the architect locks the contract, the designer stands up the design system, frontend and backend really build and test, QA produces the runtime proof, security audits the attack surface, DevOps ships the deploy proof. Doers write the trunk serially; critics review in parallel on read-only forks; everyone hands off through the blackboard and never chats peer-to-peer — so you get the parallel upside without multi-agent fragility. All eight roles share the one base brain you already logged into — no extra API key to buy.",
+      desc: "Not a black box — a team with a division of labor: the PM scopes the need, the architect locks the contract, the designer stands up the design system, frontend and backend really build and test, QA produces runtime proof, security audits the attack surface, and DevOps ships deploy proof. Doers write the trunk serially; critics review in fresh read-only sessions, and UmaDev refuses that review path when the base cannot prove read-only. Everyone hands off through the blackboard. All eight roles share the one base brain you already logged into — no extra API key to buy.",
       deliversLabel: "Ships",
       lead: {
         img: "/assets/umadev/mascot-thumb-lead.png",
@@ -379,7 +381,7 @@ export const i18n = {
       layers: [
         { k: "TUI / CLI", d: "Where you talk to UmaDev — a chat interface plus command entry." },
         { k: "Team orchestration (+ coordinator)", d: "Lets the base's model judge the turn; the coordinator owns and drives a visible plan and schedules the eight-role team step by step." },
-        { k: "Runtime / backend", d: "Hands tasks to Claude Code / Codex CLI / OpenCode to write real code." },
+        { k: "Runtime / backend", d: "Hands tasks to one of five first-class, deeply integrated bases: three vendor-specific drivers plus two isolated official ACP v1 drivers." },
         { k: "Governance · quality · evidence", d: "L0 firmware always injects the design system / knowledge / pitfall memory; every call leaves an audit trail." },
       ],
     },
@@ -404,20 +406,22 @@ export const i18n = {
     ],
     modes: {
       eyebrow: "Run modes",
-      title: "Three local CLIs that write real code",
-      desc: "Current support is Claude Code, Codex CLI and OpenCode. UmaDev reuses your logged-in local tool; it does not take over accounts or store logins.",
+      title: "Five local CLIs that write real code",
+      desc: "All five bases receive first-class, deep integration. Claude Code, Codex, and OpenCode use vendor-specific protocol drivers; Grok Build and Kimi Code use official ACP v1 interfaces through a hardened core and isolated vendor profiles. UmaDev does not take over accounts or store logins.",
       whoLabel: "Best for",
       callLabel: "How UmaDev calls it",
       tabs: [
-        { id: "claude-code", name: "Claude Code", bin: "claude", cmd: "claude --print --output-format text", who: "People already using Claude Code" },
-        { id: "codex", name: "Codex CLI", bin: "codex", cmd: "codex exec --sandbox workspace-write", who: "People already using the Codex CLI" },
-        { id: "opencode", name: "OpenCode", bin: "opencode", cmd: "opencode run", who: "People already using OpenCode" },
+        { id: "claude-code", name: "Claude Code", bin: "claude", cmd: "claude --print --input-format stream-json --output-format stream-json", who: "People already using Claude Code" },
+        { id: "codex", name: "Codex CLI", bin: "codex", cmd: "codex app-server", who: "People already using the Codex CLI" },
+        { id: "opencode", name: "OpenCode", bin: "opencode", cmd: "opencode serve --hostname 127.0.0.1 --port 0", who: "People already using OpenCode" },
+        { id: "grok-build", name: "Grok Build", bin: "grok", cmd: "grok --no-auto-update --cwd <workspace> --permission-mode <mode> <profile flags> agent stdio", who: "Cached login or XAI_API_KEY; UmaDev never auto-starts OAuth or a browser" },
+        { id: "kimi-code", name: "Kimi Code", bin: "kimi", cmd: "kimi acp", who: "Run kimi login yourself first; UmaDev only revalidates it and never opens a browser" },
       ],
       cards: [
-        { title: "Reuse local login state", cmd: "/claude · /codex · /opencode", desc: "Keep using the Claude Code, Codex CLI or OpenCode account you already logged into; those tools do the real file writes and commands." },
-        { title: "Non-interactive command driving", cmd: "subprocess", desc: "UmaDev acts as the team's coordinator for the division of labor, gates, governance and evidence; code execution stays in the local CLI." },
+        { title: "Reuse vendor login state", cmd: "/claude · /codex · /opencode · /grok · /kimi", desc: "Authenticate with the base CLI itself. UmaDev reuses that vendor-owned session; the selected CLI performs the real file writes and commands." },
+        { title: "Background machine-protocol sessions", cmd: "subprocess", desc: "All five bases run as persistent bidirectional sessions. The child omits the vendor TUI, while questions, approvals, tool events, and follow-up turns still reach the UmaDev user in real time." },
       ],
-      notes: ["Only three local CLIs are supported", "Keep your existing account & subscription", "The backend reads/writes real files & runs commands", "UmaDev owns flow, rules, quality gate & evidence"],
+      notes: ["Exactly five first-class deep integrations; protocol paths are not product tiers", "The two ACP bases keep isolated auth, permission, resume, and OS contracts", "Kimi Code is exact-source pinned and never auto-opens a login browser", "umadev install installs governance integration, not the vendor CLI"],
     },
     demo: { replay: "Replay" },
     gov: {
@@ -444,7 +448,7 @@ export const i18n = {
     },
     cta: {
       title: "Free, open source — one sentence to assemble your team",
-      sub: "MIT licensed · single Rust binary · runs locally. All eight roles share the Claude Code / Codex CLI / OpenCode you already logged into, and it stores no logins.",
+      sub: "MIT licensed · single Rust binary · runs locally. All eight roles share one of five configured base CLIs, and UmaDev stores no vendor login.",
       btn1: "Start on GitHub",
       btn2: "Read the docs",
       note: "npm install -g umadev",
@@ -453,7 +457,7 @@ export const i18n = {
     galleryPage: { title: "Mascot gallery", sub: "The UmaDev IP mascot set — click any image to enlarge." },
     logPage: { title: "Changelog", sub: "Every UmaDev release — what was added, improved and secured.", current: "Latest", more: "Show {n} more", less: "Show less" },
     footer: {
-      blurb: "A coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use, turning one idea into a shippable, auditable, commercial-grade app.",
+      blurb: "A coding agent that works like a real dev team, driving one of five local coding CLIs and turning an idea into a shippable, auditable, commercial-grade app.",
       cols: [
         { h: "Product", links: [{ t: "Pipeline" }, { t: "Run modes" }, { t: "Governance" }, { t: "Quality gate" }, { t: "Knowledge base" }] },
         { h: "Docs", links: [{ t: "Quick start" }, { t: "Command reference" }, { t: "Configuration" }, { t: "Rust architecture" }, { t: "Spec" }] },
@@ -463,7 +467,7 @@ export const i18n = {
     },
     demoScript: [
       { type: "prompt", text: "Build a class-booking app: users book/cancel, admins manage classes." },
-      { type: "sys", text: "✦ Requirement clarified · auto mode · backend claude-code" },
+      { type: "sys", text: "[system] Requirement clarified · auto mode · backend claude-code" },
       { type: "stage", text: "[1/9] research   competitors / domain specs / real reviews…" },
       { type: "file", text: "→ output/booking-research.md" },
       { type: "stage", text: "[2/9] docs       generating PRD · architecture · UI/UX…" },
@@ -534,7 +538,7 @@ export const docs = {
           id: "quickstart",
           title: "快速开始",
           blocks: [
-            { p: "UmaDev 是一个模拟真实开发团队工作的本地 Agent。它不提供模型，而是驱动你已经登录的 Claude Code、Codex 或 OpenCode：先判断任务规模，再由协调者调度产品、架构、设计、前后端、QA、安全和 DevOps 八个角色完成计划、执行、评审、验证与交付。npm 只是预编译 Rust 二进制的分发壳。" },
+            { p: "UmaDev 是一个模拟真实开发团队工作的本地 Agent。它不提供模型，而是深度适配五个一等底座；Claude Code、Codex、OpenCode 使用厂商专属协议驱动，Grok Build 与 Kimi Code 使用厂商官方 ACP v1 接口和隔离厂商配置，两条路径地位对等。随后由协调者调度产品、架构、设计、前后端、QA、安全和 DevOps 八个角色完成计划、执行、评审、验证与交付。npm 只是预编译 Rust 二进制的分发壳。" },
             { c: "npm install -g umadev" },
             { p: "Linux 上不要用 sudo 装。npm 默认前缀 /usr/local 属主是 root，普通用户 npm i -g 会 EACCES；而 sudo npm i -g 会在前缀里留下 root 属主的目录树，之后你以普通用户执行的每一条 npm 全局命令（npm update -g、npm i -g 任何包）都会 EACCES 并整体回滚，连带你的底座 CLI（@anthropic-ai/claude-code、@openai/codex）也再也更新不动。请换一个你自己拥有的前缀：" },
             { c: "npm config set prefix ~/.npm-global\nexport PATH=\"$HOME/.npm-global/bin:$PATH\"   # 写进 ~/.zshrc 或 ~/.bashrc\nnpm install -g umadev" },
@@ -543,8 +547,11 @@ export const docs = {
             { p: "支持 macOS（Apple Silicon / Intel）、Linux（x86_64 / ARM64，glibc ≥ 2.31；musl/Alpine 需源码构建）、Windows x86_64。也可以从源码构建：" },
             { c: "git clone https://github.com/umacloud/umadev.git\ncd umadev\ncargo build --release\n./target/release/umadev --version" },
             { h: "准备一个 AI 编码底座" },
-            { p: "UmaDev 推荐驱动你已经登录的 CLI，三选一即可，然后按它们自己的方式登录。UmaDev 不保存你的登录信息，只是把任务作为非交互命令发给它们。" },
-            { c: "npm install -g @anthropic-ai/claude-code\nnpm install -g @openai/codex\nnpm install -g opencode-ai" },
+            { p: "从五个底座中选择一个并按厂商文档安装、登录。UmaDev 不保存登录信息，也不代装、更新、执行交互式登录或授权底座 CLI；下面的命令只用于确认目标二进制已经位于 PATH。" },
+            { c: "# 厂商专属协议驱动（一等）\nclaude --version\ncodex --version\nopencode --version\n\n# 官方 ACP v1 协议驱动（一等）\ngrok --version\nkimi --version" },
+            { p: "如果使用 umadev install --base <id>，安装的是 UmaDev 治理集成（例如 hook），不是底座本身。" },
+            { p: "Grok Build 的后台机器协议子进程只使用已有 cached token 或 XAI_API_KEY；这里的无头 / 非交互仅指不渲染 Grok 自己的 TUI，UmaDev 仍维持常驻双向用户会话。initialize 后只选择明确可用的后台认证，不会自动启动 OAuth 或打开浏览器；需要 grok login 时，请先在 UmaDev 外自行完成。" },
+            { p: "Kimi Code 使用官方源码审计的 @moonshot-ai/kimi-code@0.26.0 与 kimi acp；请先自行运行 kimi login。UmaDev 只通过 ACP 复验已有登录，绝不会自动运行登录或打开浏览器。Windows 还需 Git Bash，非标准路径可设置 KIMI_SHELL_PATH。" },
             { h: "初始化项目" },
             { c: "cd your-project\numadev init" },
             { h: "预览和交付" },
@@ -580,6 +587,7 @@ export const docs = {
       items: [
         { id: "config", title: "配置文件", blocks: [{ p: "首次运行会写入 ~/.umadev/config.toml(语言 + 默认底座);项目级可用 .umadevrc 覆盖。质量门阈值与跳过项放在项目根配置里。" }, { c: "# ~/.umadev/config.toml\nbackend = \"claude-code\"\nlang = \"zh-CN\"" }] satisfies DocBlock[] },
         { id: "env", title: "环境变量", blocks: [{ cmds: [["UMADEV_WORKER_TIMEOUT", "单次底座调用超时（秒）"], ["UMADEV_VERIFY_TIMEOUT_SECS", "验证步骤的全局超时"], ["UMADEV_THEME", "终端主题：dark 或 light"], ["UMADEV_NO_GOAL_MODE", "设为 1 关闭 /goal 持续目标模式"], ["UMADEV_CONTINUOUS", "设为 0 退出持续单会话路径"], ["UMADEV_ALLOW_CLOUD_EMBED", "仅在同时显式提供 OPENAI_EMBED_KEY 时允许远程嵌入；默认关闭"]] }] satisfies DocBlock[] },
+        { id: "base-capabilities", title: "五底座能力边界", blocks: [{ p: "五个底座全部是一等深度适配。底层有两条对等实现路径：三个厂商专属协议驱动，以及两个使用厂商官方接口、复用加固 ACP v1 核心但配置相互隔离的驱动。ACP 不是降级模式；启动、登录、权限、恢复和能力协商仍遵循各自厂商边界。" }, { cmds: [["claude-code", "厂商专属 stream-json；Claude 自有登录；精确 --resume"], ["codex", "厂商专属 app-server；Codex 自有登录；精确 thread/resume"], ["opencode", "厂商专属 HTTP + SSE；OpenCode 自有登录；持久会话重连，要求 >= 1.14.31"], ["grok-build", "官方 ACP；cached token 或 XAI_API_KEY；不自动 OAuth/浏览器；恢复当前安全交接"], ["kimi-code", "官方源码审计 ACP；只复验已有登录；不自动打开浏览器；标准 resume/load；Windows 需 Git Bash"]] }, { p: "UmaDev 二进制覆盖 macOS（Apple Silicon / Intel）、Linux（x86_64 / ARM64，glibc >= 2.31）和 Windows x86_64；厂商 CLI 的系统支持是另一层边界，两个程序必须能在同一环境运行。" }] satisfies DocBlock[] },
         { id: "model-share", title: "底座与模型共享", blocks: [{ p: "UmaDev 不持有模型端点。它驱动你已登录的底座 CLI,自动读取并沿用底座当前配置的模型与推理强度——不强加任何 --model。底座用官方登录还是接了第三方 / 本地模型,跑的就是那个。" }] satisfies DocBlock[] },
         { id: "design", title: "不像 AI 生成的 UI", blocks: [{ p: "前端阶段强制使用 UIUX 文档声明的设计系统:图标库、设计 token、字体、组件骨架。一套反 AI-slop 设计法把命名禁令(默认 indigo、紫渐变、emoji 图标、虚构指标、模板骨架)做成硬规则;设计审查对照它,不符合就自动打回重做。" }] satisfies DocBlock[] },
       ],
@@ -612,7 +620,7 @@ export const docs = {
     {
       cat: "命令大全",
       items: [
-        { id: "tui", title: "TUI 斜杠命令", blocks: [{ cmds: [["/claude · /codex · /opencode", "切换驱动的本机底座 CLI，并携带当前上下文"], ["/goal <目标>", "持续工作直到目标真正达成"], ["/plan", "查看或调整可见依赖计划"], ["/continue · /revise <反馈>", "通过确认门或带反馈重做"], ["/preview · /deploy", "打开前端预览；识别并预览部署命令"], ["/pr create", "用评审报告与 proof pack 创建 PR"], ["/sessions · /resume <id> · /compact", "列出、恢复、压缩持久化会话"], ["/logs", "显示或隐藏底座实时进程输出"], ["/status · /verify", "查看底座/运行状态；生成验证与证据状态"]] }] satisfies DocBlock[] },
+        { id: "tui", title: "TUI 斜杠命令", blocks: [{ cmds: [["/claude · /codex · /opencode", "切换对应一等底座（厂商专属协议驱动），并携带当前上下文"], ["/grok（/grok-build）", "切换 Grok Build 一等底座（官方 ACP v1 协议驱动）"], ["/kimi（/kimi-code）", "切换 Kimi Code 一等底座（官方源码审计的 ACP v1 驱动）"], ["/goal <目标>", "持续工作直到目标真正达成"], ["/plan", "查看或调整可见依赖计划"], ["/continue · /revise <反馈>", "通过确认门或带反馈重做"], ["/preview · /deploy", "打开前端预览；识别并预览部署命令"], ["/pr create", "用评审报告与 proof pack 创建 PR"], ["/sessions · /resume <id> · /compact", "列出、恢复、压缩持久化会话"], ["/logs", "显示或隐藏底座实时进程输出"], ["/status · /verify", "查看底座/运行状态；生成验证与证据状态"]] }] satisfies DocBlock[] },
         { id: "cli", title: "终端 CLI 子命令", blocks: [{ cmds: [["umadev init", "初始化项目与 .umadev 工作区"], ["umadev", "启动持续会话 TUI"], ["umadev doctor", "自检安装、底座与权限问题"], ["umadev verify", "运行合规、证据与交付验证"], ["umadev deploy --run", "确认后执行部署并写 deploy-proof.json"], ["umadev ci", "对源文件跑同一套治理"], ["umadev mcp serve", "把治理与计划状态暴露为 MCP 工具"], ["umadev knowledge-manage", "管理团队自有知识"]] }] satisfies DocBlock[] },
       ],
     },
@@ -625,7 +633,7 @@ export const docs = {
           id: "quickstart",
           title: "Quick start",
           blocks: [
-            { p: "UmaDev is a local agent that works like a real development team. It provides no model; it drives the Claude Code, Codex, or OpenCode you already logged into. A coordinator routes the task, then schedules eight specialist roles across planning, execution, review, verification, and delivery. npm is only the distribution shell for the prebuilt Rust binary." },
+            { p: "UmaDev is a local agent that works like a real development team. It provides no model; it deeply integrates exactly five first-class bases. Claude Code, Codex, and OpenCode use vendor-specific protocol drivers; Grok Build and Kimi Code use official ACP v1 interfaces with isolated vendor profiles. These are peer implementation paths. A coordinator routes the task, then schedules eight specialist roles across planning, execution, review, verification, and delivery. npm is only the distribution shell for the prebuilt Rust binary." },
             { c: "npm install -g umadev" },
             { p: "On Linux, do not install with sudo. npm's default prefix (/usr/local) is root-owned, so npm i -g fails with EACCES — and sudo npm i -g writes a root-owned tree into the prefix, after which every later non-root npm command on it (npm update -g, npm i -g anything) fails with EACCES and npm aborts the whole transaction, so your other global packages — including your base CLI (@anthropic-ai/claude-code, @openai/codex) — can no longer be updated either. Use a prefix you own:" },
             { c: "npm config set prefix ~/.npm-global\nexport PATH=\"$HOME/.npm-global/bin:$PATH\"   # add to ~/.zshrc or ~/.bashrc\nnpm install -g umadev" },
@@ -634,8 +642,11 @@ export const docs = {
             { p: "Supports macOS Apple Silicon / Intel, Linux x86_64 / ARM64 (glibc >= 2.31; musl/Alpine needs a source build), and Windows x86_64. Or build from source:" },
             { c: "git clone https://github.com/umacloud/umadev.git\ncd umadev\ncargo build --release\n./target/release/umadev --version" },
             { h: "Prepare an AI coding backend" },
-            { p: "UmaDev drives a CLI you already logged into. Pick one of Claude Code, Codex, or OpenCode, then log in their own way." },
-            { c: "npm install -g @anthropic-ai/claude-code\nnpm install -g @openai/codex\nnpm install -g opencode-ai" },
+            { p: "Choose one of the five bases and install and authenticate it according to its vendor documentation. UmaDev neither stores its login nor installs, updates, conducts interactive login for, or licenses the vendor CLI. These commands only confirm that the target binary is on PATH." },
+            { c: "# Vendor-specific protocol drivers (first-class)\nclaude --version\ncodex --version\nopencode --version\n\n# Official ACP v1 protocol drivers (first-class)\ngrok --version\nkimi --version" },
+            { p: "umadev install --base <id> installs a UmaDev governance integration such as a hook; it does not install the base itself." },
+            { p: "The background Grok Build machine-protocol child uses only an existing cached token or XAI_API_KEY. Headless/non-interactive here means that the child omits Grok's own TUI; UmaDev still maintains a persistent bidirectional user session. After initialize, it selects only an explicitly available background authentication method and never auto-starts OAuth or opens a browser. Complete any grok login yourself before launching UmaDev." },
+            { p: "Kimi Code uses the source-audited @moonshot-ai/kimi-code@0.26.0 and kimi acp. Run kimi login yourself first; UmaDev only revalidates that login through ACP and never starts login or a browser. Windows also requires Git Bash, or KIMI_SHELL_PATH for a custom bash.exe." },
             { h: "Preview and deliver" },
             { c: "/preview     # after frontend\n/deploy      # after delivery" },
           ] satisfies DocBlock[],
@@ -660,6 +671,7 @@ export const docs = {
       items: [
         { id: "config", title: "Config files", blocks: [{ p: "First run writes ~/.umadev/config.toml (language + default backend); a project-level .umadevrc overrides it. Quality-gate threshold and skips live in the project config." }, { c: "# ~/.umadev/config.toml\nbackend = \"claude-code\"\nlang = \"en\"" }] satisfies DocBlock[] },
         { id: "env", title: "Environment variables", blocks: [{ cmds: [["UMADEV_WORKER_TIMEOUT", "Per base-call timeout in seconds"], ["UMADEV_VERIFY_TIMEOUT_SECS", "Global timeout for verification steps"], ["UMADEV_THEME", "Force the terminal theme to dark or light"], ["UMADEV_NO_GOAL_MODE", "Set to 1 to disable persistent /goal mode"], ["UMADEV_CONTINUOUS", "Set to 0 to opt out of the continuous single-session path"], ["UMADEV_ALLOW_CLOUD_EMBED", "Allow remote embeddings only when OPENAI_EMBED_KEY is also explicitly set; off by default"]] }] satisfies DocBlock[] },
+        { id: "base-capabilities", title: "Five-base capability boundaries", blocks: [{ p: "All five bases receive first-class, deep integration. Under the hood there are two peer implementation paths: three vendor-specific protocol drivers and two official ACP v1 drivers sharing a hardened core while keeping vendor policy isolated. ACP is not a fallback tier; launch, login, permissions, resume, and capabilities remain vendor-specific." }, { cmds: [["claude-code", "Vendor-specific stream-json; Claude-owned login; exact --resume"], ["codex", "Vendor-specific app-server; Codex-owned login; exact thread/resume"], ["opencode", "Vendor-specific HTTP + SSE; OpenCode-owned login; persisted-session reattach; requires >= 1.14.31"], ["grok-build", "Official ACP; cached token or XAI_API_KEY; never auto-OAuth/browser; current safe handoff recovery"], ["kimi-code", "Source-audited official ACP; revalidates existing login only; never opens a browser; standard resume/load; Git Bash on Windows"]] }, { p: "The UmaDev binary supports macOS Apple Silicon/Intel, Linux x86_64/ARM64 (glibc >= 2.31), and Windows x86_64. Vendor CLI platform support remains a separate boundary: both programs must run in the same environment." }] satisfies DocBlock[] },
         { id: "model-share", title: "Backends & model sharing", blocks: [{ p: "UmaDev owns no model endpoint. It drives your already-logged-in backend CLI and reuses whatever model and reasoning effort that CLI is configured with — it imposes no --model. Whether the base uses its official login or your own third-party / local model, that is exactly what runs." }] satisfies DocBlock[] },
         { id: "design", title: "UI that doesn't look AI-generated", blocks: [{ p: "The frontend phase binds the design system declared in the UI/UX doc: icon library, design tokens, typography, component skeleton. An anti-AI-slop design law turns named bans (default indigo, purple gradients, emoji icons, invented metrics, template skeletons) into hard rules; the design review checks against it and auto-rejects UI that drifts." }] satisfies DocBlock[] },
       ],
@@ -692,7 +704,7 @@ export const docs = {
     {
       cat: "Commands",
       items: [
-        { id: "tui", title: "TUI slash commands", blocks: [{ cmds: [["/claude · /codex · /opencode", "Switch the local base while carrying current context"], ["/goal <objective>", "Keep working until the objective is actually met"], ["/plan", "View or steer the live dependency plan"], ["/continue · /revise <feedback>", "Pass a gate or redo with feedback"], ["/preview · /deploy", "Open the frontend preview; detect and preview deploy"], ["/pr create", "Create a PR with the review report and proof pack"], ["/sessions · /resume <id> · /compact", "List, resume, and compact persistent chats"], ["/logs", "Show or hide the base's live process output"], ["/status · /verify", "Inspect base/run status; generate verification evidence"]] }] satisfies DocBlock[] },
+        { id: "tui", title: "TUI slash commands", blocks: [{ cmds: [["/claude · /codex · /opencode", "Switch to the corresponding first-class base (vendor-specific protocol driver) while carrying current context"], ["/grok (/grok-build)", "Switch to the Grok Build first-class base (official ACP v1 protocol driver)"], ["/kimi (/kimi-code)", "Switch to the Kimi Code first-class base (source-audited official ACP v1 driver)"], ["/goal <objective>", "Keep working until the objective is actually met"], ["/plan", "View or steer the live dependency plan"], ["/continue · /revise <feedback>", "Pass a gate or redo with feedback"], ["/preview · /deploy", "Open the frontend preview; detect and preview deploy"], ["/pr create", "Create a PR with the review report and proof pack"], ["/sessions · /resume <id> · /compact", "List, resume, and compact persistent chats"], ["/logs", "Show or hide the base's live process output"], ["/status · /verify", "Inspect base/run status; generate verification evidence"]] }] satisfies DocBlock[] },
         { id: "cli", title: "Terminal CLI subcommands", blocks: [{ cmds: [["umadev init", "Initialize the project and .umadev workspace"], ["umadev", "Start the continuous-session TUI"], ["umadev doctor", "Diagnose installation, base, and permission issues"], ["umadev verify", "Run compliance, evidence, and delivery verification"], ["umadev deploy --run", "Execute a confirmed deploy and write deploy-proof.json"], ["umadev ci", "Run the same governance over source files"], ["umadev mcp serve", "Expose governance and plan status as MCP tools"], ["umadev knowledge-manage", "Manage team-owned knowledge"]] }] satisfies DocBlock[] },
       ],
     },
@@ -701,7 +713,8 @@ export const docs = {
 
 export const releases = {
   zh: [
-        { ver: "1.0.55", date: "2026-07-14", current: true, title: "npm 全局安装嵌套平台包热修", changes: [["修复", "1.0.54 发布后的真实 npm 全局安装验收发现，新版 npm 可能把平台包放在 umadev/node_modules/@umacloud 的嵌套位置；旧启动器只查同级目录，因而把已经安装好的二进制误报为缺失。1.0.55 按 Node 依赖解析语义优先查找与主包绑定的嵌套副本，再回退到传统同级布局。"], ["验证", "新增真实目录回归：旧同级二进制与新嵌套二进制同时存在时必须选择新版；全新全局安装和 1.0.53 升级路径都校验 main、platform、binary 三者为 1.0.55。npm 已发布版本不可覆盖，因此本补丁立即取代 1.0.54 成为 latest。"]] },
+        { ver: "1.0.56", date: "2026-07-17", current: true, title: "五底座深度适配 · 意图与团队闭环 · 发布级硬化", changes: [["新增", "Kimi Code 成为第五个一等底座，并按官方固定源码实现隔离 ACP 生命周期；Claude Code、Codex、OpenCode、Grok Build 与 Kimi Code 的会话、权限、恢复、审批、取消、提问与后台任务都由厂商能力契约约束。"], ["修复", "普通对话重新由所选底座模型判定意图；旧计划和历史只作上下文，不能授权多余工作。Director 恢复、步骤验收、子 Agent 结算、源码感知 PR、部署与失败退出码均收紧，避免跑旧任务、提前汇报、源码漏进 PR 或失败仍显示成功。"], ["修复", "复制提示迁入状态区；Grep 只显示具有明确统计语义的计数；/init 区分空项目与已有项目；/pitfalls 与 /lessons 分离事故和已验证经验，并记录时间、独立复发、一次性归因和机械验证。"], ["验证", "全特性全目标 5,160 项中 5,153 通过、0 失败、7 项条件忽略；当前工作树治理扫描 247/247、0 不可读、0 命中。发布仍以 GitHub 的 Linux/macOS/Windows、签名、公证、npm 七包、官网构建及发布后干净安装门为准。"]] },
+        { ver: "1.0.55", date: "2026-07-14", current: false, title: "npm 全局安装嵌套平台包热修", changes: [["修复", "1.0.54 发布后的真实 npm 全局安装验收发现，新版 npm 可能把平台包放在 umadev/node_modules/@umacloud 的嵌套位置；旧启动器只查同级目录，因而把已经安装好的二进制误报为缺失。1.0.55 按 Node 依赖解析语义优先查找与主包绑定的嵌套副本，再回退到传统同级布局。"], ["验证", "新增真实目录回归：旧同级二进制与新嵌套二进制同时存在时必须选择新版；全新全局安装和 1.0.53 升级路径都校验 main、platform、binary 三者为 1.0.55。npm 已发布版本不可覆盖，因此本补丁立即取代 1.0.54 成为 latest。"]] },
         { ver: "1.0.54", date: "2026-07-14", current: false, title: "升级版本一致性闭环 · 跨终端渲染硬化 · 注释治理", changes: [["修复", "umadev update 现在同时核对 npm 主包、平台包和真实二进制版本。即使 package.json 已是 1.0.54、umadev.exe 仍是旧版，也会识别为分裂安装并继续修复；更新后只有三者完全一致才报成功。Windows 文件占用提示会明确要求关闭 VS Code、Zcode、Codex 与相关终端，并给出强制安装和 where umadev 的 PATH 排查命令；独立二进制替换失败会回滚旧文件。"], ["修复", "跨终端生命周期重构：备用屏只进入一次、恢复幂等；终端控制回复由唯一输入读取器解析，不再与键盘争抢 stdin；OSC 11 主题探测改到备用屏之后异步处理；Windows 禁用会干扰 CJK IME 的 Kitty 键盘协商；非 ASCII 输入后做有界重绘。针对 Windows Terminal、conhost、VS Code、WezTerm、iTerm2、Terminal.app、kitty、Ghostty、tmux 等建立兼容契约与回归矩阵。"], ["新增", "注释治理 UD-CODE-006d：只检查新增或恶化的普通注释债务，提示连续 8 行以上说明块或注释明显多于代码的改动；文档注释、许可证、生成文件和测试豁免。它是 advisory，不用注释配额阻塞开发，要求注释解释为什么与不变量，修复历史写入更新日志。"], ["新增", "Ctrl+V 可直接附加本机系统剪贴板图片：macOS / Windows 使用系统能力，Linux 支持 Wayland wl-paste 与 X11 xclip；远程、tmux、offline、缺工具、超 10 MiB 都诚实降级，阻塞命令不占用渲染线程。另增 UMADEV_THEME=dark|light 显式主题覆盖。"], ["修复", "Windows 影子 Git 快照不再继承用户的 autocrlf、GPG 签名、身份、hooks 与 fsmonitor 配置，首次使用也能创建字节级快照。发布链路新增真实 npm 分裂升级 smoke、版本锁步校验和 tag/Cargo 一致性门禁，防止同类 1.0.53 事故再次发布。"]] },
         { ver: "1.0.53", date: "2026-07-14", current: false, title: "升级系统全平台可用 + 工作区安全加固 + 增强 UIUX 设计", changes: [["修复", "umadev update 在 Windows 上不再刷 EPERM 红字、不再留下垃圾目录。根因是:执行升级的那个进程,正是要被替换的那个可执行文件——npm 无法删除正在运行的 exe,只能把旧目录改名丢在那里,每升一次多一坨。现在升级改由 node 壳完成,全程不启动二进制,npm 换树时没有任何文件被占用;并会顺手清扫历次升级遗留的 .umadev-* 暂存目录。"], ["修复", "umadev update 适配所有安装方式,不再只对 npm 有效。现在会认出这份 umadev 究竟是 npm / pnpm / yarn / bun 哪一个装的,就用哪一个升级(不再一律 npm install -g 装出第二份、互相遮蔽);用 cargo install 或直接下载二进制的用户也能真正自更新(从 Release 取本平台二进制,完整下载校验后原子换位,任何一步失败都保持原二进制不动,绝不留下半个写坏的文件);已经是最新版会直说而不再无谓重装;用 sudo 装出的 root 属主前缀会被当场点名并给出修复步骤,而不是让 npm 崩掉整个事务。"], ["修复", "安装时不再弹出 npm 的安装脚本白名单提示(Mac 首装一次、Linux 每次)。那个 postinstall 是纯提示脚本,而 npm 默认就吞掉它的输出——它想说的话根本传不到用户眼前。现已整个移除,用户也不必再手动配置白名单。"], ["修复", "工作区安全加固(严重)。①单写者运行锁不再因为机器启动标识对不上就被误判为过期,避免两个进程同时写同一棵源码树;②工作区自愈在恢复前,先把当前现场完整快照进影子仓库,再也不会覆盖用户手改的代码(快照失败则放弃自愈——丢掉一次自愈永远好过丢掉用户的代码),并给出一条真能执行的恢复命令;③工作区一旦停留在过去,构建与对话两条写入路径都会立刻停下并如实告知,不再往错误的树上继续写。"], ["新增", "增强 UIUX 设计。设计令牌一致性校验进入验收地板(令牌定义、配对前景色、主题覆盖、对比度),视觉方向在动手实现前先立稿;反 AI 味配色改为按色相判定,不再是一张硬编码的色值清单;而某个色系到底允不允许用,现在交给底座大脑依据真实需求判断——需求里明确禁用的颜色不会再被放行,真正的品牌色也不会被误拦。"]] },
         { ver: "1.0.52", date: "2026-07-13", current: false, title: "跨终端、跨底座的会话连续性修复:切换底座不再失忆", changes: [["修复", "跨终端恢复会话后切换底座(如 VS Code 里干到一半,到原生终端 /resume 再切 codex)不再变「失忆」:修复了两个断链——①旧底座的慢预热可能在切换后才落位,把挂错底座的会话停进车位,下一轮直接开走它;②新底座第一轮(携带全部历史的那轮)因过载等瞬时错误一个字没吐就失败时,会被误判为「已吸收历史」,下一轮裸发导致新底座从没见过对话。现在会话记住自己属于哪个底座、不匹配即丢弃重开,首轮无流式证据即失败则下一轮重新喂完整固件与转录。"], ["新增", "切换底座时打一条诚实的「上下文移交」说明(写入转录并显示):对话记忆与计划状态已随转录移交给新底座;原底座进程内的原生深层上下文(它读过的文件、推理积累)物理上不可迁移,新底座会凭黑板工件与对话记忆接手。回归测试锁死完整链路:存盘 → 新进程 /resume → 切底座 → 第一轮必携带之前的对话。"]] },
@@ -758,7 +771,8 @@ export const releases = {
     { ver: "1.0.0", date: "2026-06-21", title: "首个公开版本 · AI 开发团队 Agent", changes: [["新增", "完整 9 阶段商业交付流水线:research → docs → spec → frontend → backend → quality → delivery,含文档确认、预览确认两道人在环确认门"], ["新增", "三种本机 CLI 底座:Claude Code、Codex CLI、OpenCode —— 直接驱动你已登录的 CLI 并共享它自己的模型与推理强度,UmaDev 不持有任何 API key"], ["新增", "并行扇出:文档阶段并发起草架构与 UI/UX,缩短交付墙钟时间"], ["新增", "UIUX 一致性硬门 + 反 AI-slop 设计法:命名禁令(默认 indigo / 紫渐变 / emoji 图标 / 模板骨架)与设计 token 纪律,不符合声明设计系统的 UI 自动打回重做"], ["新增", "失败开放治理内核:写入前 hook + CI + 质量门补扫,禁 emoji 图标 / 硬编码颜色 / AI 套话;合规映射 SOC 2 · ISO 27001 · EU AI Act"], ["新增", "知识库:416 份工程规范文档,BM25 + 可选向量混合检索(RRF 融合),可接入团队自有知识库"], ["新增", "前后端契约校验:解析架构 API 表 → 渲染 OpenAPI → 校验前端 fetch 调用对齐"], ["新增", "自学习踩坑知识库:自动识别报错,按技术栈指纹在下次同类问题前主动规避"], ["新增", "质量门 + proof pack:scorecard.html 成绩单、proof-pack.zip 交付证明与审计证据链"], ["新增", "三语 TUI(简体 / 繁体 / English)、MCP server 与管理器;纯 Rust 单二进制,十个 crate,零外部进程依赖"]] },
   ],
   en: [
-        { ver: "1.0.55", date: "2026-07-14", current: true, title: "Hotfix for nested platform packages in global npm installs", changes: [["Fixed", "Post-release installation testing found that newer npm versions may place a platform package under umadev/node_modules/@umacloud instead of beside the main package. The 1.0.54 launcher checked only the hoisted location and therefore reported an installed binary as missing. 1.0.55 follows Node dependency resolution: prefer the main package's nested copy, then fall back to the traditional hoisted layout."], ["Verified", "A new real-layout regression keeps a stale hoisted binary beside a current nested binary and requires the current one to win. Fresh global installs and the 1.0.53 upgrade path verify that main, platform, and binary all resolve to 1.0.55. Published npm versions are immutable, so this patch immediately supersedes 1.0.54 as latest."]] },
+        { ver: "1.0.56", date: "2026-07-17", current: true, title: "Five deeply integrated bases, intent and team closure, release hardening", changes: [["Added", "Kimi Code is the fifth first-class base, implemented against pinned official source through an isolated ACP lifecycle. Claude Code, Codex, OpenCode, Grok Build, and Kimi Code now bind sessions, permissions, resume, approvals, cancellation, questions, and background work to vendor-specific capability contracts."], ["Fixed", "Ordinary conversation is routed by the selected base model again; old plans and history are context, never authority for unrelated work. Director resume, step acceptance, sub-agent settlement, source-aware PR staging, deploy handling, and failure exit codes are tightened so old work is not replayed, summaries do not arrive early, source is not omitted from PRs, and failures cannot report success."], ["Fixed", "Copy notices moved to the status area; Grep shows counts only when the base supplies explicit count semantics; /init distinguishes empty and existing projects; /pitfalls and /lessons separate incidents from validated guidance with timestamps, independent recurrences, one-shot attribution, and mechanical verification."], ["Verified", "Of 5,160 all-feature/all-target checks, 5,153 pass, 0 fail, and 7 are conditionally ignored. Governance scans 247/247 files with 0 unreadable and 0 findings. Publishing still depends on the GitHub Linux/macOS/Windows, signing/notarization, seven-package npm, site-build, and post-release clean-install gates."]] },
+        { ver: "1.0.55", date: "2026-07-14", current: false, title: "Hotfix for nested platform packages in global npm installs", changes: [["Fixed", "Post-release installation testing found that newer npm versions may place a platform package under umadev/node_modules/@umacloud instead of beside the main package. The 1.0.54 launcher checked only the hoisted location and therefore reported an installed binary as missing. 1.0.55 follows Node dependency resolution: prefer the main package's nested copy, then fall back to the traditional hoisted layout."], ["Verified", "A new real-layout regression keeps a stale hoisted binary beside a current nested binary and requires the current one to win. Fresh global installs and the 1.0.53 upgrade path verify that main, platform, and binary all resolve to 1.0.55. Published npm versions are immutable, so this patch immediately supersedes 1.0.54 as latest."]] },
         { ver: "1.0.54", date: "2026-07-14", current: false, title: "Verified update consistency, hardened cross-terminal rendering, and comment governance", changes: [["Fixed", "umadev update now verifies the npm main package, platform package, and the actual binary independently. A 1.0.54 package.json paired with an older umadev.exe is treated as a split install and repaired; success is reported only when all three versions match. Windows lock guidance explicitly names VS Code, Zcode, Codex, and terminals, then provides force-install and where umadev PATH diagnostics; a failed standalone-binary swap rolls back the old executable."], ["Fixed", "The terminal lifecycle now enters the alternate screen exactly once and restores it idempotently. One owned input reader parses terminal responses instead of racing keyboard input; OSC 11 theme detection runs asynchronously after alternate-screen entry; Windows skips Kitty keyboard negotiation to protect CJK IME; non-ASCII input triggers a bounded repaint. A compatibility contract and regression matrix now cover the major Windows, macOS, Linux, IDE, tmux, and GPU terminal families."], ["Added", "UD-CODE-006d governs new or worsening ordinary-comment debt: it advises on 8+ line comment runs or changes where comments substantially outweigh code, while exempting API docs, licenses, generated files, and tests. It is deliberately advisory rather than a blocking comment quota: comments should preserve why and invariants, while repair history belongs in the changelog."], ["Added", "Ctrl+V can attach an image from the local OS clipboard. macOS and Windows use built-in facilities; Linux supports Wayland wl-paste and X11 xclip. Remote sessions, tmux, the offline base, missing tools, and images over 10 MiB degrade with localized guidance, and blocking capture never runs on the render thread. UMADEV_THEME=dark|light adds an explicit theme override."], ["Fixed", "Windows shadow-Git checkpoints no longer inherit the user's autocrlf, GPG signing, identity, hooks, or fsmonitor settings, so byte-exact snapshots work on a fresh machine. The release path now includes a real split-install npm smoke test, lockstep version validation, and a tag/Cargo version gate to prevent a repeat of the 1.0.53 mismatch."]] },
         { ver: "1.0.53", date: "2026-07-14", current: false, title: "A self-update that works on every machine, a workspace that cannot be overwritten, and enhanced UI/UX design", changes: [["Fixed", "umadev update no longer prints a wall of EPERM errors or leaves debris behind on Windows. The root cause: the process running the upgrade WAS the executable being replaced — Windows refuses to unlink a running image, so npm renamed the old tree aside and could never delete it, leaving one more orphaned directory behind on every upgrade. The upgrade now runs in the node shim and never launches the binary, so nothing under the prefix is open when npm swaps the tree; it also sweeps the .umadev-* staging dirs left by earlier broken upgrades."], ["Fixed", "umadev update now works no matter how umadev was installed, not just via npm. It detects which package manager actually owns the install (npm / pnpm / yarn / bun) and upgrades with that one, instead of always shelling out to npm install -g and dropping a SECOND copy that shadows the real one. Installs from cargo install or a downloaded binary can now genuinely self-update: the matching platform binary is fetched from the release, fully downloaded and verified BEFORE any atomic swap, so a failure at any step leaves the existing binary untouched and never a half-written file. Already on the latest version now says so instead of reinstalling, and a root-owned prefix from a sudo install is named with its repair rather than letting npm abort the whole transaction."], ["Fixed", "Installing no longer triggers the npm install-script approval prompt (once on macOS, every time on Linux). That postinstall script was purely cosmetic, and npm swallows its output by default — what it wanted to say never reached the user anyway. It has been removed entirely, so there is nothing left to allow-list."], ["Fixed", "Workspace safety hardening (severe). The single-writer run lock can no longer be mistaken for stale over a boot-id mismatch, which could put two processes on one source tree. The workspace heal now snapshots the CURRENT tree into the shadow repo BEFORE restoring anything, so it can never overwrite work you redid by hand — and if the snapshot fails it declines to heal at all (losing a heal always beats losing your code), handing you a recovery command that actually works. And once a tree is stuck in the past, BOTH write paths — the build loop and the chat surface — stop immediately and say so, instead of piling more writes onto the wrong tree."], ["Added", "Enhanced UI/UX design. Design-token conformance joins the acceptance floor (token definitions, paired foregrounds, theme coverage, contrast), and the visual direction is settled before implementation starts. The anti-AI-slop color rule is now a hue judgment rather than a hardcoded list of hex values — and whether a given color family is allowed at all is now judged by the base against the real requirement, so a color the requirement explicitly forbids is no longer let through, and a genuine brand color is no longer falsely blocked."]] },
         { ver: "1.0.52", date: "2026-07-13", current: false, title: "Cross-terminal, cross-backend session continuity: switching the base no longer loses your conversation", changes: [["Fixed", "Resuming a session in another terminal and then switching backends (e.g. mid-work in VS Code, /resume in a native terminal, then switch to codex) no longer causes amnesia. Two broken links fixed: a slow warm-preload for the OLD base could park a wrong-base session after the switch, and the new base's FIRST turn (the one carrying the full history) failing with zero streamed output was mistaken for absorbed history, so the next turn went out bare. Sessions now remember which base they belong to (mismatch is discarded and reopened), and an unabsorbed first directive re-feeds the full firmware + transcript on the next turn."], ["Added", "Switching backends records an honest context-handoff note (persisted + visible): the conversation memory and plan state travel with the transcript; the old base's in-process native context (files it read, its reasoning) physically cannot migrate - the new base picks up from the blackboard artifacts and the conversation. A regression test locks the full chain: persist, new process, /resume, switch backend, and the first directive must carry the prior dialogue."]] },

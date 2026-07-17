@@ -330,14 +330,14 @@ pub const RED_GREEN_PRE_PREFIX: &str = "pre-step (red→green): ";
 /// ([`recover_abandoned_temp_rewind`]) takes of the CURRENT work-tree *before* it resets
 /// that tree back to the present.
 ///
-/// Deliberately NOT an internal label (see [`is_internal_label`]): this snapshot is the
+/// Deliberately NOT an internal label (see the internal `is_internal_label` classifier): this snapshot is the
 /// only copy of anything the user wrote while their tree was silently in the past, so it
 /// MUST be visible in the rewind picker / `umadev history` and reachable by
 /// `umadev rollback <id>`. The heal names it in the note it hands the user.
 ///
 /// **Localized**, unlike [`TEMP_REWIND_HEAD_LABEL`] / [`RED_GREEN_PRE_PREFIX`] /
 /// [`RUN_BASELINE_PREFIX`], and the difference is load-bearing. Those three are MACHINE
-/// KEYS — [`is_internal_label`] and [`run_baseline`] match on them, so a label written under
+/// KEYS — the internal `is_internal_label` classifier and [`run_baseline`] match on them, so a label written under
 /// one locale and matched under another would stop being recognised. This one is only ever
 /// READ BY A HUMAN, in `umadev history` / the rewind picker — the very surface the (already
 /// localized) heal note tells them to go look at. An English user being pointed at a
@@ -376,7 +376,8 @@ const DISPLAY_CHECKPOINTS: usize = 50;
 const CHECKPOINT_SCAN_WINDOWS: &[usize] = &[200, 1_000, 5_000];
 
 /// List checkpoints a USER may want to rewind to, newest first (capped at
-/// [`DISPLAY_CHECKPOINTS`]). Internal machinery snapshots (see [`is_internal_label`])
+/// the display-checkpoint limit). Internal machinery snapshots (see the internal
+/// `is_internal_label` classifier)
 /// are filtered out; they remain restorable by id. Empty when none / `git` missing.
 #[must_use]
 pub fn list_checkpoints(project_root: &Path) -> Vec<Checkpoint> {
@@ -491,7 +492,7 @@ fn id_is_known_checkpoint(id: &str, list: &[Checkpoint]) -> bool {
 /// Untracked / excluded paths (`node_modules`, …) are left untouched.
 ///
 /// `id` MUST name a checkpoint returned by [`list_checkpoints`]. It is RESOLVED to that
-/// checkpoint's canonical id ([`resolve_checkpoint_id`]) and the reset targets the RESOLVED
+/// checkpoint's canonical id (via the internal resolver) and the reset targets the RESOLVED
 /// commit — never the raw string the caller passed. That is what makes the guarantee real:
 /// a bool guard plus a reset to the caller's own text let `rollback 3b599bd^` and
 /// `rollback 3b599bd~1` through, because a revision EXPRESSION built on a known checkpoint
@@ -718,7 +719,7 @@ impl TempRewind {
     /// A FAILED restore is never quiet: it raises the workspace-in-the-past flag
     /// ([`workspace_is_in_past`]) and a user-facing notice, because the caller is about
     /// to go on writing onto a tree that is silently in the past (see
-    /// [`report_failed_restore`]).
+    /// the internal failed-restore reporter).
     pub fn restore(mut self) -> bool {
         let ok = Self::reset_hard(&self.root, &self.head);
         self.restored = ok;
@@ -853,7 +854,7 @@ fn in_past_key(project_root: &Path) -> PathBuf {
 }
 
 /// Record that `project_root` is stuck at an earlier checkpoint, and WHY (see
-/// [`WORKSPACE_IN_PAST`] / [`InPastReason`]). Anything written to that tree after this point
+/// the internal workspace-in-past marker / [`InPastReason`]). Anything written to that tree after this point
 /// is written on top of files that are not the user's present.
 ///
 /// [`InPastReason::Unrecoverable`] WINS over [`InPastReason::Retryable`] if both are raised
@@ -1040,14 +1041,14 @@ pub struct TempRewindMarker {
     pub pid: u32,
     /// UNIX seconds at which the rewind began (the age fallback's clock).
     pub started_at: u64,
-    /// The BOOT the rewind was taken in ([`crate::run_lock::boot_id`]). A marker whose
+    /// The BOOT the rewind was taken in (from the run-lock boot identity). A marker whose
     /// boot differs from ours was written before a reboot — its owner is dead, and its
     /// PID now belongs to someone else. Empty = unknown (an older marker, or a platform
     /// with no boot id): reboot-detection then simply does not apply and the PID/age
     /// rules stand alone.
     #[serde(default)]
     pub boot: String,
-    /// The HOST the rewind was taken on ([`crate::run_lock::hostname`]). A workspace on
+    /// The HOST the rewind was taken on (from the run-lock host identity). A workspace on
     /// a shared/network filesystem can carry a marker from another machine, whose
     /// process table we cannot probe (and whose boot id naturally differs from ours —
     /// which must NOT be read as "rebooted"). Empty = unknown (treated as this host).
@@ -1103,7 +1104,7 @@ fn clear_temp_rewind_marker(root: &Path) {
 static WORKSPACE_NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Leave a workspace-integrity note for the user-facing surface to show (see
-/// [`WORKSPACE_NOTICES`]). Bounded — a note is only ever raised by a recovery attempt.
+/// the internal workspace-notice queue). Bounded — a note is only ever raised by a recovery attempt.
 pub fn record_workspace_notice(note: String) {
     if let Ok(mut q) = WORKSPACE_NOTICES.lock() {
         // A hard cap so a pathological loop can never grow this without bound.
@@ -1113,7 +1114,7 @@ pub fn record_workspace_notice(note: String) {
     }
 }
 
-/// Take every pending workspace-integrity note (see [`WORKSPACE_NOTICES`]). The caller MUST
+/// Take every pending workspace-integrity note (see the internal notice queue). The caller MUST
 /// surface what it takes — these are drained, not copied.
 #[must_use]
 pub fn take_workspace_notices() -> Vec<String> {
@@ -1179,7 +1180,7 @@ fn older_than_temp_rewind_stale(m: &TempRewindMarker, now: u64) -> bool {
 /// Without this, the user's own tracked source files are left reverted to an earlier
 /// step's state with no marker, no message, and no recovery — and `rollback` moves in
 /// the WRONG direction. So: read the marker, and if the process that wrote it is
-/// **provably gone** ([`marker_is_abandoned`]), `reset --hard` back to the head snapshot
+/// **provably gone** (as determined by the internal abandonment classifier), `reset --hard` back to the head snapshot
 /// it recorded. Called at process start (against the verb's resolved workspace) and
 /// again when a run takes the single-writer lock.
 ///
@@ -1467,9 +1468,10 @@ pub struct ChangedFile {
     /// Workspace-relative, `/`-separated path.
     pub path: String,
     /// `true` when the file did NOT exist at the baseline — a genuinely NEW file, as
-    /// opposed to an edit of one that was already there. The distinction is what lets
-    /// a scope check treat "a new file nobody planned" (a new surface) differently
-    /// from "a line changed in a file that was already there".
+    /// opposed to an edit or deletion of one that was already there. The distinction
+    /// lets a scope check treat "a new file nobody planned" (a new surface)
+    /// differently from a change to an existing surface. The path is retained for a
+    /// deletion so rollback, scope checks, and PR staging do not lose that change.
     pub added: bool,
 }
 
@@ -1582,11 +1584,9 @@ pub fn run_diff_since(project_root: &Path, baseline_id: &str) -> RunDiff {
         let Some(path) = parts.next().map(str::trim).filter(|p| !p.is_empty()) else {
             continue;
         };
-        // `D` (deleted since the baseline) is not a surface the scope check reasons
-        // about — a deletion adds no new file, dependency, or route.
         let added = match status.chars().next() {
             Some('A') => true,
-            Some('M' | 'T') => false,
+            Some('M' | 'T' | 'D') => false,
             _ => continue,
         };
         files.push(ChangedFile {
@@ -2343,6 +2343,28 @@ mod tests {
         assert_eq!(
             file_at(root, &run_baseline(root).unwrap().id, "existing.ts").as_deref(),
             Some("v1")
+        );
+    }
+
+    #[test]
+    fn changed_since_run_baseline_keeps_deleted_paths() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("obsolete.ts"), "export const old = true;\n").unwrap();
+        create_run_baseline(root, "demo").expect("baseline");
+        std::fs::remove_file(root.join("obsolete.ts")).unwrap();
+
+        let changed = changed_since_run_baseline(root).expect("the diff is viewable");
+        assert_eq!(
+            changed,
+            vec![ChangedFile {
+                path: "obsolete.ts".to_string(),
+                added: false,
+            }],
+            "a deletion is still part of the run diff and must reach rollback/PR/scope consumers"
         );
     }
 
