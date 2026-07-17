@@ -68,6 +68,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env("UMADEV_EMBED_MODEL_DIR", &empty_model);
+    command.env_remove("XDG_CONFIG_HOME");
     for secret in [
         "ANTHROPIC_API_KEY",
         "OPENAI_API_KEY",
