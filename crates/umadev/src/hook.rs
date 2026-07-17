@@ -1122,16 +1122,22 @@ mod tests {
     fn kimi_write_and_edit_path_fields_enter_the_same_governance_floor() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
-        let secret = format!(
-            r#"{{"tool_name":"Write","tool_input":{{"path":"{}","content":"TOKEN=secret"}}}}"#,
-            root.join(".env").display()
-        );
+        let secret = serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": {"path": root.join(".env"), "content": "TOKEN=secret"}
+        })
+        .to_string();
         assert!(pre_write_in(&secret, &root).block);
 
-        let edit = format!(
-            r#"{{"tool_name":"Edit","tool_input":{{"path":"{}","old_string":"x","new_string":"PRIVATE KEY"}}}}"#,
-            root.join(".ssh/id_rsa").display()
-        );
+        let edit = serde_json::json!({
+            "tool_name": "Edit",
+            "tool_input": {
+                "path": root.join(".ssh/id_rsa"),
+                "old_string": "x",
+                "new_string": "PRIVATE KEY"
+            }
+        })
+        .to_string();
         assert!(pre_write_in(&edit, &root).block);
     }
 

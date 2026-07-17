@@ -251,14 +251,14 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     writer.flush().expect("flush synchronization clear key");
 
     let command_capture_start = captured.lock().expect("lock terminal capture").len();
-    writer.write_all(b"/quit").expect("type /quit");
-    writer.flush().expect("flush /quit text");
+    writer.write_all(b"/exit").expect("type /exit alias");
+    writer.flush().expect("flush /exit text");
     let command_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let rendered = {
             let bytes = captured.lock().expect("lock terminal capture");
             let raw = String::from_utf8_lossy(&bytes[command_capture_start..]);
-            umadev_agent::base_error::strip_ansi(&raw).contains(">_ /quit")
+            umadev_agent::base_error::strip_ansi(&raw).contains("/exit")
         };
         if rendered {
             break;
@@ -268,7 +268,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
             let raw = String::from_utf8_lossy(&bytes[command_capture_start..]);
             let visible = umadev_agent::base_error::strip_ansi(&raw);
             panic!(
-                "UmaDev did not render the intentional /quit command; visible terminal tail: {visible}"
+                "UmaDev did not render the intentional /exit command; visible terminal tail: {visible}"
             );
         }
         thread::sleep(Duration::from_millis(25));
@@ -280,8 +280,8 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     // ConPTY's UTF-8 pipe needs the Windows CRLF line ending once the input
     // frame is fully rendered; Unix PTYs represent Enter as a lone CR.
     let submit: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\r" };
-    writer.write_all(submit).expect("press Enter after /quit");
-    writer.flush().expect("flush /quit submit key");
+    writer.write_all(submit).expect("press Enter after /exit");
+    writer.flush().expect("flush /exit submit key");
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let (status, timed_out) = loop {
@@ -301,7 +301,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     let output_bytes = captured.lock().expect("lock terminal capture");
     let output = String::from_utf8_lossy(&output_bytes);
 
-    assert!(!timed_out, "UmaDev did not accept /quit: {output}");
+    assert!(!timed_out, "UmaDev did not accept /exit: {output}");
     assert!(status.success(), "UmaDev exited unsuccessfully: {status}");
     assert!(
         output.contains("UmaDev"),

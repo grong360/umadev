@@ -8631,6 +8631,10 @@ mod tests {
     use super::*;
     use std::io::{BufRead as _, Cursor, Write as _};
 
+    fn fixture_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join("umadev-acp-fixtures").join(name)
+    }
+
     fn grok_task_backgrounded(
         session_id: &str,
         event_id: &str,
@@ -8930,6 +8934,10 @@ mod tests {
         let workspace = Path::new("/tmp/project");
         assert_eq!(
             AcpVendor::Grok.install_hint(),
+            AcpVendor::Grok.install_hint_for(cfg!(windows))
+        );
+        assert_eq!(
+            AcpVendor::Grok.install_hint_for(false),
             "curl -fsSL https://x.ai/cli/install.sh | bash"
         );
         assert_eq!(
@@ -9569,7 +9577,7 @@ mod tests {
             .into_iter()
             .map(|mib| crate::turn_input::PreparedBlock::File {
                 attachment: crate::turn_input::PreparedAttachment {
-                    canonical_path: PathBuf::from("/fixture/binary.dat"),
+                    canonical_path: fixture_path("binary.dat"),
                     bytes: vec![0; mib * 1024 * 1024],
                     media_type: "application/octet-stream".to_string(),
                 },
@@ -9593,7 +9601,7 @@ mod tests {
     #[test]
     fn grok_wire_budget_attributes_json_expansion_to_the_exact_file_block() {
         let attachment = || crate::turn_input::PreparedAttachment {
-            canonical_path: PathBuf::from("/fixture/control.txt"),
+            canonical_path: fixture_path("control.txt"),
             // JSON encodes each control byte as six ASCII bytes. Two source
             // files remain below the shared 20 MiB input limit but cross the
             // Grok wire limit only when the second block is appended.
@@ -10808,7 +10816,7 @@ mod tests {
         let text = crate::turn_input::PreparedTurnInput {
             blocks: vec![crate::turn_input::PreparedBlock::File {
                 attachment: crate::turn_input::PreparedAttachment {
-                    canonical_path: PathBuf::from("/fixture/context.txt"),
+                    canonical_path: fixture_path("context.txt"),
                     bytes: "Kimi 原生文本上下文".as_bytes().to_vec(),
                     media_type: "text/plain; charset=utf-8".to_string(),
                 },
@@ -10826,7 +10834,7 @@ mod tests {
         let binary = crate::turn_input::PreparedTurnInput {
             blocks: vec![crate::turn_input::PreparedBlock::File {
                 attachment: crate::turn_input::PreparedAttachment {
-                    canonical_path: PathBuf::from("/fixture/archive.bin"),
+                    canonical_path: fixture_path("archive.bin"),
                     bytes: vec![0, 0xff, 1, 2],
                     media_type: "application/octet-stream".to_string(),
                 },
