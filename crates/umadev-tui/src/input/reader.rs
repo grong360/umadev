@@ -378,6 +378,38 @@ impl OwnedInput {
             }
         }
     }
+
+    /// Pump stdin for up to `budget`, just long enough to capture a fast OSC 11
+    /// background-color reply, WITHOUT dequeuing any input.
+    ///
+    /// Bytes are fed through the normal tokenizer/decoder path, so a reply is
+    /// captured into `background_reply` (see `enqueue`) while any real
+    /// keystrokes that arrive in the same window are queued for the ordinary
+    /// [`Self::next`] loop — nothing is dropped. Returns as soon as a reply
+    /// lands (the common case, a few milliseconds) or when `budget` elapses (a
+    /// terminal that never answers, e.g. Apple Terminal.app). Fail-open: a
+    /// closed reader channel returns early and any parse miss simply leaves the
+    /// startup default in place. Called once, before the first frame, so a
+    /// terminal that DOES support OSC 11 gets the correct palette on the FIRST
+    /// paint instead of flashing the default until the asynchronous reply lands.
+    pub async fn prime_background_theme(&mut self, budget: Duration) {
+        if self.background_reply.is_some() {
+            return;
+        }
+        let deadline = Instant::now() + budget;
+        while self.background_reply.is_none() {
+            tokio::select! {
+                chunk = self.rx.recv(), if !self.closed => {
+                    let Some(bytes) = chunk else {
+                        self.closed = true;
+                        return;
+                    };
+                    self.ingest(&bytes);
+                }
+                () = sleep_until_opt(Some(deadline)) => return,
+            }
+        }
+    }
 }
 
 impl Default for OwnedInput {
@@ -460,6 +492,15 @@ impl InputSource {
         match self {
             InputSource::Owned(o) => o.take_background_reply(),
             InputSource::Legacy(_) => None,
+        }
+    }
+
+    /// Pre-paint OSC 11 drain — see [`OwnedInput::prime_background_theme`]. A
+    /// no-op on the legacy path (it has no response lane). Bounded and
+    /// fail-open, so it never blocks startup.
+    pub async fn prime_background_theme(&mut self, budget: Duration) {
+        if let InputSource::Owned(o) = self {
+            o.prime_background_theme(budget).await;
         }
     }
 }
@@ -834,6 +875,45 @@ mod tests {
             2,
             "exactly the two real keystrokes surface, none of the reply: {keys:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prime_background_theme_captures_a_fast_reply_before_paint() {
+        // The pre-paint drain must catch an OSC 11 reply that is already on the
+        // wire, and any keystrokes riding in the same chunk stay queued for the
+        // ordinary input loop — none are lost or surfaced early.
+        let (mut oi, tx) = owned_for_test();
+        tx.send(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\hi".to_vec())
+            .unwrap();
+        oi.prime_background_theme(Duration::from_millis(120)).await;
+        assert_eq!(
+            oi.take_background_reply(),
+            Some(true),
+            "a light reply available before the first frame must be captured"
+        );
+        let keys: Vec<Event> = std::mem::take(&mut oi.queue).into();
+        assert_eq!(keys.len(), 2, "the two typed-ahead keys are preserved");
+        let _tx = tx;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prime_background_theme_is_bounded_when_no_reply_arrives() {
+        // Apple Terminal.app answers neither OSC 11 nor COLORFGBG: the drain
+        // must return within its budget (fail-open) rather than block startup,
+        // leaving the caller's default in place.
+        let (mut oi, tx) = owned_for_test();
+        let t0 = tokio::time::Instant::now();
+        oi.prime_background_theme(Duration::from_millis(120)).await;
+        assert!(
+            t0.elapsed() >= Duration::from_millis(120),
+            "the drain must wait its full budget when nothing answers"
+        );
+        assert_eq!(
+            oi.take_background_reply(),
+            None,
+            "no reply means no classification — the startup default stands"
+        );
+        let _tx = tx;
     }
 
     #[test]

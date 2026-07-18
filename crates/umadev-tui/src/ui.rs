@@ -45,6 +45,28 @@ mod theme {
         !IS_LIGHT.load(Ordering::Relaxed)
     }
 
+    /// Whether the ACTIVE palette is the light one. The observable half of
+    /// [`set_light_theme`] — used by the `/theme` toggle's tests and by any
+    /// caller that must branch on the resolved theme.
+    pub fn is_light() -> bool {
+        IS_LIGHT.load(Ordering::Relaxed)
+    }
+
+    /// A user's explicit `/theme light|dark` choice pins the palette for the
+    /// session, so a late terminal background-probe reply cannot flip it back.
+    /// Cleared by `/theme auto`, which re-runs detection. Default: unpinned.
+    static USER_LOCKED: AtomicBool = AtomicBool::new(false);
+
+    /// Pin or release the manual `/theme` override (see [`USER_LOCKED`]).
+    pub fn set_user_locked(locked: bool) {
+        USER_LOCKED.store(locked, Ordering::Relaxed);
+    }
+
+    /// Whether the user pinned the palette with `/theme light|dark`.
+    pub fn user_locked() -> bool {
+        USER_LOCKED.load(Ordering::Relaxed)
+    }
+
     /// A stable id for the ACTIVE palette (P3 highlight-cache key component). The
     /// dark/light flip is the only thing that changes a highlighted line's colors,
     /// so a single bool fully identifies the theme generation. Returned as `u8`
@@ -379,6 +401,28 @@ use crate::app::{
 /// Re-exported from the private theme module for startup and asynchronous terminal detection.
 pub fn set_light_theme(is_light: bool) {
     theme::set_light_theme(is_light);
+}
+
+/// Whether the ACTIVE palette is the light one (the observable half of
+/// [`set_light_theme`]). Re-exported from the private theme module.
+#[must_use]
+pub fn is_light_theme() -> bool {
+    theme::is_light()
+}
+
+/// Pin the palette to the user's explicit `/theme light|dark` choice so a late
+/// terminal background-probe reply cannot override it; released by `/theme
+/// auto`. Re-exported from the private theme module for the slash-command
+/// handler and the asynchronous OSC 11 apply path.
+pub fn set_theme_locked(locked: bool) {
+    theme::set_user_locked(locked);
+}
+
+/// Whether the user pinned the palette with `/theme light|dark` (see
+/// [`set_theme_locked`]).
+#[must_use]
+pub fn theme_locked() -> bool {
+    theme::user_locked()
 }
 
 /// Draw one full frame — dispatches on the current screen.

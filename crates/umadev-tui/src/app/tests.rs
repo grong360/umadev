@@ -1614,6 +1614,137 @@ fn slash_mouse_emits_set_capture_action_and_uses_i18n() {
     assert!(app.mouse_scroll);
 }
 
+/// Serializes the tests that mutate the process-global theme atoms
+/// ([`crate::ui`]'s IS_LIGHT / USER_LOCKED) and restores the prior state on drop
+/// so a manual `/theme` choice never leaks into a sibling test running in
+/// parallel. Poison-robust so a panic in one test never cascades.
+static THEME_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct ThemeStateRestore {
+    light: bool,
+    locked: bool,
+}
+
+impl ThemeStateRestore {
+    fn capture() -> Self {
+        Self {
+            light: crate::ui::is_light_theme(),
+            locked: crate::ui::theme_locked(),
+        }
+    }
+}
+
+impl Drop for ThemeStateRestore {
+    fn drop(&mut self) {
+        crate::ui::set_light_theme(self.light);
+        crate::ui::set_theme_locked(self.locked);
+    }
+}
+
+#[test]
+fn slash_theme_light_and_dark_force_and_pin_the_palette() {
+    let _guard = THEME_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _restore = ThemeStateRestore::capture();
+    let mut app = fresh_app(Some("offline"));
+
+    let action = app.slash_theme("light");
+    assert_eq!(action, Action::ForceRedraw);
+    assert!(
+        crate::ui::is_light_theme(),
+        "/theme light selects the light palette"
+    );
+    assert!(
+        crate::ui::theme_locked(),
+        "a manual choice pins the palette against a late probe reply"
+    );
+    assert_eq!(
+        app.history.back().expect("a status line").body(),
+        umadev_i18n::t(app.lang, "slash.theme_light"),
+    );
+
+    let action = app.slash_theme("dark");
+    assert_eq!(action, Action::ForceRedraw);
+    assert!(
+        !crate::ui::is_light_theme(),
+        "/theme dark selects the dark palette"
+    );
+    assert!(crate::ui::theme_locked());
+    assert_eq!(
+        app.history.back().expect("a status line").body(),
+        umadev_i18n::t(app.lang, "slash.theme_dark"),
+    );
+}
+
+#[test]
+fn slash_theme_auto_releases_the_pin_and_reprobes() {
+    let _guard = THEME_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _restore = ThemeStateRestore::capture();
+    let mut app = fresh_app(Some("offline"));
+
+    // Pin first, then release with auto.
+    let _ = app.slash_theme("dark");
+    assert!(crate::ui::theme_locked());
+
+    let action = app.slash_theme("auto");
+    assert_eq!(
+        action,
+        Action::ReprobeTheme,
+        "/theme auto asks the event loop to re-fire the OSC 11 probe"
+    );
+    assert!(
+        !crate::ui::theme_locked(),
+        "auto releases the manual pin so detection can win again"
+    );
+    assert_eq!(
+        app.history.back().expect("a status line").body(),
+        umadev_i18n::t(app.lang, "slash.theme_auto"),
+    );
+
+    // A bare `/theme` (no arg) is the same reset as `/theme auto`.
+    let _ = app.slash_theme("dark");
+    let action = app.slash_theme("");
+    assert_eq!(action, Action::ReprobeTheme);
+    assert!(!crate::ui::theme_locked());
+}
+
+#[test]
+fn slash_theme_unknown_arg_is_a_friendly_noop() {
+    let _guard = THEME_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _restore = ThemeStateRestore::capture();
+    let mut app = fresh_app(Some("offline"));
+    let locked_before = crate::ui::theme_locked();
+    let light_before = crate::ui::is_light_theme();
+
+    let action = app.slash_theme("sepia");
+    assert_eq!(
+        action,
+        Action::None,
+        "an unknown arg never crashes or forces a repaint"
+    );
+    assert_eq!(
+        crate::ui::theme_locked(),
+        locked_before,
+        "an unknown arg leaves the pin untouched"
+    );
+    assert_eq!(crate::ui::is_light_theme(), light_before);
+    let last = app
+        .history
+        .back()
+        .expect("a status line")
+        .body()
+        .to_string();
+    assert!(
+        last.contains("sepia"),
+        "the friendly error echoes the bad arg: {last}"
+    );
+}
+
 #[test]
 fn submitting_a_turn_repins_transcript_to_bottom() {
     let mut app = fresh_app(Some("offline"));

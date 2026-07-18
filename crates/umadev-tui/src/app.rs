@@ -829,6 +829,12 @@ pub enum Action {
     /// — worse on flaky Windows consoles. The event loop owns `terminal`, so the
     /// actual `terminal.clear()` is issued there, not from the app model.
     ForceRedraw,
+    /// `/theme auto` — re-fire the OSC 11 terminal background query so a
+    /// terminal that supports it re-answers and the async reply refines the
+    /// palette. The handler already released the manual pin and applied the
+    /// synchronous heuristic; the event loop owns the `terminal` writer, so the
+    /// escape query is issued there (mirrors [`Self::ForceRedraw`]).
+    ReprobeTheme,
 }
 
 /// Classify a typed reply to a PAUSED consequential-action approval (A2#5):
@@ -7502,6 +7508,13 @@ impl App {
             "tui.cmd.animations",
         ),
         Self::cmd("mouse", &[], None, CmdGroup::System, "tui.cmd.mouse"),
+        Self::cmd(
+            "theme",
+            &[],
+            Some("light|dark|auto"),
+            CmdGroup::System,
+            "tui.cmd.theme",
+        ),
         Self::cmd("logs", &[], None, CmdGroup::System, "tui.cmd.logs"),
         Self::cmd(
             "questions",
@@ -12661,6 +12674,7 @@ impl App {
             "usage" => self.slash_usage(),
             "animations" => self.slash_toggle_animations(),
             "mouse" => self.slash_toggle_mouse(),
+            "theme" => self.slash_theme(rest),
             "logs" => self.slash_logs(),
             "questions" => self.slash_questions(rest),
             "redraw" => {
@@ -16112,6 +16126,57 @@ impl App {
         // transcript; OFF actually issues DisableMouseCapture so native
         // click-drag selection works again. The event loop owns `terminal`.
         Action::SetMouseCapture(self.mouse_scroll)
+    }
+
+    /// `/theme light|dark|auto` — the blind-recovery control for a terminal
+    /// whose background UmaDev guessed wrong (most often Apple Terminal.app on a
+    /// non-stock profile, where near-white text lands on a white background and
+    /// the whole UI looks blank). `light`/`dark` force the palette for the rest
+    /// of the session and pin it so a late background-probe reply cannot flip it
+    /// back; `auto` releases the pin and re-runs detection. A user staring at
+    /// invisible text can type `/theme light` sight-unseen and recover at once.
+    fn slash_theme(&mut self, rest: &str) -> Action {
+        match rest.trim().to_ascii_lowercase().as_str() {
+            "light" => {
+                crate::ui::set_light_theme(true);
+                crate::ui::set_theme_locked(true);
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "slash.theme_light"),
+                );
+                Action::ForceRedraw
+            }
+            "dark" => {
+                crate::ui::set_light_theme(false);
+                crate::ui::set_theme_locked(true);
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "slash.theme_dark"),
+                );
+                Action::ForceRedraw
+            }
+            // No argument defaults to auto — the least surprising "reset" verb.
+            "auto" | "" => {
+                // Release the manual pin, apply the best synchronous guess now
+                // (env + Apple Terminal.app heuristic), then ask the event loop
+                // to re-fire the OSC 11 probe so an OSC-capable terminal refines
+                // it. Fail-open: a terminal that never answers keeps the guess.
+                crate::ui::set_theme_locked(false);
+                crate::ui::set_light_theme(crate::detect_light_bg());
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "slash.theme_auto"),
+                );
+                Action::ReprobeTheme
+            }
+            other => {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::tf(self.lang, "slash.theme_unknown", &[other]),
+                );
+                Action::None
+            }
+        }
     }
 
     /// `/logs` — toggle **process-log visibility** for the base's long-running

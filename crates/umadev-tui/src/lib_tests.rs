@@ -2192,6 +2192,115 @@ static OPENCODE_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// flake). Poison-robust so a panic in one never cascades.
 static GOAL_MODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serializes the theme-detection tests: they all read/write the process-global
+/// UMADEV_THEME / COLORFGBG / TERM_PROGRAM env vars, so without this a set_var in
+/// one could leak into a concurrent sibling reader and flip its verdict.
+static THEME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn detect_light_bg_defaults_dark_for_an_unknown_terminal() {
+    let _guard = THEME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _theme = EnvRestore::remove("UMADEV_THEME");
+    let _fgbg = EnvRestore::remove("COLORFGBG");
+    let _prog = EnvRestore::remove("TERM_PROGRAM");
+    assert!(
+        !detect_light_bg(),
+        "an unknown terminal with no hints stays on the dark default"
+    );
+}
+
+#[test]
+fn detect_light_bg_is_light_for_apple_terminal_without_other_hints() {
+    let _guard = THEME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _theme = EnvRestore::remove("UMADEV_THEME");
+    let _fgbg = EnvRestore::remove("COLORFGBG");
+    let _prog = EnvRestore::set("TERM_PROGRAM", "Apple_Terminal");
+    assert!(
+        detect_light_bg(),
+        "Terminal.app answers no probe and ships a white profile, so default light"
+    );
+}
+
+#[test]
+fn umadev_theme_dark_overrides_the_apple_terminal_heuristic() {
+    let _guard = THEME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _theme = EnvRestore::set("UMADEV_THEME", "dark");
+    let _fgbg = EnvRestore::remove("COLORFGBG");
+    let _prog = EnvRestore::set("TERM_PROGRAM", "Apple_Terminal");
+    assert!(
+        !detect_light_bg(),
+        "an explicit UMADEV_THEME=dark wins over the Terminal.app heuristic"
+    );
+}
+
+#[test]
+fn theme_override_parses_light_dark_and_ignores_junk() {
+    let _guard = THEME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let _t = EnvRestore::set("UMADEV_THEME", "LIGHT");
+        assert_eq!(theme_override(), Some(true), "case-insensitive light");
+    }
+    {
+        let _t = EnvRestore::set("UMADEV_THEME", "  dark  ");
+        assert_eq!(theme_override(), Some(false), "trimmed dark");
+    }
+    {
+        let _t = EnvRestore::set("UMADEV_THEME", "sepia");
+        assert_eq!(theme_override(), None, "an unrecognized value is ignored");
+    }
+    {
+        let _t = EnvRestore::remove("UMADEV_THEME");
+        assert_eq!(theme_override(), None, "unset is no override");
+    }
+}
+
+#[test]
+fn theme_from_colorfgbg_reads_the_last_field_as_background() {
+    let _guard = THEME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let _c = EnvRestore::set("COLORFGBG", "0;15");
+        assert_eq!(
+            theme_from_colorfgbg(),
+            Some(true),
+            "bg 15 (bright white) => light"
+        );
+    }
+    {
+        let _c = EnvRestore::set("COLORFGBG", "15;0");
+        assert_eq!(theme_from_colorfgbg(), Some(false), "bg 0 (black) => dark");
+    }
+    {
+        let _c = EnvRestore::set("COLORFGBG", "7;0;7");
+        assert_eq!(
+            theme_from_colorfgbg(),
+            Some(true),
+            "bg is the LAST field: 7 (white) => light"
+        );
+    }
+    {
+        let _c = EnvRestore::set("COLORFGBG", "1;99");
+        assert_eq!(
+            theme_from_colorfgbg(),
+            None,
+            "an out-of-range background index is unusable"
+        );
+    }
+    {
+        let _c = EnvRestore::remove("COLORFGBG");
+        assert_eq!(theme_from_colorfgbg(), None, "unset is no signal");
+    }
+}
+
 fn isolate_opencode_config_env() -> Vec<EnvRestore> {
     [
         "OPENCODE_CONFIG",

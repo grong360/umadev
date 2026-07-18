@@ -7452,10 +7452,17 @@ type Term = Terminal<AnchoredBackend<Stdout>>;
 
 /// Initial light/dark choice. A safe asynchronous OSC 11 probe may refine it
 /// after the owned input reader starts; this function never reads stdin.
+///
+/// Order: an explicit `UMADEV_THEME` wins, then `$COLORFGBG`, then the narrow
+/// Apple Terminal.app heuristic (see `theme_from_apple_terminal`), then the
+/// dark default. The OSC 11 probe is intentionally NOT here — it needs stdin —
+/// so `setup_terminal` applies this synchronous result and the pre-paint
+/// drain / async reply then refine it for terminals that answer the query.
 #[must_use]
 pub fn detect_light_bg() -> bool {
     theme_override()
         .or_else(theme_from_colorfgbg)
+        .or_else(theme_from_apple_terminal)
         .unwrap_or(false)
 }
 
@@ -7485,10 +7492,35 @@ fn theme_from_colorfgbg() -> Option<bool> {
     Some(!(bg_num <= 6 || bg_num == 8))
 }
 
+/// Apple Terminal.app fallback. Terminal.app answers NEITHER `$COLORFGBG` NOR
+/// the OSC 11 background query, and its stock "Basic" profile is WHITE — so with
+/// no other signal it would fall to the dark default and paint near-white text
+/// on a white background (unreadable). When `$TERM_PROGRAM` identifies
+/// Terminal.app and nothing else has decided, default to light. This heuristic
+/// is deliberately narrow: every other terminal either defaults dark or answers
+/// the OSC 11 probe, so the dark default still stands for them. A dark-profile
+/// Terminal.app user forces `UMADEV_THEME=dark`, which is checked first (in
+/// [`detect_light_bg`]) and always wins.
+fn theme_from_apple_terminal() -> Option<bool> {
+    if std::env::var("TERM_PROGRAM").ok()?.trim() == "Apple_Terminal" {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn request_background_color<W: std::io::Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(b"\x1b]11;?\x1b\\")?;
     out.flush()
 }
+
+/// How long the pre-paint OSC 11 drain waits for a terminal to answer the
+/// background-color query before giving up (fail-open) and painting the first
+/// frame with the startup default. Short enough to be imperceptible on a
+/// terminal that never answers (Apple Terminal.app — already covered by the
+/// `TERM_PROGRAM` heuristic), long enough for a terminal that DOES answer to
+/// reply first (real terminals respond within a few milliseconds).
+const FIRST_PAINT_THEME_PROBE: Duration = Duration::from_millis(120);
 
 /// Set true by [`setup_terminal`] ONCE it has confirmed the terminal supports
 /// the kitty keyboard protocol AND successfully pushed the enhancement flags, so
@@ -9663,7 +9695,11 @@ fn apply_background_theme_reply(app: &mut App, input: &mut InputSource, draw_now
     let Some(is_light) = input.take_background_reply() else {
         return;
     };
-    if theme_override().is_none() {
+    // An explicit `UMADEV_THEME` or a manual `/theme light|dark` pin both win
+    // over a probe reply: the reply is still drained (so it never leaks as
+    // input), just not applied. `/theme auto` releases the pin and re-fires the
+    // query, so a fresh reply then lands here.
+    if theme_override().is_none() && !ui::theme_locked() {
         ui::set_light_theme(is_light);
         app.contaminate_terminal();
         *draw_now = true;
@@ -9792,6 +9828,17 @@ async fn event_loop(
     // stall, and an explicit UMADEV_THEME always wins.
     if use_owned && theme_override().is_none() {
         let _ = request_background_color(terminal.backend_mut());
+        // Give a terminal that supports OSC 11 a brief, bounded window to answer
+        // BEFORE the first frame, so it gets the correct palette immediately
+        // instead of flashing the startup-default dark theme until the async
+        // reply lands. Fail-open: a terminal that never answers (Apple
+        // Terminal.app — already covered by the `TERM_PROGRAM` heuristic) waits
+        // at most `FIRST_PAINT_THEME_PROBE`, and a parse miss leaves the default.
+        // Any keystrokes typed during the window stay queued for the loop below.
+        input.prime_background_theme(FIRST_PAINT_THEME_PROBE).await;
+        if let Some(is_light) = input.take_background_reply() {
+            ui::set_light_theme(is_light);
+        }
     }
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     let mut clipboard_image_in_flight = false;
@@ -10421,6 +10468,18 @@ async fn event_loop(
                     // pre-empted by the automatic heals (P0 under sync
                     // output: every frame; P3 contamination
                     // elsewhere). Fail-open.
+                    app.contaminate_terminal();
+                }
+                Action::ReprobeTheme => {
+                    // `/theme auto` — the handler already released the pin and
+                    // applied the synchronous heuristic; here we re-fire the OSC
+                    // 11 query so a terminal that supports it re-answers and the
+                    // async `apply_background_theme_reply` refines the palette.
+                    // Guarded like the startup query: only the owned reader can
+                    // consume a reply, and an explicit `UMADEV_THEME` still wins.
+                    if use_owned && theme_override().is_none() {
+                        let _ = request_background_color(terminal.backend_mut());
+                    }
                     app.contaminate_terminal();
                 }
             }
