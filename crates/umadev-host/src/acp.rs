@@ -728,12 +728,64 @@ impl AcpVendor {
 
 fn grok_auth_state_from_api_key(value: Option<&OsStr>) -> AuthState {
     if value.is_some_and(|value| !value.is_empty()) {
+        return AuthState::LoggedIn;
+    }
+    // No API key — fall back to the cached browser/device login. Grok writes its
+    // OAuth credential to `~/.grok/auth.json` (keyed by the x.ai auth endpoint),
+    // exactly as codex (`~/.codex/auth.json`) and opencode (`…/opencode/auth.json`)
+    // store theirs. A non-empty JSON object there is a stored login, so a user who
+    // authenticated through the browser flow no longer reads as "unverified".
+    // Fail-open: absent / empty `{}` / unreadable stays Unknown — never a false
+    // LoggedIn.
+    if grok_cached_login_present() {
         AuthState::LoggedIn
     } else {
-        // A cached browser/device login cannot be proven without touching the
-        // user's HOME or invoking an interactive flow, so remain conservative.
         AuthState::Unknown
     }
+}
+
+/// Grok's cached-login credential file: `~/.grok/auth.json`. `None` when no home
+/// directory can be derived (fail-open — the probe then stays Unknown).
+fn grok_auth_file() -> Option<std::path::PathBuf> {
+    crate::home_dir().map(|home| home.join(".grok").join("auth.json"))
+}
+
+/// Whether Grok has a stored browser/device login on disk.
+fn grok_cached_login_present() -> bool {
+    grok_auth_file().is_some_and(|path| credential_file_has_entries(&path))
+}
+
+/// Kimi Code's cached-login credential file: `$KIMI_CODE_HOME/credentials/
+/// kimi-code.json` (the CLI honours `KIMI_CODE_HOME`, default `~/.kimi-code`). The
+/// file is the OAuth token set (`access_token` / `refresh_token` / `expires_at`).
+/// `None` when no home directory can be derived (fail-open — probe stays Unknown).
+fn kimi_auth_file() -> Option<std::path::PathBuf> {
+    let root = std::env::var_os("KIMI_CODE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::home_dir().map(|home| home.join(".kimi-code")))?;
+    Some(root.join("credentials").join("kimi-code.json"))
+}
+
+/// Whether Kimi Code has a stored login on disk. The ACP `authenticate(login)`
+/// check at session open stays authoritative for actually USING the token; this
+/// only makes the picker show a real login instead of "unverified".
+fn kimi_cached_login_present() -> bool {
+    kimi_auth_file().is_some_and(|path| credential_file_has_entries(&path))
+}
+
+/// Pure check shared by the grok/kimi login probes: `path` exists and holds a
+/// non-empty JSON object (at least one credential entry). Fail-open: an absent
+/// file, an empty `{}`, a non-object, or any read/parse failure returns `false`,
+/// so the auth probe never claims a login it cannot actually see.
+fn credential_file_has_entries(path: &std::path::Path) -> bool {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.as_object().map(|object| !object.is_empty()))
+        .unwrap_or(false)
 }
 
 fn permission_mode(
@@ -1132,10 +1184,18 @@ impl HostDriver for AcpDriver {
                 let value = std::env::var_os("XAI_API_KEY");
                 grok_auth_state_from_api_key(value.as_deref())
             }
-            // Kimi keeps OAuth/provider credentials under its own data root.
-            // A version probe cannot prove that token is usable; the ACP
-            // `authenticate(login)` check at session open is authoritative.
-            AcpVendor::Kimi => AuthState::Unknown,
+            // Kimi keeps its OAuth credential under its own data root. The ACP
+            // `authenticate(login)` check at session open remains authoritative for
+            // USING the token, but a stored credential on disk is enough for the
+            // picker to show a real login instead of "unverified". Fail-open:
+            // absent/empty/unreadable stays Unknown — never a false LoggedIn.
+            AcpVendor::Kimi => {
+                if kimi_cached_login_present() {
+                    AuthState::LoggedIn
+                } else {
+                    AuthState::Unknown
+                }
+            }
         }
     }
 }
@@ -9412,16 +9472,63 @@ mod tests {
     }
 
     #[test]
-    fn grok_auth_probe_uses_only_nonempty_api_key_presence() {
+    fn grok_auth_probe_treats_a_nonempty_api_key_as_logged_in() {
+        // The env-key path is deterministic and independent of the machine's real
+        // ~/.grok — a non-empty key is an instant LoggedIn, and the key itself is
+        // never rendered into the state. (The no-key path now consults the cached
+        // login file, covered by `grok_login_file_is_present_*` below, so it is not
+        // asserted here where the ambient home is uncontrolled.)
         let secret = OsStr::new("xai-secret-value-must-never-be-rendered");
         let state = grok_auth_state_from_api_key(Some(secret));
         assert_eq!(state, AuthState::LoggedIn);
-        assert_eq!(
-            grok_auth_state_from_api_key(Some(OsStr::new(""))),
-            AuthState::Unknown
-        );
-        assert_eq!(grok_auth_state_from_api_key(None), AuthState::Unknown);
         assert!(!format!("{state:?}").contains(secret.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn a_stored_credential_reads_as_login_only_on_a_nonempty_json_object() {
+        // Regression: a browser/device login must read as a stored login so it no
+        // longer shows "installed · login unverified" — Grok writes ~/.grok/auth.json
+        // (keyed by the x.ai auth endpoint) and Kimi writes
+        // ~/.kimi-code/credentials/kimi-code.json (an OAuth token set), both
+        // non-empty JSON objects. An empty object, a non-object, garbage, or an
+        // absent file must NOT — the probe never claims a login it cannot see.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        std::fs::write(&path, r#"{"https://auth.x.ai::client-abc":{"t":"…"}}"#).unwrap();
+        assert!(
+            credential_file_has_entries(&path),
+            "a grok login is present"
+        );
+
+        std::fs::write(&path, r#"{"access_token":"…","refresh_token":"…"}"#).unwrap();
+        assert!(
+            credential_file_has_entries(&path),
+            "a kimi login is present"
+        );
+
+        std::fs::write(&path, "{}").unwrap();
+        assert!(
+            !credential_file_has_entries(&path),
+            "empty object is not a login"
+        );
+
+        std::fs::write(&path, "[]").unwrap();
+        assert!(
+            !credential_file_has_entries(&path),
+            "a non-object is not a login"
+        );
+
+        std::fs::write(&path, "not json").unwrap();
+        assert!(
+            !credential_file_has_entries(&path),
+            "garbage is not a login"
+        );
+
+        assert!(
+            !credential_file_has_entries(&dir.path().join("absent.json")),
+            "an absent file is not a login"
+        );
     }
 
     #[test]
