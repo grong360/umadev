@@ -30,7 +30,14 @@ test('terminal contract: package and executable versions agree through Unicode p
   assert.ok(platformLeaf, `unsupported CI platform ${process.platform}-${process.arch}`);
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev 终端契约-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.after(() =>
+    fs.rmSync(root, {
+      recursive: true,
+      force: true,
+      maxRetries: 20,
+      retryDelay: 100,
+    }),
+  );
   const packageRoot = path.join(root, '用户 空格', 'node_modules', 'umadev');
   const platformRoot = path.join(
     root,
@@ -170,7 +177,16 @@ test(
       process.exitCode = saved.exitCode;
       console.error = saved.error;
       console.warn = saved.warn;
-      fs.rmSync(root, { recursive: true, force: true });
+      // Windows releases a terminated process's handle to its .exe slightly
+      // AFTER the 'exit' event, so an immediate rmdir of the dir holding it hits
+      // ENOTEMPTY. maxRetries/retryDelay is Node's built-in backoff for exactly
+      // this (it retries EBUSY/ENOTEMPTY/EPERM), so cleanup waits out the handle.
+      fs.rmSync(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 20,
+        retryDelay: 100,
+      });
     });
 
     assert.equal(await runSelfUpdate(['--yes'], packageRoot), true);
