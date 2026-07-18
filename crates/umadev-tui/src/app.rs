@@ -3726,8 +3726,8 @@ pub struct App {
     /// abort — a FROZEN, interrupted view of the saved plan, not a live run. The
     /// renderer keys off this to draw a static "interrupted — /continue to resume"
     /// header instead of the live "· running" spinner. Set only by
-    /// [`Self::rehydrate_frozen_plan_if_transient`]; cleared by every reset path and
-    /// by a fresh plan post, so it never bleeds into a new build. Default `false`.
+    /// `rehydrate_frozen_plan_if_transient`; cleared by every reset path and by a
+    /// fresh plan post, so it never bleeds into a new build. Default `false`.
     pub plan_frozen: bool,
 
     /// **Team-review verdicts** (Wave 1 deliverable 3) — each reviewing seat's
