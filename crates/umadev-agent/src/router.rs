@@ -433,7 +433,7 @@ pub async fn route_with_context_and_readonly_session(
     }
 
     let plan = apply_route_ceilings(
-        brain_to_route(&brain, requirement),
+        brain_to_route_in_mode(&brain, requirement, options.mode),
         requirement,
         options.mode,
     );
@@ -1024,7 +1024,7 @@ pub async fn route_via_brain_in_mode(
     mode: crate::trust::TrustMode,
 ) -> RoutePlan {
     let plan = match consult_brain_oneshot(runtime, requirement).await {
-        Some(brain) => brain_to_route(&brain, requirement),
+        Some(brain) => brain_to_route_in_mode(&brain, requirement, mode),
         // Simplest possible degradation (NOT a keyword fallback): treat it as a
         // chat turn and pass it straight to the base. This path is reached only
         // after `consult_brain_oneshot` already retried a prose (non-JSON) reply
@@ -1086,11 +1086,36 @@ async fn triage_once(
     serde_json::from_str::<BrainRoute>(&json).ok()
 }
 
+/// Map the brain's triage verdict into an owned [`RoutePlan`] under the strict,
+/// approval-gated posture (a missing/garbled write authorization is never treated
+/// as permission). This is the [`crate::trust::TrustMode::Guarded`] reading; the
+/// mode-aware [`brain_to_route_in_mode`] is what the live routing surfaces call.
+/// Test-only: every production caller threads the session's real trust mode.
+#[cfg(test)]
+fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
+    brain_to_route_in_mode(brain, requirement, crate::trust::TrustMode::Guarded)
+}
+
 /// Map the brain's triage verdict into an owned [`RoutePlan`] — the brain is
 /// **authoritative** here (no escalate-only flooring): it decides the class, the
 /// depth (from complexity), the kind, and the implied team. An unparseable field
 /// falls back to the lightest sensible value.
-fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
+///
+/// `mode` gates ONE boundary: whether a brain-classified mutating turn is demoted to
+/// read-only because its separate `authorization` field is not an affirmative
+/// `mutating`. Under the approval-gated tiers (Guarded / Plan) it is — a missing or
+/// non-affirmative verdict is not permission, so their gate is never bypassed. Under
+/// [`crate::trust::TrustMode::Auto`] the user has pre-authorized autonomy, so the
+/// brain's mutating CLASS verdict is authoritative and the auth field alone no longer
+/// vetoes it (genuine read-only is still enforced by the user-wording and mode
+/// ceilings applied afterward). This is the fix for a build under AUTO being trapped
+/// in a read-only planning turn, which forces claude-code into its native plan mode
+/// and can never transition to execution.
+fn brain_to_route_in_mode(
+    brain: &BrainRoute,
+    requirement: &str,
+    mode: crate::trust::TrustMode,
+) -> RoutePlan {
     let mut class = parse_class(&brain.class).unwrap_or(RouteClass::Chat);
     // Default kind: a mutating class (build / quick-edit / debug) whose `kind` field
     // is unparseable must NOT fall back to `Light` — `Light` convenes ZERO team, so a
@@ -1112,8 +1137,26 @@ fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
         class = RouteClass::QuickEdit;
     }
     // Mutation requires an affirmative typed verdict on both brain-routing surfaces;
-    // missing or malformed authorization is not permission.
-    if class.mutates_workspace() && parse_authorization(&brain.authorization) != Some(true) {
+    // a missing or malformed authorization field is not permission under the
+    // approval-gated tiers (Guarded / Plan), whose gate must never be bypassed.
+    //
+    // Under AUTO the user has pre-authorized autonomy, so the brain's mutating CLASS
+    // verdict IS the intent and the separate `authorization` field no longer vetoes
+    // it. That field is a model self-report, and the pre-action intent barrier
+    // consults the base on a `--permission-mode plan` (read-only) fork — a posture
+    // that can skew the reply toward `read_only` even for a real build. When that
+    // demotion fired, the build ran as a read-only Explain turn, which opens
+    // claude-code in its own native plan mode; the base then drafts a plan and can
+    // never exit it, so a build under AUTO never transitions to execution (the
+    // reported deadlock). Genuine read-only intent is still enforced downstream in
+    // EVERY mode by the explicit user-wording ceiling (`apply_authorization_ceiling`)
+    // and the mode ceiling (`apply_mode_ceiling`); AUTO only stops the auth FIELD
+    // alone from trapping the turn.
+    let demote_for_missing_authorization = match mode {
+        crate::trust::TrustMode::Auto => false,
+        _ => parse_authorization(&brain.authorization) != Some(true),
+    };
+    if class.mutates_workspace() && demote_for_missing_authorization {
         class = RouteClass::Explain;
         kind = TaskKind::Light;
     }
@@ -2439,6 +2482,83 @@ mod tests {
                 assert!(route.team.is_empty(), "{class}");
             }
         }
+    }
+
+    #[test]
+    fn auto_honours_a_brain_build_class_when_authorization_field_is_weak() {
+        // The reported deadlock: a build under AUTO whose reply carried a
+        // missing/garbled authorization field was demoted to a read-only Explain
+        // turn, which opens claude-code in its native plan mode and can never
+        // transition to execution. Under AUTO the brain's mutating CLASS verdict
+        // must stand so the build flows straight to a write-capable execute turn.
+        for (class, kind) in [
+            ("quick_edit", "light"),
+            ("debug", "bugfix"),
+            ("build", "greenfield"),
+        ] {
+            for authorization in ["", "unexpected_value"] {
+                let brain = BrainRoute {
+                    class: class.to_string(),
+                    authorization: authorization.to_string(),
+                    kind: kind.to_string(),
+                    complexity: "complex".to_string(),
+                    ..Default::default()
+                };
+                let auto = brain_to_route_in_mode(
+                    &brain,
+                    "做一个能上架的产品落地页",
+                    crate::trust::TrustMode::Auto,
+                );
+                assert!(
+                    auto.class.mutates_workspace(),
+                    "AUTO must keep {class} / {authorization:?} write-capable"
+                );
+
+                // Guarded / Plan keep the strict floor: a weak authorization is not
+                // permission there, so the approval gate is never bypassed.
+                for strict in [
+                    crate::trust::TrustMode::Guarded,
+                    crate::trust::TrustMode::Plan,
+                ] {
+                    let route = brain_to_route_in_mode(&brain, "current request", strict);
+                    assert_eq!(
+                        route.class,
+                        RouteClass::Explain,
+                        "{strict:?} must demote {class} / {authorization:?} to read-only"
+                    );
+                    assert!(!route.class.mutates_workspace(), "{strict:?} / {class}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_reads_the_class_over_the_auth_field_but_honours_explicit_read_only_wording() {
+        // Under AUTO the brain's CLASS is authoritative, so a bare `read_only`
+        // authorization FIELD (which a plan-mode fork can emit even for a real build)
+        // no longer vetoes the build. Genuine read-only intent must come from the
+        // user's own wording, which the explicit read-only ceiling still enforces in
+        // every mode — including AUTO.
+        let brain = BrainRoute {
+            class: "build".to_string(),
+            authorization: "read_only".to_string(),
+            kind: "greenfield".to_string(),
+            complexity: "complex".to_string(),
+            ..Default::default()
+        };
+        // A bare auth field is not a veto under AUTO: the build stands.
+        let build = brain_to_route_in_mode(&brain, "做一个落地页", crate::trust::TrustMode::Auto);
+        assert!(build.class.mutates_workspace());
+
+        // Explicit read-only USER WORDING is a hard ceiling, even under AUTO.
+        let request = "只分析 SEO，不要修改任何文件";
+        let capped = apply_route_ceilings(
+            brain_to_route_in_mode(&brain, request, crate::trust::TrustMode::Auto),
+            request,
+            crate::trust::TrustMode::Auto,
+        );
+        assert_eq!(capped.class, RouteClass::Explain);
+        assert!(!capped.class.mutates_workspace());
     }
 
     #[test]
