@@ -78,9 +78,13 @@ fn version_output_excerpt(raw: &str) -> String {
     }
 }
 
-/// Validate the permission semantics supplied by the installed OpenCode CLI.
-/// Low and unparseable versions both fail closed with an actionable diagnostic.
-fn validate_opencode_version(raw: &str) -> Result<Version, String> {
+/// Enforce the read-only Plan floor against an OpenCode `--version` value: a
+/// version at or above [`MIN_SAFE_OPENCODE_VERSION`] passes, a lower or
+/// unparseable one fails closed with the actionable upgrade diagnostic. This is
+/// the single source of the Plan-mode refusal message and is applied ONLY for
+/// the read-only Plan posture — Guarded and Auto never reject on the version
+/// number.
+pub(crate) fn validate_opencode_version(raw: &str) -> Result<Version, String> {
     let Some(version) = parse_reported_opencode_version(raw) else {
         return Err(format!(
             "OpenCode CLI returned an unrecognized `--version` value (`{}`). UmaDev cannot prove that the Plan read-only subagent fix from {MIN_SAFE_OPENCODE_VERSION} is present, so it refused to run this base instead of assuming it is safe. Upgrade or reinstall with `{OPENCODE_UPGRADE_COMMAND}`, verify `opencode --version`, and retry.",
@@ -96,13 +100,18 @@ fn validate_opencode_version(raw: &str) -> Result<Version, String> {
     Ok(version)
 }
 
-/// Run the real version probe used by discovery and every OpenCode execution
-/// surface. Returning the normalized version keeps picker/doctor output stable.
-pub(crate) async fn probe_safe_opencode_version(
+/// Resolve the installed `opencode` binary by reading its `--version`, WITHOUT
+/// enforcing the read-only floor. This only proves the base is installed and
+/// answering, so discovery and the Guarded/Auto postures run ANY installed
+/// version. `Ok` carries the raw `--version` output for a caller that then
+/// applies the Plan-only floor; `Err` distinguishes an absent binary
+/// (`... not found on PATH`, surfaced as `NotInstalled`) from a `--version`
+/// that genuinely failed (surfaced as `Unhealthy`).
+pub(crate) async fn probe_opencode_version(
     program: &str,
     workspace: &Path,
 ) -> Result<String, String> {
-    let out = run_subprocess(SubprocessCall {
+    run_subprocess(SubprocessCall {
         program,
         args: &["--version".to_string()],
         prompt: "",
@@ -111,8 +120,48 @@ pub(crate) async fn probe_safe_opencode_version(
         timeout: Duration::from_secs(10),
         env: &[],
     })
-    .await?;
-    validate_opencode_version(&out.stdout).map(|version| version.to_string())
+    .await
+    .map(|out| out.stdout)
+}
+
+/// The version string the picker/doctor shows for a resolved binary: the exact
+/// semver when the `--version` output is recognizable, otherwise a short,
+/// single-line excerpt of what the CLI reported. An unfamiliar format is still
+/// "installed" — never a refusal at discovery time.
+fn reported_opencode_version(raw: &str) -> String {
+    parse_reported_opencode_version(raw).map_or_else(
+        || version_output_excerpt(raw),
+        |version| version.to_string(),
+    )
+}
+
+/// Apply the read-only floor for a permission posture to an already-resolved
+/// `--version` output. Read-only Plan requires a version at or above
+/// [`MIN_SAFE_OPENCODE_VERSION`] (a `Task` subagent on an older build can escape
+/// Plan's read-only rules and write files — a prevention UmaDev cannot honor
+/// after the fact); Guarded and Auto accept any version, because a base already
+/// permitted to write gains nothing from that bypass. Split from resolution so
+/// the one-shot driver can reuse its memoized probe while the session path
+/// probes fresh, yet both share the exact same posture rule.
+fn floor_for_posture(raw: &str, permissions: BasePermissionProfile) -> Result<(), String> {
+    if matches!(permissions, BasePermissionProfile::Plan) {
+        validate_opencode_version(raw)?;
+    }
+    Ok(())
+}
+
+/// Resolve the `opencode` binary and enforce the read-only floor for
+/// `permissions` in one step. Shared by the persistent session's start/resume
+/// paths (which probe fresh) so NO execution path opens a read-only Plan session
+/// on a sub-minimum version, while Guarded/Auto adapt to any installed version.
+/// The one-shot driver applies the identical rule through its memoized probe.
+pub(crate) async fn ensure_opencode_version_permits(
+    program: &str,
+    workspace: &Path,
+    permissions: BasePermissionProfile,
+) -> Result<(), String> {
+    let raw = probe_opencode_version(program, workspace).await?;
+    floor_for_posture(&raw, permissions)
 }
 
 /// Drives the `opencode` CLI as a subprocess.
@@ -120,10 +169,13 @@ pub(crate) async fn probe_safe_opencode_version(
 pub struct OpenCodeDriver {
     program: String,
     timeout: Duration,
-    /// One security-version probe per driver (shared by its concurrent forks).
-    /// The actual execution paths consult it too, so a configured backend cannot
-    /// bypass the startup picker and silently run an unsafe Plan session.
-    safe_version: Arc<OnceCell<Result<String, String>>>,
+    /// One `--version` probe per driver (shared by its concurrent forks),
+    /// caching whether the binary is installed and answering — NOT whether it
+    /// clears the read-only floor. Execution applies the Plan-only floor on top
+    /// of this, so a configured backend that bypasses the startup picker still
+    /// cannot open a read-only Plan session on a sub-minimum version, while
+    /// Guarded/Auto adapt to any installed version.
+    version_probe: Arc<OnceCell<Result<String, String>>>,
     /// Permission posture for this legacy one-shot driver. Defaults to Plan.
     permissions: BasePermissionProfile,
     /// When `true`, the next `complete` resumes a prior `opencode` session so
@@ -146,7 +198,7 @@ impl Default for OpenCodeDriver {
             program: std::env::var("UMADEV_OPENCODE_BIN")
                 .unwrap_or_else(|_| "opencode".to_string()),
             timeout: crate::worker_timeout_from_env(),
-            safe_version: Arc::new(OnceCell::new()),
+            version_probe: Arc::new(OnceCell::new()),
             permissions: BasePermissionProfile::Plan,
             continue_session: false,
             session_id: Arc::new(RwLock::new(None)),
@@ -172,21 +224,41 @@ impl OpenCodeDriver {
         self
     }
 
-    async fn require_safe_version(&self, workspace: &Path) -> Result<String, String> {
+    /// Resolve — once per driver — whether the binary is installed and answering
+    /// `--version`. Version-NUMBER-agnostic: the read-only Plan floor is applied
+    /// on top of this by [`Self::ensure_version_permits_run`], never baked in
+    /// here, so Guarded/Auto adapt to any installed version.
+    async fn require_resolved_version(&self, workspace: &Path) -> Result<String, String> {
         let program = self.program.clone();
         let workspace = workspace.to_path_buf();
-        self.safe_version
-            .get_or_init(|| async move { probe_safe_opencode_version(&program, &workspace).await })
+        self.version_probe
+            .get_or_init(|| async move { probe_opencode_version(&program, &workspace).await })
             .await
             .clone()
     }
 
+    /// Gate a run for this driver's posture, reusing the memoized probe. Read-only
+    /// Plan enforces the minimum-safe-version floor (the exact upgrade refusal is
+    /// unchanged); Guarded and Auto run ANY installed version. This is the single
+    /// choke point both execution surfaces call, so no code path can open a
+    /// read-only Plan session on a sub-minimum version.
+    async fn ensure_version_permits_run(&self, workspace: &Path) -> Result<(), String> {
+        let raw = self.require_resolved_version(workspace).await?;
+        floor_for_posture(&raw, self.permissions)
+    }
+
+    /// Inject a `--version` result into the memoized probe so tests exercise the
+    /// posture-scoped floor without a real binary. It records the raw resolution
+    /// (installed + answering); the Plan-only floor is applied at run time, so a
+    /// sub-minimum string is refused under Plan yet runs under Guarded/Auto.
     #[cfg(test)]
     fn with_version_output_for_test(mut self, raw: &str) -> Self {
-        let value = validate_opencode_version(raw).map(|version| version.to_string());
-        let cell = OnceCell::new();
-        assert!(cell.set(value).is_ok(), "fresh version cell must be empty");
-        self.safe_version = Arc::new(cell);
+        let cell: OnceCell<Result<String, String>> = OnceCell::new();
+        assert!(
+            cell.set(Ok(raw.to_string())).is_ok(),
+            "fresh version cell must be empty"
+        );
+        self.version_probe = Arc::new(cell);
         self
     }
 
@@ -335,7 +407,7 @@ impl Runtime for OpenCodeDriver {
 
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse, RuntimeError> {
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
-        self.require_safe_version(&ws)
+        self.ensure_version_permits_run(&ws)
             .await
             .map_err(crate::map_subprocess_error)?;
         let prompt = merge_prompt(&req);
@@ -393,7 +465,7 @@ impl Runtime for OpenCodeDriver {
     ) -> Result<CompletionResponse, RuntimeError> {
         let prompt = merge_prompt(&req);
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
-        self.require_safe_version(&ws)
+        self.ensure_version_permits_run(&ws)
             .await
             .map_err(crate::map_subprocess_error)?;
         let args = self.call_args(&req.model);
@@ -729,10 +801,15 @@ impl HostDriver for OpenCodeDriver {
 
     async fn probe(&self) -> ProbeResult {
         let tmp = default_workspace();
-        match self.require_safe_version(&tmp).await {
-            // Installed — resolve the honest auth state too (gap G10).
-            Ok(version) => ProbeResult::Ready {
-                version,
+        match self.require_resolved_version(&tmp).await {
+            // Installed AND answering `--version` → Ready regardless of the
+            // version NUMBER: an old build is installed, not "refused". The
+            // read-only Plan floor is applied at run time, never at discovery,
+            // so the picker treats OpenCode like every other base and can still
+            // show the detected version. Resolve the honest auth state too
+            // (gap G10).
+            Ok(raw) => ProbeResult::Ready {
+                version: reported_opencode_version(&raw),
                 auth_state: self.probe_auth().await,
             },
             Err(e) if e.contains("not found on PATH") => ProbeResult::NotInstalled {
@@ -827,6 +904,20 @@ mod tests {
 
     use super::*;
 
+    /// A minimal one-turn request for the execution-surface tests.
+    fn sample_completion_request() -> CompletionRequest {
+        CompletionRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![umadev_runtime::Message {
+                role: "user".into(),
+                content: "go".into(),
+            }],
+            max_tokens: None,
+            temperature: None,
+        }
+    }
+
     #[test]
     fn fork_yields_a_concurrent_instance() {
         // A real logged-in base MUST fork so the pipeline's parallel fan-out
@@ -899,6 +990,155 @@ mod tests {
         };
         let err = d.complete(req).await.unwrap_err().to_string();
         assert!(err.contains("minimum safe version 1.14.31"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn guarded_and_auto_adapt_to_any_installed_version() {
+        // The core directive: a version NUMBER may only gate the read-only
+        // safety behavior, never blanket-refuse the base. Below the Plan floor,
+        // Guarded and Auto still run — they are already permitted to write, so
+        // the Task-subagent read-only bypass the floor guards against is moot.
+        for profile in [BasePermissionProfile::Guarded, BasePermissionProfile::Auto] {
+            let d = OpenCodeDriver::with_program("echo")
+                .with_permissions(profile)
+                .with_version_output_for_test("1.14.30");
+            let resp = d
+                .complete(sample_completion_request())
+                .await
+                .expect("Guarded/Auto must run any installed version");
+            assert_eq!(resp.id, "opencode-cli");
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_still_refuses_below_minimum_and_unparseable_versions() {
+        // Read-only Plan keeps the unchanged upgrade refusal — the one place a
+        // write cannot be un-done, so prevention is the only option.
+        for raw in ["1.14.30", "OpenCode version unknown", ""] {
+            let d = OpenCodeDriver::with_program("echo")
+                .with_permissions(BasePermissionProfile::Plan)
+                .with_version_output_for_test(raw);
+            let err = d
+                .complete(sample_completion_request())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("refused to run"), "{raw:?} -> {err}");
+            assert!(err.contains(OPENCODE_UPGRADE_COMMAND), "{raw:?} -> {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_runs_on_the_minimum_or_higher() {
+        for raw in ["1.14.31", "1.17.16"] {
+            let d = OpenCodeDriver::with_program("echo")
+                .with_permissions(BasePermissionProfile::Plan)
+                .with_version_output_for_test(raw);
+            let resp = d
+                .complete(sample_completion_request())
+                .await
+                .expect("Plan runs once the read-only fix is present");
+            assert_eq!(resp.id, "opencode-cli");
+        }
+    }
+
+    // The core safety property: a read-only Plan session can NEVER exec a
+    // sub-minimum OpenCode. A real binary would create a sentinel if run; the
+    // Plan floor must refuse BEFORE any exec, on the streaming AND non-streaming
+    // surfaces, for a low AND an unparseable version.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_plan_never_execs_a_sub_minimum_base() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::TempDir::new().unwrap();
+        let sentinel = dir.path().join("base_ran.flag");
+        let script = dir.path().join("fake-opencode");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n: > '{}'\nprintf 'ran\\n'\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = script.to_str().unwrap();
+
+        for raw in ["1.14.30", "OpenCode version unknown"] {
+            for streaming in [false, true] {
+                let d = OpenCodeDriver::with_program(program)
+                    .with_permissions(BasePermissionProfile::Plan)
+                    .with_version_output_for_test(raw);
+                let result = if streaming {
+                    d.complete_streaming(sample_completion_request(), &|_ev| {})
+                        .await
+                } else {
+                    d.complete(sample_completion_request()).await
+                };
+                let err = result.unwrap_err().to_string();
+                assert!(
+                    err.contains("refused to run"),
+                    "{raw:?}/{streaming} -> {err}"
+                );
+                assert!(
+                    !sentinel.exists(),
+                    "read-only Plan must NEVER exec a sub-minimum base ({raw:?}, streaming={streaming})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_reports_ready_for_an_installed_old_version() {
+        // Installed but below the Plan floor is still INSTALLED: the doctor/picker
+        // shows Ready (with the detected version), like claude/codex/kimi/grok —
+        // the read-only refusal is deferred to a Plan run, not shown as Unhealthy.
+        let d = OpenCodeDriver::with_program("echo").with_version_output_for_test("1.14.30");
+        match d.probe().await {
+            ProbeResult::Ready { version, .. } => assert_eq!(version, "1.14.30"),
+            other => panic!("an installed old version must probe Ready, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_reports_unhealthy_when_version_command_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // `--version` present but genuinely failing (non-zero exit) is Unhealthy,
+        // distinct from an absent binary (NotInstalled).
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("broken-opencode");
+        std::fs::write(&script, "#!/bin/sh\necho boom >&2\nexit 3\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let d = OpenCodeDriver::with_program(script.to_str().unwrap());
+        assert!(matches!(d.probe().await, ProbeResult::Unhealthy { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_gate_scopes_the_floor_to_plan() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // `ensure_opencode_version_permits` is the choke point the persistent
+        // session start/resume paths call. A sub-minimum version is refused for
+        // read-only Plan and accepted for Guarded/Auto — the same posture rule as
+        // the one-shot driver, proven on the exact shared function.
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("old-opencode");
+        std::fs::write(&script, "#!/bin/sh\necho 1.14.30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = script.to_str().unwrap();
+        let ws = std::env::temp_dir();
+
+        let refused = ensure_opencode_version_permits(program, &ws, BasePermissionProfile::Plan)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.contains("minimum safe version 1.14.31"),
+            "{refused}"
+        );
+
+        for profile in [BasePermissionProfile::Guarded, BasePermissionProfile::Auto] {
+            ensure_opencode_version_permits(program, &ws, profile)
+                .await
+                .expect("Guarded/Auto adapt to any installed version at the shared gate");
+        }
     }
 
     #[test]
