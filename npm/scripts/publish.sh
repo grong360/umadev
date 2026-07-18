@@ -97,7 +97,9 @@ remote_integrity() {
 }
 
 remote_version() {
-  npm view "$1@$2" version --json 2>/dev/null | node -e '
+  # --prefer-online forces a registry revalidation so a retry loop re-reads the
+  # live dist-tag instead of a cached packument from an earlier (stale) read.
+  npm view "$1@$2" version --json --prefer-online 2>/dev/null | node -e '
     const fs = require("node:fs");
     try {
       const value = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -187,7 +189,18 @@ if [[ -z "$DRY_RUN" ]]; then
     name="$(node -p 'JSON.parse(process.argv[1]).name' "$manifest")"
     version="$(node -p 'JSON.parse(process.argv[1]).version' "$manifest")"
     npm dist-tag add "$name@$version" latest
-    tagged="$(remote_version "$name" latest || true)"
+    # npm's registry is read-after-write eventually consistent: a read
+    # immediately after `dist-tag add` can still return the previous value from a
+    # replica or CDN edge. The add above is authoritative, so poll the read-back
+    # (up to ~40s) rather than failing an otherwise-successful promotion on the
+    # first stale reply — the exact flake that left 1.0.56 published but with
+    # `latest` still pointing at the prior version.
+    tagged=""
+    for _ in 1 2 3 4 5 6 7 8; do
+      tagged="$(remote_version "$name" latest || true)"
+      [[ "$tagged" == "$version" ]] && break
+      sleep 5
+    done
     [[ "$tagged" == "$version" ]] || {
       echo "publish.sh: latest for $name is $tagged, expected $version" >&2
       exit 1
