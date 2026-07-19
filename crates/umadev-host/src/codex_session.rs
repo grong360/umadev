@@ -100,7 +100,9 @@ use umadev_runtime::{
 
 use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
-use crate::{reap_after_kill, END_REAP_BUDGET};
+use crate::{
+    isolate_process_tree, kill_isolated_process_tree, reap_isolated_process_tree, END_REAP_BUDGET,
+};
 
 const MAX_INPUT_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// Bound one app-server JSONL record independently from the event-channel cap.
@@ -1334,6 +1336,13 @@ fn take_pipe<T>(pipe: Option<T>, which: &str) -> Result<T, SessionError> {
 
 /// Spawn `codex app-server` in `workspace` with piped stdio + kill-on-drop.
 /// Windows `.cmd`/`.bat` shims are routed through `cmd /c` by [`spawn_parts`].
+///
+/// The child is placed in its OWN process group ([`isolate_process_tree`]) so
+/// teardown can signal the WHOLE tree at once. An npm install exposes `codex` as
+/// a Node trampoline that execs the native `codex app-server` as a grandchild;
+/// killing only the direct child would reparent that native process to init
+/// (PPID 1) and leak it. The group lets [`reap_isolated_process_tree`] /
+/// [`kill_isolated_process_tree`] terminate the trampoline AND the native server.
 fn spawn_app_server(
     program: &str,
     workspace: &Path,
@@ -1347,6 +1356,7 @@ fn spawn_app_server(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    isolate_process_tree(&mut cmd);
     crate::spawn_retrying_etxtbsy(&mut cmd).map_err(|e| spawn_error(program, &e))
 }
 
@@ -3448,11 +3458,13 @@ impl BaseSession for CodexSession {
 
     async fn end(&mut self) -> Result<(), SessionError> {
         // Best-effort graceful close: interrupt any in-flight turn, then kill the
-        // child AND wait (bounded) for it to be reaped so shutdown is
-        // deterministic and leaves no orphan `codex app-server`. On overrun we
-        // fail open to kill_on_drop. Consistent with claude / opencode `end()`.
+        // whole process GROUP AND wait (bounded) for the direct child to be
+        // reaped so shutdown is deterministic and leaves no orphan `codex
+        // app-server` — the native server is a grandchild of the Node trampoline,
+        // so a direct-child kill would leak it (reparented to PPID 1). On overrun
+        // we fail open to kill_on_drop. Consistent with claude / opencode `end()`.
         let _ = self.interrupt().await;
-        reap_after_kill(&self.child, END_REAP_BUDGET).await;
+        reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
         self.stderr_drain.shutdown().await;
         Ok(())
     }
@@ -3474,6 +3486,20 @@ impl BaseSession for CodexSession {
         // (`thread/resume` with a workspace-write sandbox), restoring the thread's
         // accumulated context. Empty (handshake not completed) → None (fail-open).
         (!self.thread_id.is_empty()).then_some(self.thread_id.as_str())
+    }
+}
+
+impl Drop for CodexSession {
+    fn drop(&mut self) {
+        // The non-`end()` teardown paths (a dropped route pre-classification, a
+        // timed-out or cancelled turn whose session is simply dropped) MUST also
+        // kill the whole process GROUP: killing only the direct Node trampoline
+        // leaves the native `codex app-server` grandchild reparented to init
+        // (PPID 1), which is the leak this fixes. Fail-open — a contended/poisoned
+        // lock falls back to the child's own `kill_on_drop(true)`.
+        if let Ok(mut child) = self.child.try_lock() {
+            kill_isolated_process_tree(&mut child);
+        }
     }
 }
 
@@ -5653,6 +5679,71 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, body).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The real fix, end-to-end through the codex spawn chokepoint. A fake `codex`
+    /// shim (standing in for the npm Node trampoline) spawns a long-lived
+    /// GRANDCHILD `sleep` in the isolated group (standing in for the native
+    /// `app-server`), then teardown via [`kill_isolated_process_tree`] on the
+    /// DIRECT child must reap the grandchild too. A direct-child-only kill would
+    /// orphan the grandchild to init (PPID 1) — the leak under fix. Fail-open:
+    /// skipped cleanly if `/bin/sh` or `sleep` cannot run on this platform.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_app_server_group_kill_reaps_a_grandchild() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("codex");
+        // Ignore the app-server arg; spawn a grandchild sleeper in THIS process
+        // group, record its pid to a file in cwd (pipe buffering would strand it
+        // on stdout), then block so this shim stays the group leader.
+        write_fake_codex(
+            &script,
+            "#!/bin/sh\nsleep 300 &\nprintf '%s' \"$!\" > gc.pid\nwait\n",
+        );
+        let Ok(mut child) = spawn_app_server(script.to_str().unwrap(), dir.path()) else {
+            return; // fail-open: platform could not spawn the shim
+        };
+        // Wait (bounded) for the grandchild pid to be published.
+        let pid_path = dir.path().join("gc.pid");
+        let mut grandchild: Option<i32> = None;
+        for _ in 0..250 {
+            if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                grandchild = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let Some(grandchild) = grandchild else {
+            // Shim never launched the grandchild — clean up the group and skip.
+            kill_isolated_process_tree(&mut child);
+            let _ = child.wait().await;
+            return;
+        };
+        let gc = nix::unistd::Pid::from_raw(grandchild);
+        assert!(
+            nix::sys::signal::kill(gc, None).is_ok(),
+            "the grandchild must be alive before teardown"
+        );
+        // Teardown: kill the whole GROUP, not just the direct shim.
+        kill_isolated_process_tree(&mut child);
+        let _ = child.wait().await;
+        // The grandchild is gone within a bounded window (init reaps the zombie).
+        let mut reaped = false;
+        for _ in 0..250 {
+            if nix::sys::signal::kill(gc, None).is_err() {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "the group kill must reap the grandchild, not orphan it to PPID 1"
+        );
     }
 
     #[cfg(unix)]

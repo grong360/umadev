@@ -96,7 +96,9 @@ use umadev_runtime::{
 
 use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
-use crate::{reap_after_kill, END_REAP_BUDGET};
+use crate::{
+    isolate_process_tree, kill_isolated_process_tree, reap_isolated_process_tree, END_REAP_BUDGET,
+};
 
 /// How many events the SSE-reader task may buffer ahead of the consumer.
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -544,6 +546,11 @@ async fn spawn_serve(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    // Own process group so teardown can signal the WHOLE tree: an npm-installed
+    // `opencode` can front the real server through a Node trampoline, and a
+    // direct-child kill would reparent the actual `opencode serve` to init and
+    // leak it. See [`isolate_process_tree`] / [`kill_isolated_process_tree`].
+    isolate_process_tree(&mut cmd);
 
     let mut child = crate::spawn_retrying_etxtbsy(&mut cmd)
         .map_err(|e| SessionError::Start(spawn_err(program, &e)))?;
@@ -558,7 +565,9 @@ async fn spawn_serve(
     let base_url = match read_listening_url(stdout, serve_timeout).await {
         Ok(url) => url,
         Err(error) => {
-            let _ = child.start_kill();
+            // `serve` start timed out / failed: kill the whole tree, not just the
+            // trampoline, so no native `opencode serve` grandchild is orphaned.
+            kill_isolated_process_tree(&mut child);
             return Err(SessionError::Start(error));
         }
     };
@@ -677,7 +686,7 @@ impl OpenCodeSession {
         let session_id = match http.create_session_profile(agent, model, permissions).await {
             Ok(id) => id,
             Err(e) => {
-                let _ = child.start_kill();
+                kill_isolated_process_tree(&mut child);
                 return Err(SessionError::Start(format!("create session: {e}")));
             }
         };
@@ -685,7 +694,7 @@ impl OpenCodeSession {
         let (rx, sse_task, turn_sse_gate) = match http.attach_sse(&session_id).await {
             Ok(attached) => attached,
             Err(error) => {
-                let _ = child.start_kill();
+                kill_isolated_process_tree(&mut child);
                 return Err(SessionError::Start(error));
             }
         };
@@ -763,7 +772,7 @@ impl OpenCodeSession {
                 .map_err(crate::redaction::sanitize_session_error)?;
 
         if let Err(error) = http.get_session(session_id).await {
-            let _ = child.start_kill();
+            kill_isolated_process_tree(&mut child);
             return Err(crate::redaction::sanitize_session_error(
                 SessionError::Start(format!("resume opencode session `{session_id}`: {error}")),
             ));
@@ -772,7 +781,7 @@ impl OpenCodeSession {
         // This is the fail-closed boundary that prevents a prior Auto session's
         // wildcard allow from surviving a Guarded/Plan resume.
         if let Err(error) = http.apply_permissions(session_id, permissions).await {
-            let _ = child.start_kill();
+            kill_isolated_process_tree(&mut child);
             return Err(crate::redaction::sanitize_session_error(
                 SessionError::Start(format!(
                     "refresh opencode session permissions `{session_id}`: {error}"
@@ -783,7 +792,7 @@ impl OpenCodeSession {
         let (rx, sse_task, turn_sse_gate) = match http.attach_sse(session_id).await {
             Ok(attached) => attached,
             Err(error) => {
-                let _ = child.start_kill();
+                kill_isolated_process_tree(&mut child);
                 return Err(crate::redaction::sanitize_session_error(
                     SessionError::Start(error),
                 ));
@@ -831,6 +840,13 @@ impl Drop for OpenCodeSession {
     fn drop(&mut self) {
         if let Some(task) = self.sse_task.take() {
             task.abort();
+        }
+        // A dropped session (timed-out / cancelled turn, or normal teardown that
+        // skipped `end()`) must kill the whole process GROUP: killing only the
+        // direct child can leave a native `opencode serve` grandchild orphaned.
+        // Fail-open — a contended/poisoned lock falls back to `kill_on_drop`.
+        if let Ok(mut child) = self.child.try_lock() {
+            kill_isolated_process_tree(&mut child);
         }
     }
 }
@@ -1072,7 +1088,7 @@ impl BaseSession for OpenCodeSession {
             .finish_session(&self.session_id, self.lifecycle)
             .await;
         self.pending_interactions.clear();
-        reap_after_kill(&self.child, END_REAP_BUDGET).await;
+        reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
         self.stderr_drain.shutdown().await;
         Ok(())
     }

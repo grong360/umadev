@@ -523,46 +523,6 @@ impl<T> Drop for AbortOnDrop<T> {
 /// so `end()` can never block the host.
 const END_REAP_BUDGET: Duration = Duration::from_secs(2);
 
-/// Start-kill a continuous-session base child and then poll (bounded by
-/// [`END_REAP_BUDGET`]) until the OS reaper actually reaps it — so `end()` is
-/// deterministic and leaves no orphan native or ACP base process behind.
-/// Consistent across the three native session drivers and the shared ACP
-/// session driver used by Grok Build.
-///
-/// The child lives behind a [`std::sync::Mutex`] so the `&self`
-/// `try_exit_status` peek needs no `&mut`; this takes the blocking lock ONLY for
-/// the sync `start_kill()` / `try_wait()` micro-calls and NEVER holds it across
-/// an `.await` (each poll re-locks), leaving the async reaper free to run.
-///
-/// Fail-open: a poisoned/contended lock or a `try_wait` error just ends the
-/// poll early — `kill_on_drop(true)` remains the final backstop, so we never
-/// block the host on shutdown.
-pub(crate) async fn reap_after_kill(
-    child: &std::sync::Mutex<tokio::process::Child>,
-    budget: Duration,
-) {
-    // Signal the kill under the lock (sync; the guard drops before any await).
-    match child.lock() {
-        Ok(mut guard) => {
-            let _ = guard.start_kill();
-        }
-        // Poisoned lock: a prior panic while holding it. Fail-open — the
-        // caller's `kill_on_drop` is the backstop.
-        Err(_) => return,
-    }
-    let deadline = tokio::time::Instant::now() + budget;
-    loop {
-        // Re-lock for a non-blocking `try_wait`; never hold the lock across the
-        // sleep. A contended lock (a concurrent `try_exit_status` peek) simply
-        // retries on the next tick.
-        let reaped = matches!(child.try_lock().map(|mut g| g.try_wait()), Ok(Ok(Some(_))));
-        if reaped || tokio::time::Instant::now() >= deadline {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// Put a long-lived machine-protocol child in its own process group.
 /// Descendants created by an npm/Node trampoline inherit that group, allowing
 /// shutdown to terminate the actual native base instead of only its wrapper.
@@ -582,6 +542,20 @@ pub(crate) fn isolate_process_tree(cmd: &mut tokio::process::Command) {
     {
         let _ = cmd;
     }
+}
+
+/// Build the `taskkill` arguments that force-kill an entire process TREE by pid:
+/// `/T` recurses into descendants, `/F` forces termination. Pure so the exact
+/// argument vector is unit-testable on every target, even though it is only
+/// *used* on Windows by [`kill_isolated_process_tree`].
+#[cfg(any(windows, test))]
+fn taskkill_tree_args(pid: u32) -> [String; 4] {
+    [
+        "/T".to_string(),
+        "/F".to_string(),
+        "/PID".to_string(),
+        pid.to_string(),
+    ]
 }
 
 /// Best-effort immediate termination of an isolated child and its descendants.
@@ -609,7 +583,7 @@ pub(crate) fn kill_isolated_process_tree(child: &mut tokio::process::Child) {
                 .join("System32")
                 .join("taskkill.exe");
             let _ = std::process::Command::new(taskkill)
-                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .args(taskkill_tree_args(pid))
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -3564,17 +3538,17 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reap_after_kill_reaps_a_running_child() {
-        // A live child (a long sleep) is start-killed and then observed reaped
-        // within the bounded budget — deterministic, no orphan.
-        let child = tokio::process::Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn sleep");
+    async fn reap_isolated_process_tree_reaps_a_running_child() {
+        // A live child (a long sleep) placed in its OWN process group is group-
+        // killed and then observed reaped within the bounded budget —
+        // deterministic, no orphan.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        isolate_process_tree(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleep");
         let m = std::sync::Mutex::new(child);
         let started = tokio::time::Instant::now();
-        reap_after_kill(&m, Duration::from_secs(5)).await;
+        reap_isolated_process_tree(&m, Duration::from_secs(5)).await;
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "reap must return before the full budget once the child dies"
@@ -3586,20 +3560,55 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn reap_after_kill_is_bounded_by_budget() {
+    async fn reap_isolated_process_tree_is_bounded_by_budget() {
         // Even with a zero budget the call kills then returns at once (fail-open),
         // never hanging — kill_on_drop is the backstop for the reap.
-        let child = tokio::process::Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn sleep");
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("30").kill_on_drop(true);
+        isolate_process_tree(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleep");
         let m = std::sync::Mutex::new(child);
         let started = tokio::time::Instant::now();
-        reap_after_kill(&m, Duration::ZERO).await;
+        reap_isolated_process_tree(&m, Duration::ZERO).await;
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "a zero budget must return promptly, not hang"
+        );
+    }
+
+    /// Windows kill-invocation argument construction — `taskkill /T /F /PID <pid>`
+    /// walks the whole process TREE. Pure + platform-independent so the exact
+    /// argument vector is asserted on every target (the Windows teardown path in
+    /// [`kill_isolated_process_tree`] builds its arguments from this helper).
+    #[test]
+    fn taskkill_tree_args_target_the_whole_tree_forcibly() {
+        assert_eq!(
+            taskkill_tree_args(4321),
+            ["/T", "/F", "/PID", "4321"],
+            "the tree kill must be forced (/F) and recursive (/T) for the exact pid"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_isolated_process_tree_is_fail_open_on_an_already_exited_child() {
+        // The child has already exited: the group signal cannot land and the
+        // direct-child kill is a no-op, but teardown must still return cleanly
+        // (no panic, no hang) so a dead base never blocks host shutdown.
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.kill_on_drop(true);
+        isolate_process_tree(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn true");
+        let _ = child.wait().await;
+        // Direct helper: returns without panicking on a reaped pid.
+        kill_isolated_process_tree(&mut child);
+        // And through the async reaper with a real budget: still prompt.
+        let m = std::sync::Mutex::new(child);
+        let started = tokio::time::Instant::now();
+        reap_isolated_process_tree(&m, Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "tearing down an already-dead child must return promptly"
         );
     }
 

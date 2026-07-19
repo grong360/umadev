@@ -65,7 +65,9 @@ use umadev_runtime::{
 
 use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
-use crate::{reap_after_kill, END_REAP_BUDGET};
+use crate::{
+    isolate_process_tree, kill_isolated_process_tree, reap_isolated_process_tree, END_REAP_BUDGET,
+};
 
 /// How many events the stdout-reader task may buffer ahead of the consumer.
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -529,6 +531,11 @@ impl ClaudeSession {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        // Own process group so teardown signals the WHOLE tree at once. A
+        // direct-child kill would orphan any tool/subagent subprocess the base
+        // spawned (and, on an npm trampoline install, the native base grandchild)
+        // by reparenting it to init. See [`kill_isolated_process_tree`].
+        isolate_process_tree(&mut cmd);
 
         let mut child = crate::spawn_retrying_etxtbsy(&mut cmd)
             .map_err(|e| SessionError::Start(spawn_err(program, &e)))?;
@@ -726,6 +733,18 @@ impl ClaudeSession {
     }
 }
 
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        // A dropped session (timed-out / cancelled turn, or teardown that skipped
+        // `end()`) must kill the whole process GROUP so no tool/subagent (or, on
+        // an npm trampoline install, native base) grandchild is orphaned to init.
+        // Fail-open — a contended/poisoned lock falls back to `kill_on_drop`.
+        if let Ok(mut child) = self.child.try_lock() {
+            kill_isolated_process_tree(&mut child);
+        }
+    }
+}
+
 #[async_trait]
 impl BaseSession for ClaudeSession {
     fn capabilities(&self) -> SessionCapabilities {
@@ -907,11 +926,13 @@ impl BaseSession for ClaudeSession {
     }
 
     async fn end(&mut self) -> Result<(), SessionError> {
-        // Best-effort: kill the child (drops stdin → EOF, tears down the
-        // reader/stderr tasks) AND wait (bounded) for it to be reaped so shutdown
-        // is deterministic and leaves no orphan. On overrun we fail open to
-        // kill_on_drop. Consistent with codex / opencode `end()`.
-        reap_after_kill(&self.child, END_REAP_BUDGET).await;
+        // Best-effort: kill the whole process GROUP (drops stdin → EOF, tears
+        // down the reader/stderr tasks) AND wait (bounded) for the direct child
+        // to be reaped so shutdown is deterministic and leaves no orphan — a
+        // direct-child kill would reparent tool/subagent grandchildren to init.
+        // On overrun we fail open to kill_on_drop. Consistent with codex /
+        // opencode `end()`.
+        reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
         self.stderr_drain.shutdown().await;
         Ok(())
     }
