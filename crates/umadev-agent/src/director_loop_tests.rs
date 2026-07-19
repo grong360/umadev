@@ -3065,6 +3065,83 @@ fn sliding_deadline_clamps_the_idle_window_to_the_absolute_cap() {
 }
 
 #[test]
+fn in_tool_idle_wait_is_bounded_by_the_absolute_cap_not_the_sliding_window() {
+    // H6: the deadline `drive_one_turn` hands `next_event_idle` for the NEXT wait must
+    // be the ABSOLUTE cap while a tool is in flight — a live-but-silent tool (a long
+    // build/test/install/dev-server) survives to the hard ceiling, NEVER cut at the
+    // sliding `eff` window one idle window in (the watchdog's docstring promise). With
+    // no tool in flight the bound stays the sliding `eff` window, so a genuinely hung
+    // (silent, non-tool) base still Fails after one idle window.
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    let eff = now + Duration::from_secs(60); // one idle window from the last progress
+    let absolute = now + Duration::from_secs(3_600); // the absolute run cap
+    assert_eq!(
+        idle_wait_deadline(true, absolute, eff),
+        absolute,
+        "in a tool → bounded by the ABSOLUTE cap, not the sliding window (a live-but-\
+         silent tool must survive to the hard ceiling)"
+    );
+    assert_eq!(
+        idle_wait_deadline(false, absolute, eff),
+        eff,
+        "no tool in flight → bounded by the sliding idle window (a hung base still \
+         settles after one window)"
+    );
+}
+
+#[test]
+fn single_turn_budget_reconcile_marks_only_written_source_present_steps_done() {
+    // H7: the single-turn loop drives the whole goal in ONE turn and never ticks steps
+    // Done outside the clean branch, so a budget pause would report done:0 and re-drive
+    // everything. Reconcile honestly from the workspace before the pause: a
+    // source-present Build step whose declared create-files ALL exist is Done (so a
+    // resume skips it); a step whose outputs are still missing stays Pending (so a
+    // resume drives only it). A settled step is never downgraded.
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    // `written.rs` exists on disk; `missing.rs` does not.
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/written.rs"), "// built").unwrap();
+    let step = |id: &str, file: &str, status: StepStatus| PlanStep {
+        files: StepFiles {
+            create: vec![file.to_string()],
+            modify: Vec::new(),
+        },
+        id: id.to_string(),
+        title: format!("step {id}"),
+        seat: crate::critics::Seat::FrontendEngineer,
+        kind: StepKind::Build,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence: Vec::new(),
+        status,
+    };
+    let mut plan = Plan {
+        steps: vec![
+            step("written", "src/written.rs", StepStatus::Active),
+            step("missing", "src/missing.rs", StepStatus::Pending),
+        ],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    reconcile_single_turn_plan_from_workspace(&mut plan, tmp.path());
+    let status = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
+    assert_eq!(
+        status("written"),
+        StepStatus::Done,
+        "a step whose declared output exists is reconciled Done (resume skips it)"
+    );
+    assert_eq!(
+        status("missing"),
+        StepStatus::Pending,
+        "a step whose output is still missing stays Pending (resume drives it)"
+    );
+    // Honest progress + a resume still has work to do.
+    assert_eq!(plan.progress(), (1, 2));
+}
+
+#[test]
 fn is_productive_event_only_slides_on_real_content() {
     // Content-bearing frames are productivity (slide the budget); pure control
     // frames are not (they can't hold a stalled build's budget open forever).
@@ -3274,6 +3351,83 @@ async fn budget_stop_with_no_remaining_steps_settles_not_a_pause() {
             DirectorLoopOutcome::Done { .. } | DirectorLoopOutcome::Failed(_)
         ),
         "a fully-terminal plan settles Done/Failed, not a pause: {outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn budget_pause_does_not_finalize_the_build_as_a_failure() {
+    // MEDIUM (finalize-on-pause): a resumable budget pause must PARK + checkpoint, NOT
+    // run the terminal finalize (`finalize_phase_from_plan(false)` /
+    // `director::finalize(clean=false)`), which records the resumable pause as a
+    // finalized FAILURE — the "delivery — withheld … unfinished build" note — that
+    // disagrees with `/status`. Prove that withheld-delivery finalize note NEVER fires
+    // on the budget-pause exit, while the graceful budget wind-down note DOES.
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mk = |id: &str, deps: &[&str]| PlanStep {
+        files: plan_state::StepFiles {
+            create: vec![format!("src/{id}.rs")],
+            modify: Vec::new(),
+        },
+        id: id.to_string(),
+        title: format!("step {id}"),
+        seat: crate::critics::Seat::FrontendEngineer,
+        kind: StepKind::Build,
+        depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence: Vec::new(),
+        status: StepStatus::Pending,
+    };
+    let plan = Plan {
+        steps: vec![mk("a", &[]), mk("b", &["a"])],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    let mut sess = FakeSession::new(
+        vec![text_turn("step a done")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let o = opts(tmp.path());
+    let route = build_route(); // deliberate Standard — would emit a delivery finalize
+    let already_past = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    let outcome = drive_director_loop_with_idle(
+        &mut sess,
+        &o,
+        &events,
+        "GO".into(),
+        Some(plan),
+        Some(&route),
+        IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+        already_past,
+    )
+    .await;
+    assert!(
+        matches!(outcome, DirectorLoopOutcome::PausedAtBudget { .. }),
+        "the run pauses at the budget: {outcome:?}"
+    );
+    // The terminal finalize block never ran: no withheld-delivery finalize note (nor
+    // any other `delivery —` finalize note) on a resumable pause.
+    assert!(
+        !rec.events().iter().any(|e| matches!(
+            e,
+            EngineEvent::Note(n) if n.contains("withheld") || n.contains("delivery —")
+        )),
+        "a budget pause must NOT finalize the build (no delivery note): {:?}",
+        rec.events()
+    );
+    // ...but the graceful budget wind-down note DID fire (the honest pause signal).
+    assert!(
+        rec.events().iter().any(|e| matches!(
+            e,
+            EngineEvent::Note(n) if n.contains("time budget reached")
+        )),
+        "the graceful budget wind-down note fires: {:?}",
+        rec.events()
     );
 }
 
@@ -6773,51 +6927,106 @@ fn resume_step(
 
 #[tokio::test]
 async fn a_budget_paused_plan_resumes_only_the_remaining_steps() {
-    // A `PausedAtBudget` checkpoints the plan exactly like a gate pause: the completed
-    // steps stay Done, the rest Pending. Resuming it (`/continue`) rides the SAME
-    // `drive_director_loop_resume` path as a `PausedAtGate` resume — `load_resumable_plan`
-    // keeps Done steps, and readiness scheduling never re-drives them. Prove the Done
-    // step's work is NOT re-sent while the Pending step IS driven.
-    use crate::plan_state::{Plan, StepStatus};
+    // THE MASKED BUG (C1a). A `PausedAtBudget` must PARK the agent ledger (root →
+    // Waiting), NOT `finish(false)` it — the latter cancels the child seats and marks
+    // the root terminally Failed, so on `/continue` `ensure_root` refuses the terminal
+    // root and the whole resume dies "agent task ledger unavailable: … already
+    // terminal". This drives the FULL cycle (a real budget pause that leaves a PRIOR
+    // run's ledger, then `/continue`) so a regression back to `finish(false)` on the
+    // pause is caught here — the earlier version seeded only plan.json and no ledger,
+    // so `PlanTaskTracker::open` minted a FRESH root and never exercised the refusal.
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
     let tmp = tempfile::TempDir::new().unwrap();
     seed_source(tmp.path());
     let (events, _rec) = sink();
-    let persisted = Plan {
+    let mk = |id: &str, deps: &[&str]| PlanStep {
+        files: plan_state::StepFiles {
+            create: vec![format!("src/{id}.rs")],
+            modify: Vec::new(),
+        },
+        id: id.to_string(),
+        title: format!("STEP_{id} the work"),
+        seat: crate::critics::Seat::FrontendEngineer,
+        kind: StepKind::Build,
+        depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence: Vec::new(),
+        status: StepStatus::Pending,
+    };
+    let plan = Plan {
         steps: vec![
-            resume_step("alpha", "ALPHA_SCAFFOLD the project", &[], StepStatus::Done),
-            resume_step(
-                "beta",
-                "BETA_FEATURE the remaining work",
-                &["alpha"],
-                StepStatus::Pending,
-            ),
+            mk("alpha", &[]),
+            mk("beta", &["alpha"]),
+            mk("gamma", &["beta"]),
         ],
         risks: vec![],
         open_questions: vec![],
     };
-    plan_state::save(&persisted, tmp.path()).expect("persist the budget-paused plan");
+    let o = opts(tmp.path());
+    let route = build_route();
 
+    // ---- FIRST run: an already-spent budget drives step alpha, then PAUSES,
+    // leaving a PARKED (not failed) ledger + the checkpointed plan on disk. ----
     let mut sess = FakeSession::new(
-        vec![text_turn("Built BETA. Done.")],
+        vec![text_turn("STEP_alpha done")],
         true,
         r#"{"accepts": true, "blocking": []}"#,
     );
-    let sent = sess.sent_handle();
-    let o = opts(tmp.path());
-    let route = build_route();
-    let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
+    let already_past = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    let paused = drive_director_loop_with_idle(
+        &mut sess,
+        &o,
+        &events,
+        "GO".into(),
+        Some(plan),
+        Some(&route),
+        IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+        already_past,
+    )
+    .await;
+    assert!(
+        matches!(
+            paused,
+            DirectorLoopOutcome::PausedAtBudget { done: 1, total: 3 }
+        ),
+        "the first run pauses at the budget with one step done: {paused:?}"
+    );
+    // The pause parked the plan: alpha Done, beta/gamma still Pending (not stranded).
+    let saved = plan_state::load(tmp.path()).expect("the plan is checkpointed for resume");
+    let status = |id: &str| saved.steps.iter().find(|s| s.id == id).unwrap().status;
+    assert_eq!(status("alpha"), StepStatus::Done);
+    assert_eq!(status("beta"), StepStatus::Pending);
+    assert_eq!(status("gamma"), StepStatus::Pending);
+
+    // ---- `/continue`: a FRESH session resumes the PARKED run over the SAME ledger. ----
+    let mut resume_sess = FakeSession::new(
+        vec![text_turn("STEP_beta done"), text_turn("STEP_gamma done")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let sent = resume_sess.sent_handle();
+    let outcome = drive_director_loop_resume(&mut resume_sess, &o, &events, &route).await;
     assert!(
         matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
-        "the budget-paused plan resumes and drives its remaining steps to Done: {outcome:?}"
+        "the parked budget pause RESUMES to Done — never a Failed \
+         'agent task ledger unavailable: … already terminal': {outcome:?}"
     );
 
+    // Match the step actually DRIVEN (the directive's "## Current step" header), not a
+    // bare id mention — the resumed directive legitimately names STEP_alpha in its
+    // run-notes ("Verified build step completed: STEP_alpha"), which is NOT a re-drive.
     let sent = sent.lock().unwrap();
     assert!(
-        sent.iter().any(|d| d.contains("BETA_FEATURE")),
-        "the Pending step IS driven on resume: {sent:?}"
+        sent.iter()
+            .any(|d| d.contains("## Current step\nSTEP_beta")),
+        "the remaining Pending step IS driven on resume: {sent:?}"
     );
     assert!(
-        !sent.iter().any(|d| d.contains("ALPHA_SCAFFOLD")),
+        !sent
+            .iter()
+            .any(|d| d.contains("## Current step\nSTEP_alpha")),
         "the already-Done step is NEVER re-driven on resume (zero re-runs): {sent:?}"
     );
 }

@@ -5503,6 +5503,12 @@ impl App {
         self.degraded = false;
         // The run errored out (not a user cancel) → its task is a Failed row.
         self.mark_active_task(TaskStatus::Failed);
+        // Clear the pipeline-live flag: an abort is terminal-for-now, so a leftover
+        // `run_started` would (a) make the `/continue` handler's `!run_started`
+        // re-attach guard SKIP a resumable abort (leaving the user stuck on "a run is
+        // still in flight" / "not started") and (b) keep the header painting a live
+        // run. A fresh `/run` re-arms it via `PipelineStarted`.
+        self.run_started = false;
         self.active_gate = None;
         self.gate_choice = None;
         self.run_started_at = None;
@@ -11470,6 +11476,16 @@ impl App {
         // The writer session is gone; what remains is the parked plan on disk.
         self.director_run_in_flight = false;
         self.budget_paused = true;
+        // Clear the pipeline-live flag AND settle the run's registry task so it is no
+        // longer `Running`. A leftover `run_started`/`Running` task keeps
+        // `has_active_run()` — hence `has_interruptible_work()` — TRUE on a run that has
+        // actually PARKED, which made `/continue` answer "a run is still in flight" and
+        // do nothing, ESC arm a phantom interrupt, and `/codex` refuse as busy. Settle
+        // it `Stopped` (a resumable pause, not `Failed`/`Done`); a `/continue`
+        // re-registers the resumed run. (`is_pipeline_active()` already excludes a
+        // budget pause; this also frees `active_task()`.)
+        self.run_started = false;
+        self.mark_active_task(TaskStatus::Stopped);
         // Stop every live counter so the status bar reflects a real paused state.
         self.run_started_at = None;
         self.phase_started_at = None;
@@ -12894,6 +12910,29 @@ impl App {
                     );
                     self.record_trust_pass(gate.id_str());
                     Action::Continue(gate)
+                } else if !self.finished
+                    && (self.budget_paused || self.aborted)
+                    && umadev_agent::has_resumable_run(&self.project_root)
+                {
+                    // A budget pause OR a resumable transient abort parked the run with
+                    // its plan intact on disk — `/continue` RE-ATTACHES and drives only
+                    // the remaining steps. This fires AHEAD of the
+                    // `has_interruptible_work` and `!run_started` guards below (mirroring
+                    // `/tasks continue`, which likewise omits the `!run_started` guard):
+                    // a freshly-parked/aborted run can still carry a stale live flag or a
+                    // not-yet-settled registry task, and without this pre-emption
+                    // `/continue` would wrongly answer "a run is still in flight" and do
+                    // nothing on a run that has actually stopped.
+                    if self.reject_director_execution_in_plan() {
+                        return Some(Action::None);
+                    }
+                    let req = self.resume_run_requirement();
+                    self.push_resume_separator();
+                    self.push(
+                        ChatRole::UmaDev,
+                        umadev_i18n::t(self.lang, "continue.resuming"),
+                    );
+                    Action::ResumeRun(req)
                 } else if self.has_interruptible_work() || self.thinking {
                     self.push(
                         ChatRole::System,

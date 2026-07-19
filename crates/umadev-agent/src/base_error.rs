@@ -397,7 +397,17 @@ fn is_capability_unsupported(hay: &str) -> bool {
     ];
     let tool = TOOL_TOKEN.iter().any(|m| hay.contains(m));
     let unsupported = UNSUPPORTED.iter().any(|m| hay.contains(m));
-    tool && unsupported
+    // AUTH-BEFORE-CAPABILITY: an auth/entitlement failure text can ALSO pair a tool
+    // token with an "unsupported" signal — e.g. "401 Unauthorized: web search is not
+    // supported for your API key" or "your plan does not include web_search". That is
+    // a HARD auth failure (the user must re-auth / upgrade), NOT a degradable
+    // capability gap, and degrading it would silently swallow the real problem AND
+    // waste one research re-drive on a tool the gateway will keep refusing. So the
+    // AMBIGUOUS pairing defers to auth: require the text NOT to also carry auth
+    // markers, letting such an error fall through to the auth class below. The tight
+    // STRONG hosted/client-tool phrases above are unambiguous capability signals and
+    // are intentionally left to win on their own.
+    tool && unsupported && !is_auth(hay)
 }
 
 /// Not logged in / unauthorized / bad-or-expired key (401/403).
@@ -734,6 +744,50 @@ mod tests {
                 None
             ),
             BaseFailure::CapabilityUnsupported
+        );
+    }
+
+    #[test]
+    fn auth_entitlement_error_naming_web_search_is_auth_not_capability() {
+        // AUTH-BEFORE-CAPABILITY: an auth/entitlement failure whose text ALSO pairs a
+        // tool token ("web search") with an "unsupported" signal ("not supported") must
+        // classify as HARD Auth, never a degradable CapabilityUnsupported — otherwise
+        // the pipeline silently DEGRADES a re-auth-required failure and wastes a
+        // research re-drive on a tool the gateway keeps refusing.
+        assert_eq!(
+            classify(
+                None,
+                Some("401 Unauthorized: web search is not supported for your API key"),
+                None
+            ),
+            BaseFailure::Auth,
+            "an auth 401 mentioning 'web search … not supported' is a hard auth failure"
+        );
+        assert_eq!(
+            classify(
+                None,
+                Some("Your subscription does not include web_search; please upgrade or re-authenticate (invalid credentials)"),
+                None
+            ),
+            BaseFailure::Auth,
+            "an entitlement error pairing a tool token with 'does not' still resolves to auth"
+        );
+        // The DEGRADE path must therefore NOT fire on it (it is not capability-degradable).
+        assert!(!is_capability_degradable(&classify(
+            None,
+            Some("403 forbidden: web search not supported on this key"),
+            None
+        )));
+        // Control: the SAME capability phrasing WITHOUT any auth marker still degrades
+        // (the tight capability class is preserved, only the auth collision defers).
+        assert_eq!(
+            classify(
+                None,
+                Some("tool type web_search is not supported by this model"),
+                None
+            ),
+            BaseFailure::CapabilityUnsupported,
+            "a pure capability rejection (no auth marker) still classifies as capability"
         );
     }
 

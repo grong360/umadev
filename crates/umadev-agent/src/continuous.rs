@@ -282,6 +282,23 @@ pub async fn run_block(
     // settles the turn on what's built, never aborts. The `deadline` is the ABSOLUTE
     // cap; the SLIDING idle window is applied inside each pump (Stage 3), so a
     // slow-but-progressing turn is not cut mid-progress.
+    //
+    // KNOWN GAP (legacy-only, deliberately UN-fixed): this gated phase walk never
+    // surfaces [`RunOutcome::PausedAtBudget`] — only `PausedAtGate` / `Completed` /
+    // `HardStop`. A budget exhaustion mid-phase is settled GRACEFULLY by the pump as a
+    // done-ish turn (it returns what it built), so the block continues and either
+    // `Completed`s with partial work or reaches a downstream quality / zero-source
+    // gate that `HardStop`s — it is NOT offered to `/continue` as a resumable budget
+    // pause. The default `/run` path is the director loop
+    // ([`crate::director_loop::drive_plan_steps`]), which DOES park + surface
+    // `PausedAtBudget` per step; this walk runs ONLY behind `UMADEV_LEGACY_PIPELINE=1`
+    // and has no per-step resumable checkpoint to offer (it drives whole phases, not
+    // DAG steps), so synthesising an honest budget pause here would mean threading a
+    // budget-reached signal out of every `drive_phase` and tracking phase-level
+    // resumability — cost the legacy escape hatch does not justify. The
+    // `PausedAtBudget` variant + its `run_continuous_block` ledger-park handler exist
+    // for the director path (and a future legacy wiring); this path deliberately does
+    // not fabricate one.
     let deadline = std::time::Instant::now() + crate::director_loop::run_budget_absolute();
 
     // Persist the project's governance context BEFORE any phase writes a file, so

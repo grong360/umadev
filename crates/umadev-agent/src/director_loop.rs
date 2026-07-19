@@ -357,6 +357,29 @@ pub(crate) fn sliding_deadline(
         .map_or(hard_cap, |dl| dl.min(hard_cap))
 }
 
+/// H6 — the run-budget deadline to hand [`next_event_idle`] for the NEXT idle wait.
+///
+/// While a tool is in flight (`in_tool_call`) the bound MUST be the ABSOLUTE cap
+/// `deadline`, NOT the sliding `eff` window: a live-but-silent tool (a long
+/// build / test / install / dev server that legitimately emits nothing for minutes)
+/// is liveness-checked by [`next_event_idle`] and must survive to the absolute cap,
+/// exactly as that watchdog's docstring promises. Passing the sliding `eff` there
+/// would settle `IdleTimedOut` after ONE idle window and guillotine a healthy tool.
+/// With NO tool in flight the bound is the sliding `eff` window, so a genuinely hung
+/// (silent, non-tool) base is still caught after one idle window. Pure.
+#[must_use]
+pub(crate) fn idle_wait_deadline(
+    in_tool_call: bool,
+    deadline: std::time::Instant,
+    eff: std::time::Instant,
+) -> std::time::Instant {
+    if in_tool_call {
+        deadline
+    } else {
+        eff
+    }
+}
+
 /// Whether `ev` is GENUINE base productivity — a real content-bearing frame (text,
 /// reasoning, a tool call / result / output) as opposed to a pure control frame
 /// (session/model/state/queue housekeeping). Only a productive event slides the run
@@ -1390,8 +1413,20 @@ async fn drive_director_loop_with_idle(
         next_directive = qc.fix_directive_with_assessments("", &assessments);
     }
 
-    // Loop fell through (exhausted the bounded rounds) — persist the plan's final
-    // state for resume; reality is the caller's hard-gate.
+    // Loop fell through (exhausted the bounded rounds). H7: on a BUDGET break the
+    // single-turn loop already drove the whole goal in one turn but left its steps
+    // Active/Pending (it never ticks Done outside the clean branch). Reconcile Done
+    // from the workspace BEFORE persisting, so the checkpoint the resume reloads
+    // reports honest done/total and `drive_director_loop_resume` skips the steps whose
+    // outputs the mega-turn already wrote (redoing only what's genuinely missing). A
+    // NON-budget fall-through (a real QC failure) keeps its statuses — reconciling
+    // there would flatter an unfinished build, so it is gated on `budget_reached`.
+    if budget_reached {
+        if let Some(p) = plan.as_mut() {
+            reconcile_single_turn_plan_from_workspace(p, &options.project_root);
+        }
+    }
+    // Persist the plan's final state for resume; reality is the caller's hard-gate.
     persist_plan(&plan, options);
     // Non-clean settle (the bounded rounds didn't fully clear): honest phase only.
     finalize_phase_from_plan_opt(&plan, options, false);
@@ -2028,6 +2063,55 @@ async fn drive_plan_steps(
         }
     }
 
+    // RESUMABLE BUDGET PAUSE (park, do NOT finish/finalize) — mirror the GATE-pause
+    // exit above. If the schedule loop stopped ONLY because the wall-clock budget was
+    // exhausted AND resumable work remains (≥1 `Pending`/`Active` step), PARK the
+    // ledger (root → `Waiting`, exactly like `wait_for_user` at the gate pause) and
+    // return a first-class `PausedAtBudget` BEFORE the finish/finalize block below.
+    //
+    // That block calls `task_tracker.finish(false, …)`, which CANCELS the unfinished
+    // child seats and marks the ledger ROOT terminally `Failed`; on `/continue`,
+    // `PlanTaskTracker::open` → `ensure_root` then REFUSES that terminal root
+    // ("director task is already terminal") and the whole resume dies `Failed`. It
+    // also runs `finalize_phase_from_plan(false)` / `director::finalize(false)`, which
+    // record a resumable pause as a finalized FAILURE (disagreeing with `/status`).
+    // Parking keeps the seats + root resumable and skips the finalize entirely — a
+    // budget pause is a resumable CHECKPOINT, never a terminal settle. The plan is
+    // checkpointed here (Done steps stay Done, the rest Pending — this runs BEFORE
+    // `mark_unreachable_pending_blocked`, so no remaining step is stranded Blocked) and
+    // a per-step summary is emitted so the parked state survives in the transcript.
+    //
+    // FAIL-OPEN: if the plan can't persist OR the ledger can't park, fall THROUGH to
+    // the normal finish/finalize path rather than returning an unresumable pause (a
+    // pause that can't reload would lose the build). `budget_reached` is set ONLY at
+    // the between-steps budget break (never by the circuit breaker or a verification
+    // failure), so a real failure is never disguised as a pause.
+    let budget_resumable = budget_reached
+        && plan
+            .steps
+            .iter()
+            .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active));
+    if budget_resumable && plan_state::save(plan, &options.project_root).is_ok() {
+        match task_tracker.wait_for_user("run time budget exhausted") {
+            Ok(()) => {
+                // Same checkpoint the gate pause records: the artifact versions the
+                // parked plan was built against (so a resume only re-opens a doc step
+                // if the user actually edited a doc while parked).
+                record_artifact_versions(&options.project_root);
+                emit_plan_completion_summary(plan, events, &incomplete_evidence);
+                let (done, total) = plan.progress();
+                return Some(DirectorLoopOutcome::PausedAtBudget { done, total });
+            }
+            Err(error) => {
+                // Parking failed — do NOT return an unresumable pause; fall through to
+                // the finish/finalize path so the run settles honestly instead.
+                events.emit(EngineEvent::Note(format!(
+                    "team · could not park the agent ledger at the budget pause: {error}"
+                )));
+            }
+        }
+    }
+
     // MEDIUM #2 — honest scope: a Blocked step permanently strands its dependents as
     // Pending (they never become ready, since readiness needs every dep Done). The
     // scheduling loop above just leaves them; without this they'd sit Pending forever
@@ -2183,29 +2267,18 @@ async fn drive_plan_steps(
         route,
         run_actual_size_from_plan(plan),
     );
-    // RESUMABLE BUDGET PAUSE (Stage 2): the run stopped ONLY because its wall-clock
-    // budget was exhausted AND resumable work remains (≥1 `Pending`/`Active` step) —
-    // surface a first-class `PausedAtBudget` instead of a hard `Failed`, so the
-    // in-progress plan (checkpointed just above by `persist_plan_ref` +
-    // `emit_plan_completion_summary`) is offered to `/continue` rather than lost to a
-    // forced re-entry. The remaining-work guard mirrors `confirm_gate_after_step`: a
-    // fully-terminal plan (everything Done/Blocked) is NOT resumable, so it settles
-    // Done/Failed via `incomplete_reason`. `budget_reached` is set ONLY at the
-    // between-steps budget break above (never by the circuit breaker or a genuine
-    // verification failure), so a real failure is never disguised as a pause.
-    let budget_resumable = budget_reached
-        && plan
-            .steps
-            .iter()
-            .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active));
-    Some(if budget_resumable {
-        let (done, total) = plan.progress();
-        DirectorLoopOutcome::PausedAtBudget { done, total }
-    } else {
-        match incomplete_reason {
-            Some(reason) => DirectorLoopOutcome::Failed(reason),
-            None => DirectorLoopOutcome::Done { reply: last_reply },
-        }
+    // TERMINAL SETTLE. The RESUMABLE budget pause is handled EARLIER, at the
+    // park-not-finish exit above (which returns `PausedAtBudget` BEFORE this
+    // finish/finalize block so the ledger is parked `Waiting`, never finalized
+    // `Failed`). Reaching here with `budget_reached` set therefore means the pause
+    // could NOT be checkpointed/parked (the plan failed to persist or the ledger
+    // could not park) — the run has already been finalized `Failed` above, so
+    // returning an unresumable `PausedAtBudget` here would recreate the "resume dies
+    // already-terminal" bug. Settle honestly: `Done` on a clean convergence, else
+    // `Failed` with the incomplete reason.
+    Some(match incomplete_reason {
+        Some(reason) => DirectorLoopOutcome::Failed(reason),
+        None => DirectorLoopOutcome::Done { reply: last_reply },
     })
 }
 
@@ -5208,6 +5281,45 @@ fn persist_plan(plan: &Option<Plan>, options: &RunOptions) {
     }
 }
 
+/// H7 — reconcile a SINGLE-TURN build's plan against the workspace before a budget
+/// pause. The single-turn loop drives the WHOLE goal in ONE base turn (it never
+/// schedules steps individually), marking the ready steps [`StepStatus::Active`] but
+/// only ticking [`StepStatus::Done`] in the clean branch. So a budget break would
+/// report `done:0` and — because [`drive_director_loop_resume`] re-drives every
+/// non-`Done` step via [`drive_plan_steps`] — REDO work the one mega-turn already
+/// wrote to disk.
+///
+/// Reconcile honestly from reality: a mutating [`StepKind::Build`] step whose
+/// acceptance is [`AcceptanceSpec::SourcePresent`] (its bar IS "the declared files
+/// exist") and whose declared `files.create` paths ALL exist on disk was completed by
+/// that mega-turn, so promote it to `Done`; a step whose outputs are still missing
+/// stays as-is so a resume drives only it. This makes `done/total` honest AND stops
+/// the resume redoing finished work. Only ever PROMOTES `Active`/`Pending` → `Done`
+/// (never downgrades a settled step), and a step with a stricter acceptance, richer
+/// evidence contract, or no declared create-file is left untouched (its completion
+/// can't be proven from file existence alone). Fail-open: an unreadable path counts
+/// as absent, so a step is never falsely marked Done.
+fn reconcile_single_turn_plan_from_workspace(plan: &mut Plan, project_root: &std::path::Path) {
+    for step in &mut plan.steps {
+        if step.kind != plan_state::StepKind::Build
+            || !matches!(step.status, StepStatus::Active | StepStatus::Pending)
+            || step.acceptance != plan_state::AcceptanceSpec::SourcePresent
+            || !step.evidence.is_empty()
+            || step.files.create.is_empty()
+        {
+            continue;
+        }
+        if step
+            .files
+            .create
+            .iter()
+            .all(|rel| project_root.join(rel).exists())
+        {
+            step.status = StepStatus::Done;
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Workflow-phase sync — keep `.umadev/workflow-state.json` (the 9-phase state
 // machine `/status` reads) in step with REAL plan progress on the director-loop
@@ -5875,7 +5987,18 @@ async fn drive_one_turn_with_backoff_and_memories(
         // every main-session pump (here + `continuous::drive_phase` /
         // `drive_rework_turn`), so the protection can't be "fixed in one, forgotten in
         // another".
-        let ev = match next_event_idle(session, idle, in_tool_call, Some(eff)).await {
+        // H6: while a tool is in flight, bound the wait by the ABSOLUTE cap `deadline`
+        // (a live-but-silent tool must survive to the hard ceiling, not be cut at the
+        // sliding `eff` window one idle window in); with no tool in flight the sliding
+        // `eff` still catches a genuinely hung base after one idle window.
+        let ev = match next_event_idle(
+            session,
+            idle,
+            in_tool_call,
+            Some(idle_wait_deadline(in_tool_call, deadline, eff)),
+        )
+        .await
+        {
             IdleEvent::Event(ev) => ev,
             IdleEvent::SessionEnded { exit, stderr_tail } => {
                 // `None` = the session ended (process dead / EOF). Per the

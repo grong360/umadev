@@ -6989,6 +6989,102 @@ fn budget_pause_presents_as_paused_not_aborted() {
 }
 
 #[test]
+fn budget_pause_frees_active_run_so_continue_resumes_and_esc_codex_are_not_busy() {
+    // C1b: `record_run_paused_at_budget` must clear `run_started` AND settle the run's
+    // registry task, so a PARKED run stops reading as "active". Otherwise the leftover
+    // `Running` task keeps `has_active_run()`/`has_interruptible_work()` TRUE, which
+    // makes `/continue` answer "a run is still in flight" (never reaching the resume
+    // branch), ESC arm a phantom interrupt, and `/codex` refuse as busy — all on a run
+    // that has actually stopped.
+    let mut app = fresh_app(Some("offline"));
+
+    // A resumable director-loop run on disk (plan with a Pending step + the
+    // workflow-state carrying the requirement) — exactly what a budget pause leaves.
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "b".into(),
+            title: "build the remaining feature".into(),
+            seat: umadev_agent::Seat::FrontendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Pending,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+    state.slug = "demo".into();
+    state.requirement = "做一个登录页".into();
+    state.backend = "offline".into();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+
+    // A live run: registered task + the in-flight flags a mid-build carries.
+    app.register_run_task("做一个登录页");
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.thinking = true;
+    app.agentic_in_flight = true;
+    app.director_run_in_flight = true;
+    assert!(app.has_active_run(), "the run reads as active while live");
+
+    // The budget pause parks it.
+    app.record_run_paused_at_budget(1, 3);
+
+    // The parked run is NO LONGER active/interruptible: the flag cleared and the
+    // registry task settled off `Running`.
+    assert!(!app.run_started, "the pipeline-live flag is cleared");
+    assert!(
+        app.active_task().is_none(),
+        "the run's registry task is settled off Running"
+    );
+    assert!(
+        !app.has_active_run() && !app.has_interruptible_work(),
+        "a parked budget pause is neither active nor interruptible"
+    );
+
+    // ESC no longer arms a phantom interrupt (the interrupt branch keys off
+    // `has_interruptible_work`, which is now false).
+    let esc = app.apply_key(KeyCode::Esc);
+    assert_ne!(esc, Action::Cancel, "ESC must not cancel a parked run");
+    assert!(
+        !app.interrupt_armed(),
+        "ESC after a budget pause must not arm an interrupt"
+    );
+
+    // `/continue` reaches the RESUME branch (Action::ResumeRun), NOT "a run is still
+    // in flight".
+    let before = app.history.len();
+    let action = app
+        .try_slash_command("/continue")
+        .expect("/continue is a slash command");
+    assert_eq!(
+        action,
+        Action::ResumeRun("做一个登录页".to_string()),
+        "a parked budget pause resumes the persisted run"
+    );
+    assert!(
+        app.history
+            .iter()
+            .skip(before)
+            .any(|m| m.body().contains("续跑")),
+        "the resume path is taken (the resuming note is shown, not the busy hint)"
+    );
+
+    // `/codex` is no longer refused as busy — the backend switches.
+    let switched = app.slash_backend(Some("codex"));
+    assert_eq!(
+        switched,
+        Action::BackendChanged,
+        "a base switch is allowed after a budget pause (not 'busy')"
+    );
+    assert_eq!(app.backend.as_deref(), Some("codex"));
+}
+
+#[test]
 fn note_signals_degraded_matches_stable_markers_only() {
     assert!(note_signals_degraded("[WARN][降级] 占位模板"));
     assert!(note_signals_degraded("… 阻断 delivery(UD-EVID-003)。"));
