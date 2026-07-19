@@ -31,7 +31,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Single check result row.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -104,7 +104,162 @@ pub async fn run_all(workspace: &Path, fix: bool) -> Vec<CheckResult> {
     results.push(check_delivery_readiness(workspace));
     results.push(check_ecosystem(workspace));
     results.push(check_npm_install());
+    results.push(check_embed_model());
+    results.push(check_node_version());
     results
+}
+
+/// Doctor row name for the local embedding-model presence check.
+const EMBED_MODEL_CHECK: &str = "local embedding model";
+
+/// Doctor row name for the Node.js runtime version check.
+const NODE_CHECK: &str = "node.js runtime";
+
+/// The three files a usable local embedding-model directory must hold, matching
+/// `umadev-knowledge`'s local backend.
+const EMBED_MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+
+/// Smallest plausible `model.safetensors`. A real `multilingual-e5-small` is tens
+/// of MB (fp16 ~224MB); anything under 1 MiB is a truncated/garbage download, not
+/// a usable model. Mirrors `umadev-knowledge`'s `MIN_SAFETENSORS_BYTES`.
+const EMBED_MODEL_MIN_SAFETENSORS_BYTES: u64 = 1_048_576;
+
+/// Minimum Node.js major version the npm launcher (`bin/cli.js`) and its `engines`
+/// floor require. Below this the launch shim prints an upgrade notice; the doctor
+/// warns so an npm-managed user learns before hitting it.
+const MIN_NODE_MAJOR: u64 = 18;
+
+/// Resolve the directory the runtime will look for the local embedding model in,
+/// mirroring `umadev-knowledge`'s `model_dir()`: the `UMADEV_EMBED_MODEL_DIR`
+/// override (set by the npm `bin/cli.js` shim) first, then the zero-config
+/// `~/.umadev/embed-model` fallback that a `cargo install` user would populate by
+/// hand. Returns `None` when neither exists.
+fn embed_model_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var("UMADEV_EMBED_MODEL_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        let p = PathBuf::from(d);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .filter(|s| !s.is_empty())?;
+    let p = PathBuf::from(home).join(".umadev").join("embed-model");
+    p.is_dir().then_some(p)
+}
+
+/// Are all three model files present in `dir`, with the weights clearing the size
+/// floor? A cheap filesystem check only — it deliberately does NOT depend on the
+/// candle backend (which is compiled in only under the `vector-local` feature), so
+/// the doctor reports the same answer in every build. Fail-open: any unreadable
+/// path counts as absent.
+fn embed_model_present(dir: Option<&Path>) -> bool {
+    let Some(dir) = dir else {
+        return false;
+    };
+    EMBED_MODEL_FILES.iter().all(|name| {
+        let path = dir.join(name);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                !name.ends_with(".safetensors") || meta.len() >= EMBED_MODEL_MIN_SAFETENSORS_BYTES
+            }
+            _ => false,
+        }
+    })
+}
+
+/// Turn "is the local model present?" into a doctor row. Present → PASS (full
+/// hybrid vector+BM25 retrieval). Absent → WARN with the honest degrade note: a
+/// `cargo install` / self-updated binary never had the model fetched (only the npm
+/// shim downloads it), so retrieval silently ran keyword-only. Never a FAIL —
+/// missing model is fail-open by contract.
+fn embed_model_row(present: bool) -> CheckResult {
+    if present {
+        CheckResult {
+            name: EMBED_MODEL_CHECK.to_string(),
+            status: Status::Passed,
+            detail: "present — hybrid vector + BM25 retrieval is active".to_string(),
+        }
+    } else {
+        CheckResult {
+            name: EMBED_MODEL_CHECK.to_string(),
+            status: Status::Warning,
+            detail:
+                "not found — knowledge retrieval falls back to keyword-only (BM25). npm installs \
+                 fetch it automatically; for a cargo/manual install, run `umadev update` or place \
+                 config.json + tokenizer.json + model.safetensors under ~/.umadev/embed-model (or \
+                 set UMADEV_EMBED_MODEL_DIR)."
+                    .to_string(),
+        }
+    }
+}
+
+/// Doctor row: is the local embedding model present so hybrid retrieval works, or
+/// is the host silently degraded to keyword-only search?
+fn check_embed_model() -> CheckResult {
+    embed_model_row(embed_model_present(embed_model_dir().as_deref()))
+}
+
+/// Extract the major version from `node --version` output (e.g. `"v18.17.0\n"` →
+/// `Some(18)`). Returns `None` for empty/garbage output.
+fn parse_node_major(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim().trim_start_matches('v');
+    trimmed.split('.').next()?.parse::<u64>().ok()
+}
+
+/// Turn the `node --version` result into a doctor row. `raw` is the command's
+/// stdout, or `None` when `node` is not on PATH / failed. Node is required only for
+/// npm-managed installs (the `bin/cli.js` launcher) and `umadev update` via npm, so
+/// its absence is informational, not a failure. A version BELOW the floor is a
+/// warning — that is exactly the case where the launch shim now prints an upgrade
+/// notice instead of a cryptic parse error.
+fn node_version_row(raw: Option<&str>) -> CheckResult {
+    let name = NODE_CHECK.to_string();
+    let Some(raw) = raw else {
+        return CheckResult {
+            name,
+            status: Status::Passed,
+            detail: format!(
+                "node not on PATH — only npm-managed installs and `umadev update` via npm need it \
+                 (Node >= {MIN_NODE_MAJOR})"
+            ),
+        };
+    };
+    match parse_node_major(raw) {
+        Some(major) if major >= MIN_NODE_MAJOR => CheckResult {
+            name,
+            status: Status::Passed,
+            detail: format!("node {} — meets the >= {MIN_NODE_MAJOR} floor", raw.trim()),
+        },
+        Some(major) => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: format!(
+                "node {} is below the supported floor (>= {MIN_NODE_MAJOR}). The npm launcher needs \
+                 Node >= {MIN_NODE_MAJOR}; upgrade Node.js to avoid a startup failure.",
+                major
+            ),
+        },
+        None => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: format!("could not parse `node --version` output ({:?})", raw.trim()),
+        },
+    }
+}
+
+/// Doctor row: the Node.js runtime version, warning when it is below the npm
+/// launcher's supported floor.
+fn check_node_version() -> CheckResult {
+    let raw = match std::process::Command::new("node").arg("--version").output() {
+        Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => None,
+    };
+    node_version_row(raw.as_deref())
 }
 
 /// Check whether `git` is available — `/checkpoint` and `/rewind` use a shadow
@@ -1124,22 +1279,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_all_returns_fifteen_checks_on_empty_workspace() {
+    async fn run_all_returns_all_checks_on_empty_workspace() {
         let tmp = TempDir::new().unwrap();
         let results = run_all(tmp.path(), false).await;
-        assert_eq!(results.len(), 15);
+        assert_eq!(results.len(), 17);
         // No FAILs on a clean workspace — only a manifest WARN.
         assert!(results.iter().all(|r| r.status != Status::Failed));
         // The "AI host backends" check warns iff no base CLI is on PATH, and the
         // auth / native-hook checks depend on the ambient selected backend and
-        // credentials, so exclude them; the only env-independent WARN asserted
-        // here is the missing manifest.
+        // credentials, so exclude them; likewise the embed-model and node checks
+        // depend on the machine (a dev box without the model warns, an old node
+        // warns). The only env-independent WARN asserted here is the missing
+        // manifest.
         assert_eq!(
             results
                 .iter()
                 .filter(|r| r.name != "AI host backends")
                 .filter(|r| r.name != "Claude non-interactive auth")
                 .filter(|r| r.name != "Kimi Code hooks")
+                .filter(|r| r.name != EMBED_MODEL_CHECK)
+                .filter(|r| r.name != NODE_CHECK)
                 .filter(|r| r.status == Status::Warning)
                 .count(),
             1
@@ -1216,6 +1375,11 @@ mod tests {
             .into_iter()
             .filter(|r| r.name != "AI host backends")
             .filter(|r| r.name != "Claude non-interactive auth")
+            // The embed-model row warns on a machine that never fetched the model
+            // (any CI/dev box without it), and the node row warns on an old/absent
+            // node — both environment-dependent, like the backend checks above.
+            .filter(|r| r.name != EMBED_MODEL_CHECK)
+            .filter(|r| r.name != NODE_CHECK)
             .collect();
         assert!(all_passed(&non_backend));
     }
@@ -1342,6 +1506,78 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    #[test]
+    fn embed_model_row_reflects_presence() {
+        // Present → PASS + the "hybrid" wording; absent → WARN with the fix recipe
+        // (npm / ~/.umadev/embed-model / UMADEV_EMBED_MODEL_DIR) and NEVER a FAIL.
+        let present = embed_model_row(true);
+        assert_eq!(present.status, Status::Passed);
+        assert_eq!(present.name, EMBED_MODEL_CHECK);
+        assert!(present.detail.contains("hybrid"));
+
+        let absent = embed_model_row(false);
+        assert_eq!(absent.status, Status::Warning);
+        assert!(absent.detail.contains("BM25"));
+        assert!(absent.detail.contains("~/.umadev/embed-model"));
+        assert!(absent.detail.contains("UMADEV_EMBED_MODEL_DIR"));
+    }
+
+    #[test]
+    fn embed_model_present_requires_all_three_and_a_sized_safetensors() {
+        assert!(!embed_model_present(None), "no dir → absent");
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        assert!(!embed_model_present(Some(dir)), "empty dir → absent");
+
+        fs::write(dir.join("config.json"), r#"{"hidden_size":384}"#).unwrap();
+        fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        // A too-small safetensors (under the size floor) must still count as absent.
+        fs::write(dir.join("model.safetensors"), vec![0u8; 1024]).unwrap();
+        assert!(
+            !embed_model_present(Some(dir)),
+            "safetensors under the size floor → absent"
+        );
+
+        // Clear the floor → present.
+        fs::write(
+            dir.join("model.safetensors"),
+            vec![0u8; usize::try_from(EMBED_MODEL_MIN_SAFETENSORS_BYTES).unwrap() + 16],
+        )
+        .unwrap();
+        assert!(embed_model_present(Some(dir)), "all three present + sized");
+    }
+
+    #[test]
+    fn node_version_row_gates_on_the_floor() {
+        // >= floor → PASS.
+        let ok = node_version_row(Some("v18.17.0\n"));
+        assert_eq!(ok.status, Status::Passed);
+        assert_eq!(ok.name, NODE_CHECK);
+        assert_eq!(node_version_row(Some("v20.1.2")).status, Status::Passed);
+
+        // Below the floor → WARN with an upgrade nudge.
+        let old = node_version_row(Some("v16.20.0"));
+        assert_eq!(old.status, Status::Warning);
+        assert!(old.detail.contains("below the supported floor"));
+
+        // Unparseable version → WARN.
+        assert_eq!(node_version_row(Some("garbage")).status, Status::Warning);
+
+        // Node absent → informational PASS (only npm-managed installs need it).
+        let none = node_version_row(None);
+        assert_eq!(none.status, Status::Passed);
+        assert!(none.detail.contains("not on PATH"));
+    }
+
+    #[test]
+    fn parse_node_major_reads_the_leading_integer() {
+        assert_eq!(parse_node_major("v18.17.0\n"), Some(18));
+        assert_eq!(parse_node_major("20.1.2"), Some(20));
+        assert_eq!(parse_node_major("v8.9.4"), Some(8));
+        assert_eq!(parse_node_major(""), None);
+        assert_eq!(parse_node_major("not-a-version"), None);
     }
 
     #[test]

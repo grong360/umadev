@@ -392,11 +392,38 @@ fn official_redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// Redirect policy for the release-*API* client. Unlike the asset download (which
+/// intentionally hops `api.github.com` → `github.com` → a CDN asset host), the
+/// releases-API call should never leave its own host: a redirect that moves the
+/// query to an unrelated origin is a sign of interception, not a legitimate CDN
+/// hand-off. So this follows only same-host HTTPS hops and caps their number,
+/// mirroring the bounded, host-scoped shape of [`official_redirect_policy`].
+/// Without any policy the client followed redirects to arbitrary hosts by default.
+fn api_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects while querying the GitHub release API");
+        }
+        let same_host = attempt
+            .previous()
+            .last()
+            .and_then(reqwest::Url::host_str)
+            .zip(attempt.url().host_str())
+            .is_some_and(|(prev, next)| prev.eq_ignore_ascii_case(next));
+        if is_https_default_port(attempt.url()) && same_host {
+            attempt.follow()
+        } else {
+            attempt.error("refusing a release-API redirect to a different host")
+        }
+    })
+}
+
 /// Fetch + parse the latest release from the GitHub API.
 async fn fetch_latest_release() -> Result<LatestRelease> {
     let client = reqwest::Client::builder()
         .user_agent("umadev-cli")
         .timeout(API_TIMEOUT)
+        .redirect(api_redirect_policy())
         .build()
         .context("could not build an HTTP client")?;
     let resp = client

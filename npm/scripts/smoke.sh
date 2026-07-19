@@ -85,7 +85,10 @@ DEAD_REGISTRY="https://127.0.0.1:1"
 make_install() {
   rm -rf "$1/umadev" "$1/@umacloud/cli-$PLATFORM"
   mkdir -p "$1/umadev/bin" "$1/@umacloud/cli-$PLATFORM/bin"
-  cp "$NPM_ROOT/umadev/bin/cli.js" "$1/umadev/bin/"
+  # The launcher is now two files: the ES5 version-gate shim (cli.js) require()s
+  # the modern implementation (cli-main.js). Both must be staged, or the shim
+  # throws "Cannot find module './cli-main.js'".
+  cp "$NPM_ROOT/umadev/bin/cli.js" "$NPM_ROOT/umadev/bin/cli-main.js" "$1/umadev/bin/"
   cp "$NPM_ROOT/umadev/package.json" "$1/umadev/"
   cp "$NPM_ROOT/cli-$PLATFORM/package.json" "$1/@umacloud/cli-$PLATFORM/"
   cp "$NPM_ROOT/cli-$PLATFORM/bin/umadev" "$1/@umacloud/cli-$PLATFORM/bin/"

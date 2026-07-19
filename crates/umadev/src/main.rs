@@ -6181,6 +6181,21 @@ fn cmd_pr(
         None,
     );
     if !run_pr_git(&project_root, &["push", "-u", "origin", &plan.head_branch]) {
+        // The commit already landed on a branch we created a moment ago; only the
+        // network push failed. Don't silently move the working tree (a `git switch`
+        // could itself fail on unrelated WIP) — instead name the branch that holds
+        // the commit and the exact recovery commands, so the user is never stranded
+        // on a fresh branch wondering where their work went.
+        if plan.needs_new_branch {
+            eprintln!(
+                "\n  [note] Your commit is safe on branch `{branch}` (currently checked out).\n\
+                 \x20        Retry the push:            git push -u origin {branch}\n\
+                 \x20        Or return to the previous branch:   git switch -\n\
+                 \x20        提交已保存在分支 `{branch}`(当前已切换到该分支),推送失败;\
+                 可重试推送,或用 `git switch -` 切回原分支。",
+                branch = plan.head_branch
+            );
+        }
         return pr_fallback(&readiness, &slug, &body_rel, lang);
     }
 

@@ -46,7 +46,34 @@ const MIN_SAFETENSORS_BYTES: u64 = 1024 * 1024; // 1 MiB
 /// corrupt cache healed never). Fail-open: never panics.
 #[must_use]
 pub fn is_available() -> bool {
-    model_dir().is_some_and(|d| model_files_usable(&d))
+    let usable = model_dir().is_some_and(|d| model_files_usable(&d));
+    if !usable {
+        // Honest degrade notice (#2b): a `cargo install` / self-updated user never
+        // had the model fetched (only the npm `bin/cli.js` shim downloads it), so
+        // without this they'd silently run keyword-only retrieval with no hint.
+        note_keyword_only_once();
+    }
+    usable
+}
+
+/// Emit at most one honest notice that retrieval is running WITHOUT the bundled
+/// local vector model — so a `cargo install` / self-updated user (for whom nothing
+/// ever fetched the model; only the npm `bin/cli.js` shim does) learns their hybrid
+/// search silently degraded to keyword-only BM25, and how to turn the vector track
+/// on. Purely a log signal: the runtime keeps working on BM25 (fail-open) and never
+/// fetches or mutates anything here. Distinct from [`warn_corrupt_cache_once`],
+/// which fires only for a present-but-corrupt cache; this also covers the common
+/// absent-model case. `umadev doctor` reports the same state as a check row.
+fn note_keyword_only_once() {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            "no local embedding model present — knowledge retrieval is using keyword-only (BM25). \
+             To enable offline hybrid vector search, install via npm (it fetches the model) or place \
+             config.json + tokenizer.json + model.safetensors under ~/.umadev/embed-model (or point \
+             {ENV_MODEL_DIR} at them)."
+        );
+    }
 }
 
 /// All three model files under `dir` exist AND pass a cheap integrity check.
