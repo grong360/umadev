@@ -1,22 +1,35 @@
 version: 2
 updates:
+  # Grouped + monthly + a low PR cap so dependency updates never pile up as one
+  # branch/PR per crate again. Each ecosystem produces at most ONE grouped PR
+  # (all its updates bundled), so the branch list stays effectively just `main`.
+  # Security updates are surfaced regardless of this schedule.
   - package-ecosystem: cargo
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 10
+      interval: monthly
+    open-pull-requests-limit: 2
+    groups:
+      cargo:
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 10
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
   - package-ecosystem: npm
     directory: "/umadev-website"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 10
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      npm:
+        patterns:
+          - "*"
