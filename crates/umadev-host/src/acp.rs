@@ -8451,6 +8451,7 @@ fn validate_grok_auth_gate(result: &Value) -> Result<(), SessionError> {
 ///     refuse rather than run a possibly-writable base under a read-only promise.
 ///   - Guarded / Auto on a NON-audited build: those profiles permit writes anyway, so
 ///     a newer/renamed mode catalog degrades (proceed on the base's own default mode).
+///
 /// Grok never reaches this — its launch flags are the authoritative boundary.
 fn kimi_missing_mode_is_fatal(source_contract: bool, permissions: BasePermissionProfile) -> bool {
     source_contract || matches!(permissions, BasePermissionProfile::Plan)
