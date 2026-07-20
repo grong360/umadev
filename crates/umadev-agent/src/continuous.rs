@@ -416,6 +416,8 @@ pub async fn run_block(
             plan.kind,
             idle,
             deadline,
+            crate::director_loop::TRANSIENT_BACKOFF_BASE,
+            crate::director_loop::TRANSIENT_BACKOFF_CAP,
         )
         .await;
         // `first_directive` is consumed by `std::mem::take` only when this is
@@ -552,6 +554,7 @@ pub async fn run_block(
 }
 
 /// Result of driving a single phase's turn.
+#[derive(Debug)]
 enum PhaseResult {
     /// The turn completed (or truncated with partial work that we accept).
     Done,
@@ -579,11 +582,20 @@ async fn drive_phase(
     // otherwise had no mid-turn ceiling at all — it never re-checks a deadline once a
     // phase turn starts draining).
     deadline: std::time::Instant,
+    // Transient backoff schedule (base/cap), threaded in so a test drives a tiny, fast
+    // window — the SAME shape the routed engine (`drive_director_loop_routed`) uses. In
+    // production these are `director_loop::TRANSIENT_BACKOFF_BASE`/`_CAP`.
+    backoff_base: std::time::Duration,
+    backoff_cap: std::time::Duration,
 ) -> PhaseResult {
     let directive = phase_directive(options, phase, first_directive, kind);
-    if let Err(e) = session.send_turn(directive).await {
+    // Keep the directive so a TRANSIENT base failure can re-drive the SAME turn on the
+    // still-live session (parity with the routed engine).
+    if let Err(e) = session.send_turn(directive.clone()).await {
         return PhaseResult::Failed(format!("send_turn: {e}"));
     }
+    // Bounded transient-retry counter (429 / overloaded / network) — see the TurnDone arm.
+    let mut transient_retries: u32 = 0;
 
     let policy = umadev_governance::Policy::load(&options.project_root);
     // Idle watchdog (P1-11): this is a naked-pump path the original P1-2 fix
@@ -825,6 +837,51 @@ async fn drive_phase(
                         umadev_i18n::tlf("bg.outstanding_note", &[&bg.outstanding().to_string()]);
                     events.emit(EngineEvent::Note(incomplete.clone()));
                     return PhaseResult::Failed(incomplete);
+                }
+                // ENGINE-PARITY RESILIENCE: a TRANSIENT base failure (a 429 rate limit, an
+                // overloaded base, a network blip — codex-on-ChatGPT's MOST common failures)
+                // used to HARD-STOP the whole multi-phase build here, while the routed engine
+                // rode the identical hiccup out via bounded backoff-retry. Lift that SAME
+                // contract into the continuous engine: emit a visible COUNTDOWN Note (never a
+                // silent wait), back off, and re-drive the SAME phase directive on the
+                // still-live session — bounded by `MAX_TRANSIENT_RETRIES` AND the run
+                // `deadline`. A HARD failure (auth / context / a non-zero exit /
+                // unclassifiable) is NOT transient, so it falls through to `finish_turn` and
+                // hard-stops AT ONCE. The classifier reads the base's OWN error text only
+                // (this `reason`), never an idle/ended settle (those `return` above), so an
+                // idle hang is never mistaken for a transient API error.
+                if let TurnStatus::Failed(reason) = &status {
+                    let failure = crate::base_error::classify(None, None, Some(reason));
+                    if crate::base_error::is_transient(&failure)
+                        && transient_retries < crate::director_loop::MAX_TRANSIENT_RETRIES
+                        && std::time::Instant::now() < deadline
+                    {
+                        transient_retries += 1;
+                        let wait = crate::director_loop::transient_backoff_wait(
+                            backoff_base,
+                            backoff_cap,
+                            transient_retries,
+                        );
+                        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "tui.retry.countdown",
+                            &[
+                                &wait.as_secs().to_string(),
+                                &transient_retries.to_string(),
+                                &crate::director_loop::MAX_TRANSIENT_RETRIES.to_string(),
+                            ],
+                        )));
+                        tokio::time::sleep(wait).await;
+                        // Re-drive the SAME directive on the still-live session.
+                        if let Err(e) = session.send_turn(directive.clone()).await {
+                            return PhaseResult::Failed(format!("send_turn: {e}"));
+                        }
+                        // Fresh attempt: reset the tool-grace + slide the idle window so the
+                        // retry gets a full window rather than inheriting the failed try's.
+                        in_tool_call = false;
+                        tool_activity.clear();
+                        last_progress = std::time::Instant::now();
+                        continue;
+                    }
                 }
                 return finish_turn(options, events, phase, status);
             }
@@ -5792,6 +5849,8 @@ mod tests {
                 std::time::Duration::from_millis(80),
             ),
             std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
         )
         .await;
 
@@ -5806,6 +5865,100 @@ mod tests {
             *interrupts.lock().unwrap(),
             1,
             "the watchdog issued its best-effort interrupt before settling"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_phase_retries_a_transient_base_failure_then_completes() {
+        // ENGINE-PARITY: a TRANSIENT base failure (overloaded / 429) must NOT hard-stop
+        // the continuous phase — it backs off and re-drives the SAME directive on the
+        // still-live session, exactly like the routed engine. The first scripted turn
+        // fails transiently; the retry completes.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![
+            vec![SessionEvent::TurnDone {
+                status: TurnStatus::Failed("Error: the base is overloaded, please retry".to_string()),
+                usage: None,
+            }],
+            vec![SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: None,
+            }],
+        ]);
+        let sent = session.sent_handle();
+
+        let result = drive_phase(
+            &mut session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+
+        assert!(
+            matches!(result, PhaseResult::Done),
+            "a transient failure that clears on retry settles as Done, not a hard-stop: {result:?}"
+        );
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            2,
+            "the SAME phase directive is re-driven once after the transient backoff"
+        );
+        assert_eq!(sent[0], sent[1], "the re-drive sends the identical directive");
+    }
+
+    #[tokio::test]
+    async fn drive_phase_hard_stops_a_non_transient_base_failure_without_retry() {
+        // The mirror of the above: a HARD failure (auth) is NOT transient, so it must
+        // fail AT ONCE with no retry — retrying a misconfigured base only grinds.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![SessionEvent::TurnDone {
+            status: TurnStatus::Failed(
+                "Error: authentication_error — invalid api key".to_string(),
+            ),
+            usage: None,
+        }]]);
+        let sent = session.sent_handle();
+
+        let result = drive_phase(
+            &mut session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+
+        assert!(
+            matches!(result, PhaseResult::Failed(_)),
+            "a hard auth failure hard-stops the phase: {result:?}"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "a non-transient failure is never re-driven"
         );
     }
 
@@ -5850,6 +6003,8 @@ mod tests {
                 std::time::Duration::from_secs(5),
             ),
             std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
         )
         .await;
 
@@ -5886,6 +6041,8 @@ mod tests {
                 std::time::Duration::from_secs(5),
             ),
             std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
         )
         .await;
         assert!(matches!(result, PhaseResult::Done));

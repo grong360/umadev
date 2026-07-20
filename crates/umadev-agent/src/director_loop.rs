@@ -420,23 +420,23 @@ pub(crate) const INTERRUPT_TIMEOUT_SECS: u64 = 5;
 /// bounded-rework philosophy: a transient hiccup earns a few backoff-and-retry
 /// attempts, but a base that is genuinely down still fails promptly rather than
 /// grinding. A HARD failure (auth / context / a non-zero exit) is NOT retried at all.
-const MAX_TRANSIENT_RETRIES: u32 = 3;
+pub(crate) const MAX_TRANSIENT_RETRIES: u32 = 3;
 
 /// The base unit of the exponential transient backoff (attempt 1 → 1×, 2 → 2×, 3 →
 /// 4× this, capped at [`TRANSIENT_BACKOFF_CAP`]). 2s keeps a single retry quick yet
 /// gives a rate limit room to clear before the next attempt.
-const TRANSIENT_BACKOFF_BASE: Duration = Duration::from_secs(2);
+pub(crate) const TRANSIENT_BACKOFF_BASE: Duration = Duration::from_secs(2);
 
 /// The cap on any single transient backoff wait, so the schedule stays bounded even
 /// if [`MAX_TRANSIENT_RETRIES`] grows. 30s is the longest a transient retry ever waits.
-const TRANSIENT_BACKOFF_CAP: Duration = Duration::from_secs(30);
+pub(crate) const TRANSIENT_BACKOFF_CAP: Duration = Duration::from_secs(30);
 
 /// The backoff wait before transient-retry `attempt` (1-based): exponential off `base`,
 /// capped at `cap` — attempt 1 → `base`, 2 → 2×`base`, 3 → 4×`base`, … never exceeding
 /// `cap`. Pure + total + bounded: the shift is clamped (so it can never overflow) and a
 /// multiply overflow saturates at `cap`, so the schedule is deterministic and can never
 /// balloon. `base`/`cap` are parameters so the test drives a tiny, fast window.
-fn transient_backoff_wait(base: Duration, cap: Duration, attempt: u32) -> Duration {
+pub(crate) fn transient_backoff_wait(base: Duration, cap: Duration, attempt: u32) -> Duration {
     let shift = attempt.saturating_sub(1).min(16);
     let mult = 1u32 << shift; // shift ≤ 16 ⇒ ≤ 65 536, never overflows a u32
     base.checked_mul(mult).map_or(cap, |d| d.min(cap))
